@@ -902,6 +902,7 @@ class LatentSyncApiRuntime:
                     "active_frames": source_frame_count,
                     "silent_frames": 0,
                 },
+                "quality_ok": True,
             }
 
 
