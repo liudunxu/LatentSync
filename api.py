@@ -994,12 +994,11 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
         input_paths = {"video": video_path, "audio": audio_path}
         reference_embedding = None
         if payload.avatar_url:
-            avatar_path = job_input_dir / "avatar.jpg"
-            shutil.copy(_download_to_file(payload.avatar_url, job_input_dir, "avatar", IMAGE_SUFFIXES, ".jpg"), avatar_path)
+            avatar_downloaded = _download_to_file(payload.avatar_url, job_input_dir, "avatar", IMAGE_SUFFIXES, ".jpg")
             runtime.load_detectors()
             if runtime.face_embedder is not None:
                 import cv2
-                avatar_frame = cv2.imread(str(avatar_path))
+                avatar_frame = cv2.imread(str(avatar_downloaded))
                 if avatar_frame is not None:
                     faces = runtime.face_embedder.get(avatar_frame)
                     if faces:
