@@ -991,9 +991,9 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
 
     output_path = result.pop("output_path")
     video_url = _output_url(request, output_path)
-    host = request.headers.get("host", str(request.base_url))
-    base_url = f"http://{host.rstrip('/')}"
+    base_url = str(request.url).rsplit("/api", 1)[0]
     download_url = f"{base_url}/api/download?url={quote(video_url, safe='')}"
+    logger.info(f"[LipSync] base_url={base_url}, video_url={video_url}, download_url={download_url}")
     response = {
         "job_id": job_id,
         "video_url": video_url,
