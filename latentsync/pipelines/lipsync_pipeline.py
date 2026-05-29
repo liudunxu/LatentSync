@@ -25,8 +25,9 @@ from diffusers.schedulers import (
     LMSDiscreteScheduler,
     PNDMScheduler,
 )
-from diffusers.utils import deprecate, logging
+from diffusers.utils import deprecate
 
+import logging
 logger = logging.getLogger(__name__)
 
 from einops import rearrange
