@@ -429,10 +429,11 @@ def _download_to_file(url: str, dest_dir: Path, prefix: str, allowed: set, fallb
 
 def _output_url(request: Request, output_path: Path) -> str:
     relative = output_path.relative_to(OUTPUT_ROOT).as_posix()
+    scheme = request.url.scheme if hasattr(request, 'url') and request.url else "https"
     host = request.headers.get("host", str(request.base_url).split("/")[2] if "://" in str(request.base_url) else f"localhost:8443")
     if ":" not in host:
         host = f"{host}:8443"
-    return f"http://{host}/outputs/{relative}"
+    return f"{scheme}://{host}/outputs/{relative}"
 
 
 def _read_video_info(video_path: Path) -> Tuple[int, float]:
@@ -1015,10 +1016,11 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
 
     output_path = result.pop("output_path")
     video_url = _output_url(request, output_path)
+    scheme = request.url.scheme if hasattr(request, 'url') and request.url else "https"
     host = request.headers.get("host", str(request.base_url).split("/")[2] if "://" in str(request.base_url) else f"localhost:8443")
     if ":" not in host:
         host = f"{host}:8443"
-    download_url = f"http://{host}/api/download?url={quote(video_url, safe='')}"
+    download_url = f"{scheme}://{host}/api/download?url={quote(video_url, safe='')}"
     response = {
         "job_id": job_id,
         "video_url": video_url,
