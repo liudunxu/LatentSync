@@ -19,32 +19,27 @@ class FaceDetector:
 
         faces = self.app.get(frame)
 
-        get_face_store = None
-        max_size = 0
-
         if len(faces) == 0:
             return None, None
-        else:
-            for face in faces:
-                bbox = face.bbox.astype(np.int_).tolist()
-                w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                if w < 50 or h < 80:
-                    continue
-                if w / h > 1.5 or w / h < 0.2:
-                    continue
-                if face.det_score < threshold:
-                    continue
-                size_now = w * h
 
-                if size_now > max_size:
-                    max_size = size_now
-                    get_face_store = face
+        valid_faces = []
+        for face in faces:
+            bbox = face.bbox.astype(np.int_).tolist()
+            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if w < 30 or h < 40:
+                continue
+            if w / h > 2.0 or w / h < 0.15:
+                continue
+            if face.det_score < threshold:
+                continue
+            valid_faces.append((face, w * h))
 
-        if get_face_store is None:
+        if not valid_faces:
             return None, None
-        else:
-            face = get_face_store
-            lmk = np.round(face.landmark_2d_106).astype(np.int_)
+
+        valid_faces.sort(key=lambda x: x[1], reverse=True)
+        face, _ = valid_faces[0]
+        lmk = np.round(face.landmark_2d_106).astype(np.int_)
 
             halk_face_coord = np.mean([lmk[74], lmk[73]], axis=0)
 
