@@ -562,10 +562,10 @@ class LatentSyncApiRuntime:
             self.detectors_loaded = True
 
     def load(self) -> None:
-        if self.loaded:
-            return
-        self.load_detectors()
         with self.load_lock:
+            if self.loaded:
+                return
+            self.load_detectors()
             if self.loaded:
                 return
             _ensure_ffmpeg()
