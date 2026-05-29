@@ -251,14 +251,20 @@ class LipsyncPipeline(DiffusionPipeline):
         images = images.cpu().numpy()
         return images
 
-    def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None):
+    def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None, detect_interval=3):
         faces = []
         boxes = []
         affine_matrices = []
         skip_mask = [] if reference_embedding is not None else None
         print(f"Affine transforming {len(video_frames)} faces...")
-        for frame in tqdm.tqdm(video_frames):
-            face, box, affine_matrix, face_emb = self.image_processor.affine_transform_with_embedding(frame)
+        cached_detections = {}
+        for idx, frame in enumerate(tqdm.tqdm(video_frames)):
+            detect_idx = (idx // detect_interval) * detect_interval
+            if detect_idx not in cached_detections:
+                face, box, affine_matrix, face_emb = self.image_processor.affine_transform_with_embedding(frame)
+                cached_detections[detect_idx] = (face, box, affine_matrix, face_emb)
+            else:
+                face, box, affine_matrix, face_emb = cached_detections[detect_idx]
             if face is None:
                 if skip_mask is not None:
                     skip_mask.append(True)
@@ -269,9 +275,9 @@ class LipsyncPipeline(DiffusionPipeline):
                 should_skip = False
                 if skip_mask is not None and face_emb is not None:
                     similarity = float(np.dot(face_emb, reference_embedding))
-                    logger.info(f"[FaceMatch] similarity={similarity:.3f}")
                     should_skip = similarity < 0.7
-                    skip_mask.append(should_skip)
+                    logger.info(f"[FaceMatch] frame={idx}, similarity={similarity:.3f}, skip={should_skip}")
+                skip_mask.append(should_skip)
                 faces.append(face)
                 boxes.append(box)
                 affine_matrices.append(affine_matrix)
