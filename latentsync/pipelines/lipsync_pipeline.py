@@ -271,7 +271,6 @@ class LipsyncPipeline(DiffusionPipeline):
                 if skip_mask is not None and face_emb is not None:
                     similarity = float(np.dot(face_emb, reference_embedding))
                     should_skip = similarity < 0.7
-                    logger.info(f"[FaceMatch] frame={idx}, similarity={similarity:.3f}, skip={should_skip}")
                 skip_mask.append(should_skip)
                 faces.append(face)
                 boxes.append(box)
