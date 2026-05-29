@@ -28,7 +28,6 @@ from diffusers.schedulers import (
 from diffusers.utils import deprecate
 
 import logging
-logger = logging.getLogger(__name__)
 
 from einops import rearrange
 import cv2
@@ -40,7 +39,7 @@ from ..whisper.audio2feature import Audio2Feature
 import tqdm
 import soundfile as sf
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+logger = logging.getLogger(__name__)
 
 
 class LipsyncPipeline(DiffusionPipeline):
