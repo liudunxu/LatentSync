@@ -429,7 +429,8 @@ def _download_to_file(url: str, dest_dir: Path, prefix: str, allowed: set, fallb
 
 def _output_url(request: Request, output_path: Path) -> str:
     relative = output_path.relative_to(OUTPUT_ROOT).as_posix()
-    return f"{str(request.base_url).rstrip('/')}/outputs/{relative}"
+    base_url = str(request.url).rsplit("/api", 1)[0]
+    return f"{base_url}/outputs/{relative}"
 
 
 def _read_video_info(video_path: Path) -> Tuple[int, float]:
