@@ -1006,11 +1006,16 @@ def download_by_url(url: str = Query(..., description="Generated or remote video
     logger.info(f"[Download] url={url}")
     local_path = _local_output_from_url(url)
     if local_path is not None:
-        logger.info(f"[Download] serving local file: {local_path}")
+        file_size = local_path.stat().st_size
+        logger.info(f"[Download] serving local file: {local_path}, size={file_size}")
         return FileResponse(
             str(local_path),
             filename=local_path.name,
             media_type="video/mp4",
+            headers={
+                "Content-Length": str(file_size),
+                "Content-Disposition": f'attachment; filename="{local_path.name}"',
+            },
         )
 
     _validate_url(url)
@@ -1019,8 +1024,20 @@ def download_by_url(url: str = Query(..., description="Generated or remote video
     except HTTPException:
         raise
 
-    filename = Path(unquote(urlparse(url).path)).name or "download.mp4"
-    media_type = response.headers.get("content-type", "application/octet-stream")
+    content_length = response.headers.get("content-length")
+    content_type = response.headers.get("content-type", "video/mp4")
+    filename = Path(unquote(urlparse(url).path)).name or "video.mp4"
+    if not filename.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm")):
+        filename = filename + ".mp4"
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Type": content_type,
+    }
+    if content_length:
+        headers["Content-Length"] = content_length
+
+    logger.info(f"[Download] streaming from remote: filename={filename}, size={content_length or 'unknown'}")
 
     def iterator():
         try:
@@ -1030,11 +1047,7 @@ def download_by_url(url: str = Query(..., description="Generated or remote video
         finally:
             response.close()
 
-    return StreamingResponse(
-        iterator(),
-        media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    return StreamingResponse(iterator(), headers=headers)
 
 
 def parse_args() -> argparse.Namespace:
