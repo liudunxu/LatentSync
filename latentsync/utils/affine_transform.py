@@ -70,8 +70,8 @@ class AlignRestore(object):
         inv_mask_erosion_t = inv_mask_erosion.squeeze(0).expand_as(inv_face)
         pasted_face = inv_mask_erosion_t * inv_face
         total_face_area = torch.sum(inv_mask_erosion.float())
-        w_edge = int(total_face_area**0.5) // 20
-        erosion_radius = w_edge * 2
+        w_edge = max(int(total_face_area**0.5) // 15, 5)
+        erosion_radius = w_edge * 3
 
         # This step will consume a large amount of GPU memory.
         # inv_mask_center = kornia.morphology.erosion(
@@ -83,8 +83,8 @@ class AlignRestore(object):
         inv_mask_center = cv2.erode(inv_mask_erosion, np.ones((erosion_radius, erosion_radius), np.uint8))
         inv_mask_center = torch.from_numpy(inv_mask_center).to(device=self.device, dtype=self.dtype)[None, None, ...]
 
-        blur_size = w_edge * 2 + 1
-        sigma = 0.3 * ((blur_size - 1) * 0.5 - 1) + 0.8
+        blur_size = w_edge * 3 + 1
+        sigma = 0.4 * ((blur_size - 1) * 0.5 - 1) + 0.9
         inv_soft_mask = kornia.filters.gaussian_blur2d(
             inv_mask_center, (blur_size, blur_size), (sigma, sigma)
         ).squeeze(0)
