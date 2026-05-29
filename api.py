@@ -1002,8 +1002,10 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
 
 @app.get("/api/download")
 def download_by_url(url: str = Query(..., description="Generated or remote video URL")):
+    logger.info(f"[Download] url={url}")
     local_path = _local_output_from_url(url)
     if local_path is not None:
+        logger.info(f"[Download] serving local file: {local_path}")
         return FileResponse(
             str(local_path),
             filename=local_path.name,
