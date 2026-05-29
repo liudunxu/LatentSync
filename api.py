@@ -957,12 +957,14 @@ def list_distinct_faces(payload: FaceListRequest, request: Request) -> Dict[str,
             "count": item["count"],
         })
 
-    return {
+    response = {
         "job_id": job_id,
         "face_urls": face_urls,
         "faces": faces,
         **result,
     }
+    logger.info(f"[/api/faces] Raw response: {json.dumps(response, ensure_ascii=False)[:2000]}")
+    return response
 
 
 @app.post("/api/lipsync")
