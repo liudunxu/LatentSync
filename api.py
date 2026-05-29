@@ -932,6 +932,7 @@ def health() -> Dict[str, object]:
 
 @app.post("/api/faces")
 def list_distinct_faces(payload: FaceListRequest, request: Request) -> Dict[str, object]:
+    logger.info(f"[/api/faces] Request: video_url={payload.video_url}, similarity_threshold={payload.similarity_threshold}, min_face_area={payload.min_face_area}")
     job_id = uuid.uuid4().hex
     job_input_dir = INPUT_ROOT / job_id
     job_output_dir = OUTPUT_ROOT / job_id
@@ -974,6 +975,7 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
     if payload.parsing_mode not in {"jaw", "raw"}:
         raise HTTPException(status_code=400, detail="parsing_mode must be 'jaw' or 'raw'")
 
+    logger.info(f"[/api/lipsync] Request: video_url={payload.video_url}, audio_url={payload.audio_url}")
     job_id = uuid.uuid4().hex
     job_input_dir = INPUT_ROOT / job_id
     job_output_dir = OUTPUT_ROOT / job_id
