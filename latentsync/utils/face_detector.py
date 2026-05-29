@@ -41,26 +41,26 @@ class FaceDetector:
         face, _ = valid_faces[0]
         lmk = np.round(face.landmark_2d_106).astype(np.int_)
 
-            halk_face_coord = np.mean([lmk[74], lmk[73]], axis=0)
+        halk_face_coord = np.mean([lmk[74], lmk[73]], axis=0)
 
-            sub_lmk = lmk[LMK_ADAPT_ORIGIN_ORDER]
-            halk_face_dist = np.max(sub_lmk[:, 1]) - halk_face_coord[1]
-            upper_bond = halk_face_coord[1] - halk_face_dist
+        sub_lmk = lmk[LMK_ADAPT_ORIGIN_ORDER]
+        halk_face_dist = np.max(sub_lmk[:, 1]) - halk_face_coord[1]
+        upper_bond = halk_face_coord[1] - halk_face_dist
 
-            x1, y1, x2, y2 = (np.min(sub_lmk[:, 0]), int(upper_bond), np.max(sub_lmk[:, 0]), np.max(sub_lmk[:, 1]))
+        x1, y1, x2, y2 = (np.min(sub_lmk[:, 0]), int(upper_bond), np.max(sub_lmk[:, 0]), np.max(sub_lmk[:, 1]))
 
-            if y2 - y1 <= 0 or x2 - x1 <= 0 or x1 < 0:
-                x1, y1, x2, y2 = face.bbox.astype(np.int_).tolist()
+        if y2 - y1 <= 0 or x2 - x1 <= 0 or x1 < 0:
+            x1, y1, x2, y2 = face.bbox.astype(np.int_).tolist()
 
-            y2 += int((x2 - x1) * 0.1)
-            x1 -= int((x2 - x1) * 0.05)
-            x2 += int((x2 - x1) * 0.05)
+        y2 += int((x2 - x1) * 0.1)
+        x1 -= int((x2 - x1) * 0.05)
+        x2 += int((x2 - x1) * 0.05)
 
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(f_w, x2)
-            y2 = min(f_h, y2)
-            return (x1, y1, x2, y2), lmk
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(f_w, x2)
+        y2 = min(f_h, y2)
+        return (x1, y1, x2, y2), lmk
 
 
 def cuda_to_int(cuda_str: str) -> int:
