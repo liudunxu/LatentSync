@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import math
 import mimetypes
@@ -989,15 +990,15 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
 
     output_path = result.pop("output_path")
     video_url = _output_url(request, output_path)
-    logger.info(f"[LipSync] Generated video download URL: {video_url}")
     download_url = f"{str(request.base_url).rstrip('/')}/api/download?url={quote(video_url, safe='')}"
-    logger.info(f"[LipSync] Download URL: {download_url}")
-    return {
+    response = {
         "job_id": job_id,
         "video_url": video_url,
         "download_url": download_url,
         **result,
     }
+    logger.info(f"[LipSync] Raw response: {json.dumps(response, ensure_ascii=False)[:2000]}")
+    return response
 
 
 @app.get("/api/download")
