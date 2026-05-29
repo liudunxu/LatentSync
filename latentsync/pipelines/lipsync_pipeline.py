@@ -251,21 +251,34 @@ class LipsyncPipeline(DiffusionPipeline):
         images = images.cpu().numpy()
         return images
 
-    def affine_transform_video(self, video_frames: np.ndarray):
+    def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None):
         faces = []
         boxes = []
         affine_matrices = []
+        skip_mask = [] if reference_embedding is not None else None
         print(f"Affine transforming {len(video_frames)} faces...")
         for frame in tqdm.tqdm(video_frames):
-            face, box, affine_matrix = self.image_processor.affine_transform(frame)
-            faces.append(face)
-            boxes.append(box)
-            affine_matrices.append(affine_matrix)
+            face, box, affine_matrix, face_emb = self.image_processor.affine_transform_with_embedding(frame)
+            if face is None:
+                if skip_mask is not None:
+                    skip_mask.append(True)
+                faces.append(torch.zeros(3, self.image_processor.resolution, self.image_processor.resolution))
+                boxes.append([0, 0, 0, 0])
+                affine_matrices.append(np.eye(3))
+            else:
+                should_skip = False
+                if skip_mask is not None and face_emb is not None:
+                    similarity = float(np.dot(face_emb, reference_embedding))
+                    logger.info(f"[FaceMatch] similarity={similarity:.3f}")
+                    should_skip = similarity < 0.3
+                    skip_mask.append(should_skip)
+                faces.append(face)
+                boxes.append(box)
+                affine_matrices.append(affine_matrix)
+        faces_tensor = torch.stack(faces)
+        return faces_tensor, boxes, affine_matrices, skip_mask
 
-        faces = torch.stack(faces)
-        return faces, boxes, affine_matrices
-
-    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list):
+    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, skip_mask=None):
         video_frames = video_frames[: len(faces)]
         out_frames = []
         print(f"Restoring {len(faces)} faces...")
@@ -273,43 +286,51 @@ class LipsyncPipeline(DiffusionPipeline):
             x1, y1, x2, y2 = boxes[index]
             height = int(y2 - y1)
             width = int(x2 - x1)
-            face = torchvision.transforms.functional.resize(
-                face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
-            )
-            out_frame = self.image_processor.restorer.restore_img(video_frames[index], face, affine_matrices[index])
-            out_frames.append(out_frame)
+            should_skip = skip_mask[index] if skip_mask and index < len(skip_mask) else False
+            if should_skip:
+                out_frames.append(video_frames[index])
+            else:
+                face_resized = torchvision.transforms.functional.resize(
+                    face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
+                )
+                out_frame = self.image_processor.restorer.restore_img(video_frames[index], face_resized, affine_matrices[index])
+                out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 
-    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray):
-        # If the audio is longer than the video, we need to loop the video
+    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray, reference_embedding=None, skip_mask=None):
         if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
+            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding)
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
             loop_video_frames = []
             loop_faces = []
             loop_boxes = []
             loop_affine_matrices = []
+            loop_skip_mask = []
             for i in range(num_loops):
                 if i % 2 == 0:
                     loop_video_frames.append(video_frames)
                     loop_faces.append(faces)
                     loop_boxes += boxes
                     loop_affine_matrices += affine_matrices
+                    loop_skip_mask += frame_skip_mask
                 else:
                     loop_video_frames.append(video_frames[::-1])
                     loop_faces.append(faces.flip(0))
                     loop_boxes += boxes[::-1]
                     loop_affine_matrices += affine_matrices[::-1]
+                    loop_skip_mask += frame_skip_mask[::-1]
 
             video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
             faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
             boxes = loop_boxes[: len(whisper_chunks)]
             affine_matrices = loop_affine_matrices[: len(whisper_chunks)]
+            skip_mask = loop_skip_mask[: len(whisper_chunks)] if loop_skip_mask else None
         else:
             video_frames = video_frames[: len(whisper_chunks)]
-            faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
+            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding)
+            skip_mask = frame_skip_mask
 
-        return video_frames, faces, boxes, affine_matrices
+        return video_frames, faces, boxes, affine_matrices, skip_mask
 
     @torch.no_grad()
     def __call__(
@@ -331,6 +352,7 @@ class LipsyncPipeline(DiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+        reference_embedding=None,
         **kwargs,
     ):
         is_train = self.unet.training
@@ -371,8 +393,8 @@ class LipsyncPipeline(DiffusionPipeline):
         video_frames = read_video(video_path, use_decord=False)
         logger.info(f"[LipSync] video_frames shape={video_frames.shape}")
 
-        video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
-        logger.info(f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, affine_matrices={len(affine_matrices)}")
+        video_frames, faces, boxes, affine_matrices, skip_mask = self.loop_video(whisper_chunks, video_frames, reference_embedding=reference_embedding)
+        logger.info(f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, affine_matrices={len(affine_matrices)}, skip_mask={skip_mask}")
 
         synced_video_frames = []
 
@@ -466,7 +488,7 @@ class LipsyncPipeline(DiffusionPipeline):
             synced_video_frames.append(decoded_latents)
 
         logger.info(f"[LipSync] decoded {len(synced_video_frames)} batches, restoring video...")
-        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
+        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices, skip_mask)
         logger.info(f"[LipSync] restored video frames shape={synced_video_frames.shape}")
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)

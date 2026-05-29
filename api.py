@@ -834,7 +834,7 @@ class LatentSyncApiRuntime:
             }
 
     @torch.no_grad()
-    def synthesize(self, payload: LipSyncRequest, paths: Dict[str, Path], job_output_dir: Path) -> Dict[str, object]:
+    def synthesize(self, payload: LipSyncRequest, paths: Dict[str, Path], job_output_dir: Path, reference_embedding=None) -> Dict[str, object]:
         self.load()
         with self.run_lock:
             from accelerate.utils import set_seed
@@ -849,7 +849,8 @@ class LatentSyncApiRuntime:
                 torch.seed()
 
             logger.info(f"[LipSync] Starting pipeline: video={video_path}, audio={audio_path}, "
-                         f"guidance_scale={settings.guidance_scale}, steps={settings.inference_steps}")
+                         f"guidance_scale={settings.guidance_scale}, steps={settings.inference_steps}, "
+                         f"has_reference_embedding={reference_embedding is not None}")
             self.pipeline(
                 video_path=str(video_path),
                 audio_path=str(audio_path),
@@ -862,6 +863,7 @@ class LatentSyncApiRuntime:
                 height=self.config.data.resolution,
                 mask_image_path=self.config.data.mask_image_path,
                 temp_dir=str(job_output_dir / "temp"),
+                reference_embedding=reference_embedding,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")
 
@@ -990,7 +992,23 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
 
     try:
         input_paths = {"video": video_path, "audio": audio_path}
-        result = runtime.synthesize(payload, input_paths, job_output_dir)
+        reference_embedding = None
+        if payload.avatar_url:
+            avatar_path = job_input_dir / "avatar.jpg"
+            shutil.copy(_download_to_file(payload.avatar_url, job_input_dir, "avatar", IMAGE_SUFFIXES, ".jpg"), avatar_path)
+            runtime.load_detectors()
+            if runtime.face_embedder is not None:
+                import cv2
+                avatar_frame = cv2.imread(str(avatar_path))
+                if avatar_frame is not None:
+                    faces = runtime.face_embedder.get(avatar_frame)
+                    if faces:
+                        emb = getattr(faces[0], "normed_embedding", None)
+                        if emb is not None:
+                            import numpy as np
+                            reference_embedding = np.asarray(emb, dtype=np.float32)
+                            logger.info(f"[LipSync] Loaded reference face embedding, shape={reference_embedding.shape}")
+        result = runtime.synthesize(payload, input_paths, job_output_dir, reference_embedding=reference_embedding)
     except HTTPException:
         raise
     except Exception as exc:

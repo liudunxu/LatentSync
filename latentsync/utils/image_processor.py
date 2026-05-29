@@ -51,8 +51,13 @@ class ImageProcessor:
 
         if device == "cpu":
             self.face_detector = None
+            self.face_embedder = None
         else:
             self.face_detector = FaceDetector(device=device)
+            self.face_embedder = None
+
+    def set_face_embedder(self, embedder):
+        self.face_embedder = embedder
 
     def affine_transform(self, image: torch.Tensor) -> np.ndarray:
         if self.face_detector is None:
@@ -72,6 +77,34 @@ class ImageProcessor:
         face = cv2.resize(face, (self.resolution, self.resolution), interpolation=cv2.INTER_LANCZOS4)
         face = rearrange(torch.from_numpy(face), "h w c -> c h w")
         return face, box, affine_matrix
+
+    def affine_transform_with_embedding(self, image: torch.Tensor):
+        if self.face_detector is None:
+            raise NotImplementedError("Using the CPU for face detection is not supported")
+        bbox, landmark_2d_106 = self.face_detector(image)
+        if bbox is None:
+            return None, None, None, None
+
+        pt_left_eye = np.mean(landmark_2d_106[[43, 48, 49, 51, 50]], axis=0)
+        pt_right_eye = np.mean(landmark_2d_106[101:106], axis=0)
+        pt_nose = np.mean(landmark_2d_106[[74, 77, 83, 86]], axis=0)
+
+        landmarks3 = np.round([pt_left_eye, pt_right_eye, pt_nose])
+
+        face, affine_matrix = self.restorer.align_warp_face(image.copy(), landmarks3=landmarks3, smooth=True)
+        box = [0, 0, face.shape[1], face.shape[0]]
+        face = cv2.resize(face, (self.resolution, self.resolution), interpolation=cv2.INTER_LANCZOS4)
+        face = rearrange(torch.from_numpy(face), "h w c -> c h w")
+
+        embedding = None
+        if self.face_embedder is not None:
+            faces = self.face_embedder.get(image.astype(np.uint8) if image.dtype != np.uint8 else image)
+            if faces:
+                emb = getattr(faces[0], "normed_embedding", None)
+                if emb is not None:
+                    embedding = np.asarray(emb, dtype=np.float32)
+
+        return face, box, affine_matrix, embedding
 
     def preprocess_fixed_mask_image(self, image: torch.Tensor, affine_transform=False):
         if affine_transform:
