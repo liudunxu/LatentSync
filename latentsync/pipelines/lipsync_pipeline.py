@@ -27,6 +27,8 @@ from diffusers.schedulers import (
 )
 from diffusers.utils import deprecate, logging
 
+logger = logging.getLogger(__name__)
+
 from einops import rearrange
 import cv2
 
@@ -363,11 +365,14 @@ class LipsyncPipeline(DiffusionPipeline):
 
         whisper_feature = self.audio_encoder.audio2feat(audio_path)
         whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
+        logger.info(f"[LipSync] audio: whisper_chunks={len(whisper_chunks)}, video_fps={video_fps}")
 
         audio_samples = read_audio(audio_path)
         video_frames = read_video(video_path, use_decord=False)
+        logger.info(f"[LipSync] video_frames shape={video_frames.shape}")
 
         video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+        logger.info(f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, affine_matrices={len(affine_matrices)}")
 
         synced_video_frames = []
 
@@ -385,6 +390,7 @@ class LipsyncPipeline(DiffusionPipeline):
         )
 
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
+        logger.info(f"[LipSync] num_inferences={num_inferences}, num_frames={num_frames}, add_audio_layer={self.unet.add_audio_layer}")
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
             if self.unet.add_audio_layer:
                 audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
@@ -435,6 +441,8 @@ class LipsyncPipeline(DiffusionPipeline):
 
                     # predict the noise residual
                     noise_pred = self.unet(unet_input, t, encoder_hidden_states=audio_embeds).sample
+                    if j == 0:
+                        logger.info(f"[LipSync] inference {i}: audio_embeds shape={audio_embeds.shape if audio_embeds is not None else None}, unet_input shape={unet_input.shape}, noise_pred shape={noise_pred.shape}")
 
                     # perform guidance
                     if do_classifier_free_guidance:
@@ -457,7 +465,9 @@ class LipsyncPipeline(DiffusionPipeline):
             )
             synced_video_frames.append(decoded_latents)
 
+        logger.info(f"[LipSync] decoded {len(synced_video_frames)} batches, restoring video...")
         synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
+        logger.info(f"[LipSync] restored video frames shape={synced_video_frames.shape}")
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()

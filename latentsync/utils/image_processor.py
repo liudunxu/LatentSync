@@ -19,6 +19,9 @@ from einops import rearrange
 import torch
 import numpy as np
 from typing import Union
+import logging
+
+logger = logging.getLogger(__name__)
 from .affine_transform import AlignRestore
 from .face_detector import FaceDetector
 
@@ -84,6 +87,7 @@ class ImageProcessor:
             images = torch.from_numpy(images)
         if images.shape[3] == 3:
             images = rearrange(images, "f h w c -> f c h w")
+        logger.info(f"[ImageProcessor] prepare_masks_and_masked_images: input shape={images.shape}, affine_transform={affine_transform}")
 
         results = [self.preprocess_fixed_mask_image(image, affine_transform=affine_transform) for image in images]
 
