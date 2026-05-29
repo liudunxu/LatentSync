@@ -1,9 +1,7 @@
 from insightface.app import FaceAnalysis
 import numpy as np
 import torch
-import logging
 
-logger = logging.getLogger(__name__)
 INSIGHTFACE_DETECT_SIZE = 512
 
 
@@ -67,7 +65,6 @@ class FaceDetector:
             y1 = max(0, y1)
             x2 = min(f_w, x2)
             y2 = min(f_h, y2)
-            logger.info(f"[FaceDetector] frame shape={frame.shape}, face bbox=({x1}, {y1}, {x2}, {y2}), det_score={face.det_score:.3f}")
             return (x1, y1, x2, y2), lmk
 
 
