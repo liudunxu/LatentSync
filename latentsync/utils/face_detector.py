@@ -19,38 +19,26 @@ class FaceDetector:
 
         faces = self.app.get(frame)
 
-        get_face_store = None
-        max_size = 0
-
         if len(faces) == 0:
             return None, None
-        else:
-            for face in faces:
-                bbox = face.bbox.astype(np.int_).tolist()
-                w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                if w < 50 or h < 80:
-                    continue
-                if w / h > 1.5 or w / h < 0.2:
-                    continue
-                if face.det_score < threshold:
-                    continue
-                size_now = w * h
 
-                if size_now > max_size:
-                    max_size = size_now
-                    get_face_store = face
+        for face in faces:
+            bbox = face.bbox.astype(np.int_).tolist()
+            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if w < 50 or h < 80:
+                continue
+            if w / h > 1.5 or w / h < 0.2:
+                continue
+            if face.det_score < threshold:
+                continue
 
-        if get_face_store is None:
-            return None, None
-        else:
-            face = get_face_store
             lmk = np.round(face.landmark_2d_106).astype(np.int_)
 
-            halk_face_coord = np.mean([lmk[74], lmk[73]], axis=0)  # lmk[73]
+            halk_face_coord = np.mean([lmk[74], lmk[73]], axis=0)
 
             sub_lmk = lmk[LMK_ADAPT_ORIGIN_ORDER]
             halk_face_dist = np.max(sub_lmk[:, 1]) - halk_face_coord[1]
-            upper_bond = halk_face_coord[1] - halk_face_dist  # *0.94
+            upper_bond = halk_face_coord[1] - halk_face_dist
 
             x1, y1, x2, y2 = (np.min(sub_lmk[:, 0]), int(upper_bond), np.max(sub_lmk[:, 0]), np.max(sub_lmk[:, 1]))
 
@@ -67,6 +55,8 @@ class FaceDetector:
             y2 = min(f_h, y2)
 
             return (x1, y1, x2, y2), lmk
+
+        return None, None
 
 
 def cuda_to_int(cuda_str: str) -> int:

@@ -505,6 +505,13 @@ def _normalize_vector(vector: np.ndarray) -> np.ndarray:
     return (vector / norm).astype(np.float32)
 
 
+LMK_ADAPT_ORIGIN_ORDER = [
+    1, 10, 12, 14, 16, 3, 5, 7, 0, 23, 21, 19,
+    32, 30, 28, 26, 17, 43, 48, 49, 51, 50, 102, 103,
+    104, 105, 101, 73, 74, 86,
+]
+
+
 # ---------------------------------------------------------------------------
 # Runtime (loads model once and reuses across requests)
 # ---------------------------------------------------------------------------
@@ -537,12 +544,12 @@ class LatentSyncApiRuntime:
                 )
                 root_path = str(PROJECT_DIR / "checkpoints" / "auxiliary")
                 self.face_embedder = FaceAnalysis(
-                    allowed_modules=["detection", "recognition"],
+                    allowed_modules=["detection", "landmark_2d_106", "recognition"],
                     root=root_path,
                     providers=providers,
                 )
                 ctx_id = settings.gpu_id if torch.cuda.is_available() else -1
-                self.face_embedder.prepare(ctx_id=ctx_id, det_size=(640, 640))
+                self.face_embedder.prepare(ctx_id=ctx_id, det_size=(512, 512))
             except Exception as exc:
                 self.face_embedding_error = str(exc)
                 logger.warning("Failed to load InsightFace detector: %s", exc)
@@ -623,6 +630,7 @@ class LatentSyncApiRuntime:
     def _detect_faces(self, frame: np.ndarray) -> List[Dict[str, object]]:
         if self.face_embedder is None:
             return []
+        f_h, f_w, _ = frame.shape
         try:
             faces = self.face_embedder.get(frame)
         except Exception:
@@ -632,10 +640,36 @@ class LatentSyncApiRuntime:
             bbox = getattr(face, "bbox", None)
             if bbox is None:
                 continue
-            det_score = float(getattr(face, "det_score", 1.0))
-            x1, y1, x2, y2 = map(float, bbox)
-            clipped = _clip_box((x1, y1, x2, y2), frame.shape)
-            if clipped is None:
+            det_score = float(getattr(face, "det_score", 0.5))
+            raw_bbox = np.array(bbox).astype(np.int_)
+            w, h = raw_bbox[2] - raw_bbox[0], raw_bbox[3] - raw_bbox[1]
+            if w < 50 or h < 80:
+                continue
+            if w / h > 1.5 or w / h < 0.2:
+                continue
+            if det_score < 0.5:
+                continue
+            lmk = getattr(face, "landmark_2d_106", None)
+            if lmk is None:
+                x1, y1, x2, y2 = raw_bbox.tolist()
+            else:
+                lmk = np.round(lmk).astype(np.int_)
+                halk_face_coord = np.mean([lmk[74], lmk[73]], axis=0)
+                sub_lmk = lmk[LMK_ADAPT_ORIGIN_ORDER]
+                halk_face_dist = np.max(sub_lmk[:, 1]) - halk_face_coord[1]
+                upper_bond = halk_face_coord[1] - halk_face_dist
+                x1, y1, x2, y2 = (np.min(sub_lmk[:, 0]), int(upper_bond), np.max(sub_lmk[:, 0]), np.max(sub_lmk[:, 1]))
+                if y2 - y1 <= 0 or x2 - x1 <= 0 or x1 < 0:
+                    x1, y1, x2, y2 = raw_bbox.tolist()
+                y2 += int((x2 - x1) * 0.1)
+                x1 -= int((x2 - x1) * 0.05)
+                x2 += int((x2 - x1) * 0.05)
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(f_w, x2)
+            y2 = min(f_h, y2)
+            clipped = (x1, y1, x2, y2)
+            if clipped[2] - clipped[0] < 8 or clipped[3] - clipped[1] < 8:
                 continue
             embedding = getattr(face, "normed_embedding", None)
             if embedding is not None:
@@ -952,6 +986,7 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
 
     output_path = result.pop("output_path")
     video_url = _output_url(request, output_path)
+    logger.info(f"[LipSync] Generated video download URL: {video_url}")
     return {
         "job_id": job_id,
         "video_url": video_url,
