@@ -865,6 +865,7 @@ class LatentSyncApiRuntime:
                 mask_image_path=self.config.data.mask_image_path,
                 temp_dir=str(job_output_dir / "temp"),
                 reference_embedding=reference_embedding,
+                face_embedder=runtime.face_embedder if reference_embedding is not None else None,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")
 

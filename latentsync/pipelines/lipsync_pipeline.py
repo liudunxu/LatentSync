@@ -251,20 +251,15 @@ class LipsyncPipeline(DiffusionPipeline):
         images = images.cpu().numpy()
         return images
 
-    def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None, detect_interval=3):
+    def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None):
+        logger.info(f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}")
         faces = []
         boxes = []
         affine_matrices = []
         skip_mask = [] if reference_embedding is not None else None
         print(f"Affine transforming {len(video_frames)} faces...")
-        cached_detections = {}
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
-            detect_idx = (idx // detect_interval) * detect_interval
-            if detect_idx not in cached_detections:
-                face, box, affine_matrix, face_emb = self.image_processor.affine_transform_with_embedding(frame)
-                cached_detections[detect_idx] = (face, box, affine_matrix, face_emb)
-            else:
-                face, box, affine_matrix, face_emb = cached_detections[detect_idx]
+            face, box, affine_matrix, face_emb = self.image_processor.affine_transform_with_embedding(frame)
             if face is None:
                 if skip_mask is not None:
                     skip_mask.append(True)
@@ -304,6 +299,7 @@ class LipsyncPipeline(DiffusionPipeline):
         return np.stack(out_frames, axis=0)
 
     def loop_video(self, whisper_chunks: list, video_frames: np.ndarray, reference_embedding=None, skip_mask=None):
+        logger.info(f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}")
         if len(whisper_chunks) > len(video_frames):
             faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding)
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
@@ -359,6 +355,7 @@ class LipsyncPipeline(DiffusionPipeline):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
         reference_embedding=None,
+        face_embedder=None,
         **kwargs,
     ):
         is_train = self.unet.training
@@ -370,6 +367,9 @@ class LipsyncPipeline(DiffusionPipeline):
         device = self._execution_device
         mask_image = load_fixed_mask(height, mask_image_path)
         self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
+        if face_embedder is not None:
+            self.image_processor.set_face_embedder(face_embedder)
+            logger.info(f"[LipSync] Set face_embedder on ImageProcessor for face matching")
         self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
         # 1. Default height and width to unet
