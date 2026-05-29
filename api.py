@@ -1018,6 +1018,7 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
                 logger.warning(f"[LipSync] Face embedder not available")
         else:
             logger.info(f"[LipSync] No avatar_url provided, skipping face matching")
+        result = runtime.synthesize(payload, input_paths, job_output_dir, reference_embedding=reference_embedding)
     except HTTPException:
         raise
     except Exception as exc:
