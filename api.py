@@ -978,7 +978,7 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
     if payload.parsing_mode not in {"jaw", "raw"}:
         raise HTTPException(status_code=400, detail="parsing_mode must be 'jaw' or 'raw'")
 
-    logger.info(f"[/api/lipsync] Request: video_url={payload.video_url}, audio_url={payload.audio_url}")
+    logger.info(f"[/api/lipsync] Request: video_url={payload.video_url}, audio_url={payload.audio_url}, avatar_url={payload.avatar_url}")
     job_id = uuid.uuid4().hex
     job_input_dir = INPUT_ROOT / job_id
     job_output_dir = OUTPUT_ROOT / job_id
@@ -1008,7 +1008,16 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
                             import numpy as np
                             reference_embedding = np.asarray(emb, dtype=np.float32)
                             logger.info(f"[LipSync] Loaded reference face embedding, shape={reference_embedding.shape}")
-        result = runtime.synthesize(payload, input_paths, job_output_dir, reference_embedding=reference_embedding)
+                        else:
+                            logger.warning(f"[LipSync] No embedding found in avatar face")
+                    else:
+                        logger.warning(f"[LipSync] No face detected in avatar image")
+                else:
+                    logger.warning(f"[LipSync] Failed to read avatar image")
+            else:
+                logger.warning(f"[LipSync] Face embedder not available")
+        else:
+            logger.info(f"[LipSync] No avatar_url provided, skipping face matching")
     except HTTPException:
         raise
     except Exception as exc:
