@@ -844,6 +844,8 @@ class LatentSyncApiRuntime:
             else:
                 torch.seed()
 
+            logger.info(f"[LipSync] Starting pipeline: video={video_path}, audio={audio_path}, "
+                         f"guidance_scale={settings.guidance_scale}, steps={settings.inference_steps}")
             self.pipeline(
                 video_path=str(video_path),
                 audio_path=str(audio_path),
@@ -857,6 +859,7 @@ class LatentSyncApiRuntime:
                 mask_image_path=self.config.data.mask_image_path,
                 temp_dir=str(job_output_dir / "temp"),
             )
+            logger.info(f"[LipSync] Pipeline completed, output={output_path}")
 
             try:
                 source_frame_count, source_fps = _read_video_info(video_path)
@@ -987,10 +990,12 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
     output_path = result.pop("output_path")
     video_url = _output_url(request, output_path)
     logger.info(f"[LipSync] Generated video download URL: {video_url}")
+    download_url = f"{str(request.base_url).rstrip('/')}/api/download?url={quote(video_url, safe='')}"
+    logger.info(f"[LipSync] Download URL: {download_url}")
     return {
         "job_id": job_id,
         "video_url": video_url,
-        "download_url": f"{str(request.base_url).rstrip('/')}/api/download?url={quote(video_url, safe='')}",
+        "download_url": download_url,
         **result,
     }
 

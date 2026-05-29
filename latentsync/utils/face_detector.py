@@ -1,7 +1,9 @@
 from insightface.app import FaceAnalysis
 import numpy as np
 import torch
+import logging
 
+logger = logging.getLogger(__name__)
 INSIGHTFACE_DETECT_SIZE = 512
 
 
@@ -19,19 +21,31 @@ class FaceDetector:
 
         faces = self.app.get(frame)
 
+        get_face_store = None
+        max_size = 0
+
         if len(faces) == 0:
             return None, None
+        else:
+            for face in faces:
+                bbox = face.bbox.astype(np.int_).tolist()
+                w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                if w < 50 or h < 80:
+                    continue
+                if w / h > 1.5 or w / h < 0.2:
+                    continue
+                if face.det_score < threshold:
+                    continue
+                size_now = w * h
 
-        for face in faces:
-            bbox = face.bbox.astype(np.int_).tolist()
-            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            if w < 50 or h < 80:
-                continue
-            if w / h > 1.5 or w / h < 0.2:
-                continue
-            if face.det_score < threshold:
-                continue
+                if size_now > max_size:
+                    max_size = size_now
+                    get_face_store = face
 
+        if get_face_store is None:
+            return None, None
+        else:
+            face = get_face_store
             lmk = np.round(face.landmark_2d_106).astype(np.int_)
 
             halk_face_coord = np.mean([lmk[74], lmk[73]], axis=0)
@@ -53,10 +67,8 @@ class FaceDetector:
             y1 = max(0, y1)
             x2 = min(f_w, x2)
             y2 = min(f_h, y2)
-
+            logger.info(f"[FaceDetector] frame shape={frame.shape}, face bbox=({x1}, {y1}, {x2}, {y2}), det_score={face.det_score:.3f}")
             return (x1, y1, x2, y2), lmk
-
-        return None, None
 
 
 def cuda_to_int(cuda_str: str) -> int:
