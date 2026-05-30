@@ -255,13 +255,23 @@ class LipsyncPipeline(DiffusionPipeline):
     def detect_main_speaker_embedding(video_frames: np.ndarray, face_embedder) -> Optional[np.ndarray]:
         if face_embedder is None or len(video_frames) == 0:
             return None
-        mid_frame = video_frames[len(video_frames) // 2]
-        faces = face_embedder.get(mid_frame.astype(np.uint8))
-        if faces:
-            emb = getattr(faces[0], "normed_embedding", None)
-            if emb is not None:
-                return np.asarray(emb, dtype=np.float32)
-        return None
+
+        embedding_counts: dict = {}
+        sample_indices = list(range(0, len(video_frames), max(1, len(video_frames) // 10)))[:20]
+        for idx in sample_indices:
+            frame = video_frames[idx]
+            faces = face_embedder.get(frame.astype(np.uint8))
+            for f in faces:
+                emb = getattr(f, "normed_embedding", None)
+                if emb is None:
+                    continue
+                emb_key = tuple(np.round(emb.astype(np.float32), 4))
+                embedding_counts[emb_key] = embedding_counts.get(emb_key, 0) + 1
+
+        if not embedding_counts:
+            return None
+        most_common_key = max(embedding_counts, key=embedding_counts.get)
+        return np.array(most_common_key, dtype=np.float32)
 
     def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None):
         logger.info(f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}")
