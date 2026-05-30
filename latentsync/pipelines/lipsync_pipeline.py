@@ -252,26 +252,44 @@ class LipsyncPipeline(DiffusionPipeline):
         return images
 
     @staticmethod
-    def detect_main_speaker_embedding(video_frames: np.ndarray, face_embedder) -> Optional[np.ndarray]:
+    def _mouth_distance(lmk: np.ndarray) -> float:
+        if lmk is None:
+            return 0.0
+        inner_mouth = [52, 58, 67, 61]
+        outer_mouth = [48, 54, 51, 57]
+        try:
+            inner = np.mean([lmk[i] for i in inner_mouth], axis=0)
+            outer = np.mean([lmk[i] for i in outer_mouth], axis=0)
+            return float(np.linalg.norm(inner - outer))
+        except (IndexError, TypeError):
+            return 0.0
+
+    def detect_main_speaker_embedding(self, video_frames: np.ndarray, face_embedder) -> Optional[np.ndarray]:
         if face_embedder is None or len(video_frames) == 0:
             return None
-
-        embedding_counts: dict = {}
+        best_frame_idx = None
+        best_mouth_dist = -1.0
+        best_emb = None
         sample_indices = list(range(0, len(video_frames), max(1, len(video_frames) // 10)))[:20]
         for idx in sample_indices:
             frame = video_frames[idx]
-            faces = face_embedder.get(frame.astype(np.uint8))
-            for f in faces:
-                emb = getattr(f, "normed_embedding", None)
-                if emb is None:
-                    continue
-                emb_key = tuple(np.round(emb.astype(np.float32), 4))
-                embedding_counts[emb_key] = embedding_counts.get(emb_key, 0) + 1
-
-        if not embedding_counts:
+            bbox, lmk = self.image_processor.face_detector(frame)
+            if bbox is None:
+                continue
+            mouth_dist = self._mouth_distance(lmk)
+            if mouth_dist > best_mouth_dist:
+                best_mouth_dist = mouth_dist
+                best_frame_idx = idx
+        if best_frame_idx is None:
             return None
-        most_common_key = max(embedding_counts, key=embedding_counts.get)
-        return np.array(most_common_key, dtype=np.float32)
+        frame = video_frames[best_frame_idx]
+        faces = face_embedder.get(frame.astype(np.uint8))
+        if faces:
+            emb = getattr(faces[0], "normed_embedding", None)
+            if emb is not None:
+                best_emb = np.asarray(emb, dtype=np.float32)
+        logger.info(f"[LipSync] Main speaker from frame {best_frame_idx} with mouth_dist={best_mouth_dist:.2f}")
+        return best_emb
 
     def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None):
         logger.info(f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}")
