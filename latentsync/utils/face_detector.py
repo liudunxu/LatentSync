@@ -46,7 +46,7 @@ class FaceDetector:
         pose = getattr(face, "pose", None)
         if pose is not None:
             yaw = abs(pose[1])
-            if yaw > 20:
+            if yaw > 15:
                 logger.debug(f"[FaceDetector] Skipping side face: yaw={yaw:.1f}")
                 return None, None
 
