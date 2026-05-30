@@ -388,7 +388,7 @@ class LipsyncPipeline(DiffusionPipeline):
         audio_sample_rate: int = 16000,
         height: Optional[int] = None,
         width: Optional[int] = None,
-        num_inference_steps: int = 30,
+        num_inference_steps: int = 40,
         guidance_scale: float = 1.5,
         weight_dtype: Optional[torch.dtype] = torch.float16,
         eta: float = 0.0,
