@@ -271,7 +271,8 @@ class LipsyncPipeline(DiffusionPipeline):
                 if skip_mask is not None and face_emb is not None:
                     similarity = float(np.dot(face_emb, reference_embedding))
                     should_skip = similarity < 0.7
-                skip_mask.append(should_skip)
+                if skip_mask is not None:
+                    skip_mask.append(should_skip)
                 faces.append(face)
                 boxes.append(box)
                 affine_matrices.append(affine_matrix)
@@ -313,13 +314,15 @@ class LipsyncPipeline(DiffusionPipeline):
                     loop_faces.append(faces)
                     loop_boxes += boxes
                     loop_affine_matrices += affine_matrices
-                    loop_skip_mask += frame_skip_mask
+                    if frame_skip_mask is not None:
+                        loop_skip_mask += frame_skip_mask
                 else:
                     loop_video_frames.append(video_frames[::-1])
                     loop_faces.append(faces.flip(0))
                     loop_boxes += boxes[::-1]
                     loop_affine_matrices += affine_matrices[::-1]
-                    loop_skip_mask += frame_skip_mask[::-1]
+                    if frame_skip_mask is not None:
+                        loop_skip_mask += frame_skip_mask[::-1]
 
             video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
             faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
