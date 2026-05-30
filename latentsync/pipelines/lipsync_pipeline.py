@@ -252,15 +252,15 @@ class LipsyncPipeline(DiffusionPipeline):
         return images
 
     @staticmethod
-    def _mouth_distance(lmk: np.ndarray) -> float:
-        if lmk is None:
+    def _mouth_open_ratio(lmk: np.ndarray, face_size: float) -> float:
+        if lmk is None or face_size <= 0:
             return 0.0
         inner_mouth = [52, 58, 67, 61]
         outer_mouth = [48, 54, 51, 57]
         try:
             inner = np.mean([lmk[i] for i in inner_mouth], axis=0)
             outer = np.mean([lmk[i] for i in outer_mouth], axis=0)
-            return float(np.linalg.norm(inner - outer))
+            return float(np.linalg.norm(inner - outer) / face_size)
         except (IndexError, TypeError):
             return 0.0
 
@@ -268,7 +268,7 @@ class LipsyncPipeline(DiffusionPipeline):
         if face_embedder is None or len(video_frames) == 0:
             return None
         best_frame_idx = None
-        best_mouth_dist = -1.0
+        best_ratio = -1.0
         best_emb = None
         sample_indices = list(range(0, len(video_frames), max(1, len(video_frames) // 10)))[:20]
         for idx in sample_indices:
@@ -276,9 +276,11 @@ class LipsyncPipeline(DiffusionPipeline):
             bbox, lmk = self.image_processor.face_detector(frame)
             if bbox is None:
                 continue
-            mouth_dist = self._mouth_distance(lmk)
-            if mouth_dist > best_mouth_dist:
-                best_mouth_dist = mouth_dist
+            x1, y1, x2, y2 = bbox
+            face_size = max(x2 - x1, y2 - y1)
+            mouth_ratio = self._mouth_open_ratio(lmk, face_size)
+            if mouth_ratio > best_ratio:
+                best_ratio = mouth_ratio
                 best_frame_idx = idx
         if best_frame_idx is None:
             return None
@@ -288,7 +290,7 @@ class LipsyncPipeline(DiffusionPipeline):
             emb = getattr(faces[0], "normed_embedding", None)
             if emb is not None:
                 best_emb = np.asarray(emb, dtype=np.float32)
-        logger.info(f"[LipSync] Main speaker from frame {best_frame_idx} with mouth_dist={best_mouth_dist:.2f}")
+        logger.info(f"[LipSync] Main speaker from frame {best_frame_idx} with mouth_ratio={best_ratio:.4f}")
         return best_emb
 
     def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None):
