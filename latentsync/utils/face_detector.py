@@ -1,6 +1,9 @@
 from insightface.app import FaceAnalysis
 import numpy as np
 import torch
+import logging
+
+logger = logging.getLogger(__name__)
 
 INSIGHTFACE_DETECT_SIZE = 512
 
@@ -39,6 +42,14 @@ class FaceDetector:
 
         valid_faces.sort(key=lambda x: x[1], reverse=True)
         face, _ = valid_faces[0]
+
+        pose = getattr(face, "pose", None)
+        if pose is not None:
+            yaw = abs(pose[1])
+            if yaw > 30:
+                logger.debug(f"[FaceDetector] Skipping side face: yaw={yaw:.1f}")
+                return None, None
+
         lmk = np.round(face.landmark_2d_106).astype(np.int_)
 
         halk_face_coord = np.mean([lmk[74], lmk[73]], axis=0)
