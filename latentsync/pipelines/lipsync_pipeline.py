@@ -251,28 +251,38 @@ class LipsyncPipeline(DiffusionPipeline):
         images = images.cpu().numpy()
         return images
 
+    @staticmethod
+    def detect_main_speaker_embedding(video_frames: np.ndarray, face_embedder) -> Optional[np.ndarray]:
+        if face_embedder is None or len(video_frames) == 0:
+            return None
+        mid_frame = video_frames[len(video_frames) // 2]
+        faces = face_embedder.get(mid_frame.astype(np.uint8))
+        if faces:
+            emb = getattr(faces[0], "normed_embedding", None)
+            if emb is not None:
+                return np.asarray(emb, dtype=np.float32)
+        return None
+
     def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None):
         logger.info(f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}")
         faces = []
         boxes = []
         affine_matrices = []
-        skip_mask = [] if reference_embedding is not None else None
+        skip_mask = []
         print(f"Affine transforming {len(video_frames)} faces...")
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
             face, box, affine_matrix, face_emb = self.image_processor.affine_transform_with_embedding(frame)
             if face is None:
-                if skip_mask is not None:
-                    skip_mask.append(True)
+                skip_mask.append(True)
                 faces.append(torch.zeros(3, self.image_processor.resolution, self.image_processor.resolution))
                 boxes.append([0, 0, 0, 0])
                 affine_matrices.append(np.eye(3))
             else:
                 should_skip = False
-                if skip_mask is not None and face_emb is not None:
+                if reference_embedding is not None and face_emb is not None:
                     similarity = float(np.dot(face_emb, reference_embedding))
                     should_skip = similarity < 0.7
-                if skip_mask is not None:
-                    skip_mask.append(should_skip)
+                skip_mask.append(should_skip)
                 faces.append(face)
                 boxes.append(box)
                 affine_matrices.append(affine_matrix)
@@ -298,8 +308,11 @@ class LipsyncPipeline(DiffusionPipeline):
                 out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 
-    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray, reference_embedding=None, skip_mask=None):
+    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray, reference_embedding=None, face_embedder=None, skip_mask=None):
         logger.info(f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}")
+        if reference_embedding is None and face_embedder is not None:
+            reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
+            logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
         if len(whisper_chunks) > len(video_frames):
             faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding)
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
@@ -314,21 +327,19 @@ class LipsyncPipeline(DiffusionPipeline):
                     loop_faces.append(faces)
                     loop_boxes += boxes
                     loop_affine_matrices += affine_matrices
-                    if frame_skip_mask is not None:
-                        loop_skip_mask += frame_skip_mask
+                    loop_skip_mask += frame_skip_mask
                 else:
                     loop_video_frames.append(video_frames[::-1])
                     loop_faces.append(faces.flip(0))
                     loop_boxes += boxes[::-1]
                     loop_affine_matrices += affine_matrices[::-1]
-                    if frame_skip_mask is not None:
-                        loop_skip_mask += frame_skip_mask[::-1]
+                    loop_skip_mask += frame_skip_mask[::-1]
 
             video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
             faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
             boxes = loop_boxes[: len(whisper_chunks)]
             affine_matrices = loop_affine_matrices[: len(whisper_chunks)]
-            skip_mask = loop_skip_mask[: len(whisper_chunks)] if loop_skip_mask else None
+            skip_mask = loop_skip_mask[: len(whisper_chunks)]
         else:
             video_frames = video_frames[: len(whisper_chunks)]
             faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding)
@@ -401,7 +412,7 @@ class LipsyncPipeline(DiffusionPipeline):
         video_frames = read_video(video_path, use_decord=False)
         logger.info(f"[LipSync] video_frames shape={video_frames.shape}")
 
-        video_frames, faces, boxes, affine_matrices, skip_mask = self.loop_video(whisper_chunks, video_frames, reference_embedding=reference_embedding)
+        video_frames, faces, boxes, affine_matrices, skip_mask = self.loop_video(whisper_chunks, video_frames, reference_embedding=reference_embedding, face_embedder=face_embedder)
         logger.info(f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, affine_matrices={len(affine_matrices)}, skip_mask={skip_mask}")
 
         synced_video_frames = []
