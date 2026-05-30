@@ -288,7 +288,7 @@ class LipsyncPipeline(DiffusionPipeline):
             height = int(y2 - y1)
             width = int(x2 - x1)
             should_skip = skip_mask[index] if skip_mask and index < len(skip_mask) else False
-            if should_skip:
+            if should_skip or height <= 0 or width <= 0:
                 out_frames.append(video_frames[index])
             else:
                 face_resized = torchvision.transforms.functional.resize(
