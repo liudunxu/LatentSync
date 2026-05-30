@@ -429,7 +429,7 @@ def _download_to_file(url: str, dest_dir: Path, prefix: str, allowed: set, fallb
 
 def _output_url(request: Request, output_path: Path) -> str:
     relative = output_path.relative_to(OUTPUT_ROOT).as_posix()
-    scheme = request.url.scheme if hasattr(request, 'url') and request.url else "https"
+    scheme = "https"
     host = request.headers.get("host", str(request.base_url).split("/")[2] if "://" in str(request.base_url) else f"localhost:8443")
     if ":" not in host:
         host = f"{host}:8443"
