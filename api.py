@@ -61,7 +61,7 @@ class Settings:
     gpu_id: int = int(os.getenv("LATENTSYNC_GPU_ID", "0"))
     unet_config_path: str = os.getenv("LATENTSYNC_UNET_CONFIG", "configs/unet/stage2_512.yaml")
     inference_ckpt_path: str = os.getenv("LATENTSYNC_INFERENCE_CKPT", "checkpoints/latentsync_unet.pt")
-    guidance_scale: float = float(os.getenv("LATENTSYNC_GUIDANCE_SCALE", "2.4"))
+    guidance_scale: float = float(os.getenv("LATENTSYNC_GUIDANCE_SCALE", "2.1"))
     inference_steps: int = int(os.getenv("LATENTSYNC_INFERENCE_STEPS", "30"))
     seed: int = int(os.getenv("LATENTSYNC_SEED", "1247"))
     enable_deepcache: bool = os.getenv("LATENTSYNC_ENABLE_DEEPCACHE", "1").lower() in {"1", "true", "yes"}
@@ -139,9 +139,9 @@ class LipSyncRequest(BaseModel):
     # Side-face / fast-turn prefilters. Frames exceeding either threshold fall
     # back to the original (no inpainting), which is the right call for blurry
     # side profiles and motion-blur turns. yaw_rate is in degrees/frame, not
-    # per second (12°/frame at 25fps ≈ 300°/sec).
-    yaw_skip_threshold: float = Field(24.0, ge=0.0, le=90.0)
-    yaw_rate_skip_threshold: float = Field(12.0, ge=0.0, le=45.0)
+    # per second (10°/frame at 25fps ≈ 250°/sec).
+    yaw_skip_threshold: float = Field(18.0, ge=0.0, le=90.0)
+    yaw_rate_skip_threshold: float = Field(10.0, ge=0.0, le=45.0)
     # Episode-level side-face filter: when N consecutive frames exceed
     # yaw_skip_threshold, also skip `pre_pad`/`post_pad` frames of
     # transition zone around the episode (frames whose yaw is between
@@ -153,10 +153,10 @@ class LipSyncRequest(BaseModel):
     side_face_episode_post_pad: int = Field(4, ge=0, le=30)
     # Warn-band ratio: yaws above `yaw_skip_threshold * ratio` but below
     # `yaw_skip_threshold` are treated as transition frames / near-profile
-    # runs. Default 0.75 = warn @ 18° for the default 24° threshold.
-    yaw_warn_threshold_ratio: float = Field(0.75, ge=0.0, le=1.0)
+    # runs. Default 0.70 = warn @ 12.6° for the default 18° threshold.
+    yaw_warn_threshold_ratio: float = Field(0.70, ge=0.0, le=1.0)
     side_face_warn_min_run_frames: int = Field(
-        3,
+        2,
         ge=0,
         le=120,
         description="Skip sustained near-profile runs above the yaw warn threshold; 0 disables.",

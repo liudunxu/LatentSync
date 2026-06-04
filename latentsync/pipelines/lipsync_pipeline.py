@@ -727,15 +727,15 @@ class LipsyncPipeline(DiffusionPipeline):
         self,
         video_frames: np.ndarray,
         reference_embedding=None,
-        yaw_skip_threshold: float = 24.0,
-        yaw_rate_skip_threshold: float = 12.0,
+        yaw_skip_threshold: float = 18.0,
+        yaw_rate_skip_threshold: float = 10.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.20,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 4,
         side_face_episode_post_pad: int = 4,
-        yaw_warn_threshold_ratio: float = 0.75,
-        side_face_warn_min_run_frames: int = 3,
+        yaw_warn_threshold_ratio: float = 0.70,
+        side_face_warn_min_run_frames: int = 2,
     ):
         logger.info(
             f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
@@ -950,15 +950,15 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         skip_mask=None,
-        yaw_skip_threshold: float = 24.0,
-        yaw_rate_skip_threshold: float = 12.0,
+        yaw_skip_threshold: float = 18.0,
+        yaw_rate_skip_threshold: float = 10.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.20,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 4,
         side_face_episode_post_pad: int = 4,
-        yaw_warn_threshold_ratio: float = 0.75,
-        side_face_warn_min_run_frames: int = 3,
+        yaw_warn_threshold_ratio: float = 0.70,
+        side_face_warn_min_run_frames: int = 2,
     ):
         logger.info(
             f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
@@ -1054,7 +1054,7 @@ class LipsyncPipeline(DiffusionPipeline):
         temporal_smoothing_enabled: bool = True,
         # Preserve current-frame mouth-core motion after temporal smoothing.
         # 0 = fully smoothed mouth, 1 = keep generated current-frame mouth.
-        mouth_motion_preserve_strength: float = 0.75,
+        mouth_motion_preserve_strength: float = 0.45,
         # Postfilter: skip frames where the generated mouth ROI is clearly
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
@@ -1063,9 +1063,9 @@ class LipsyncPipeline(DiffusionPipeline):
         quality_min_sharpness_ratio: float = 0.05,
         quality_max_fallback_ratio: float = 0.45,
         # Yaw-based prefilters for side faces / fast head turns. Defaults now
-        # prefer filtering hard profile cases over trying to synthesize them.
-        yaw_skip_threshold: float = 24.0,
-        yaw_rate_skip_threshold: float = 12.0,
+        # prefer filtering side/profile cases over trying to synthesize them.
+        yaw_skip_threshold: float = 18.0,
+        yaw_rate_skip_threshold: float = 10.0,
         # Episode-level side-face filter: when contiguous frames exceed
         # yaw_skip_threshold, also skip pre_pad/post_pad transition frames
         # around the episode (whose yaw is in the warn band between
@@ -1073,8 +1073,8 @@ class LipsyncPipeline(DiffusionPipeline):
         # Set pre_pad/post_pad to 0 to disable the padding.
         side_face_episode_pre_pad: int = 4,
         side_face_episode_post_pad: int = 4,
-        yaw_warn_threshold_ratio: float = 0.75,
-        side_face_warn_min_run_frames: int = 3,
+        yaw_warn_threshold_ratio: float = 0.70,
+        side_face_warn_min_run_frames: int = 2,
         # Mouth-occlusion prefilter: skip frames where the mouth is covered
         # by a hand, microphone, phone, mask, etc. Score 0..1; above the
         # threshold the frame is treated as not-lip-syncable and the original
