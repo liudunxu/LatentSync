@@ -297,8 +297,8 @@ class LipsyncPipeline(DiffusionPipeline):
         mask: torch.Tensor,
         strength: float = 0.6,
     ) -> torch.Tensor:
-        """Per-frame mean+std color transfer from `face` to match `ref_face`,
-        applied only inside the mask region of `face`.
+        """Mean+std color transfer from `face` to match `ref_face`,
+        applied only inside `mask` (1 = generated region).
 
         Why: the inpainter outputs the full 512x512 face, but only the masked
         region (lower face) is "new" -- the rest is supposed to be a no-op
@@ -309,9 +309,9 @@ class LipsyncPipeline(DiffusionPipeline):
         the original is sharp and unmasked) makes the seam invisible.
 
         Args:
-            face: (3, H, W) generated face in [-1, 1] (after paste step).
-            ref_face: (3, H, W) original face in [-1, 1] -- same shape, no paste.
-            mask: (1, H, W) in [0, 1] (1 = generated region).
+            face: (3, H, W) or (B, 3, H, W) generated face in [-1, 1].
+            ref_face: same shape as face.
+            mask: (1, H, W), (B, 1, H, W), or broadcastable mask in [0, 1].
             strength: 0 = no transfer, 1 = full transfer.
 
         Returns:
@@ -319,40 +319,51 @@ class LipsyncPipeline(DiffusionPipeline):
         """
         if strength <= 0 or face is None or ref_face is None or mask is None:
             return face
-        if face.shape != ref_face.shape or face.shape[0] != 3:
+        if face.shape != ref_face.shape:
             return face
         try:
+            squeeze = False
             x = face.detach().to(torch.float32)
-            r = ref_face.detach().to(torch.float32)
-            m1 = mask.detach().to(torch.float32)
-            # Normalize mask to (3, H, W) for elementwise mul, and a per-
-            # channel weight tensor (1, H, W) for stats so the per-channel
-            # mean/std isn't diluted by a 3x broadcast.
-            if m1.dim() == 3:
-                if m1.shape[0] == 3:
-                    m3 = m1
-                    m_w = m1[0:1]
-                else:  # (1, H, W)
-                    m3 = m1.expand(3, -1, -1)
-                    m_w = m1
-            else:  # (H, W)
-                m3 = m1.unsqueeze(0).expand(3, -1, -1)
-                m_w = m1.unsqueeze(0)
-            weight_sum = m_w.sum(dim=(1, 2)).clamp_min(1.0).expand(3)
+            r = ref_face.detach().to(device=x.device, dtype=torch.float32)
+            m1 = mask.detach().to(device=x.device, dtype=torch.float32)
+            if x.dim() == 3:
+                x = x.unsqueeze(0)
+                r = r.unsqueeze(0)
+                squeeze = True
+            if x.dim() != 4 or x.shape[1] != 3:
+                return face
+            if m1.dim() == 2:
+                m1 = m1.unsqueeze(0).unsqueeze(0)
+            elif m1.dim() == 3:
+                m1 = m1.unsqueeze(0) if m1.shape[0] in (1, 3) else m1.unsqueeze(1)
+            if m1.dim() != 4:
+                return face
+            if m1.shape[1] == 3:
+                m_w = m1[:, 0:1]
+                m3 = m1
+            else:
+                m_w = m1[:, 0:1]
+                m3 = m_w.expand(-1, 3, -1, -1)
+            if m3.shape[0] == 1 and x.shape[0] > 1:
+                m3 = m3.expand(x.shape[0], -1, -1, -1)
+                m_w = m_w.expand(x.shape[0], -1, -1, -1)
+            if m3.shape[0] != x.shape[0]:
+                return face
+            weight_sum = m_w.sum(dim=(2, 3)).clamp_min(1.0).expand(-1, 3)
             src_pixels = x * m3
             tgt_pixels = r * m3
-            src_mean = src_pixels.sum(dim=(1, 2)) / weight_sum
-            tgt_mean = tgt_pixels.sum(dim=(1, 2)) / weight_sum
-            src_var = ((x - src_mean.view(3, 1, 1)) ** 2 * m3).sum(dim=(1, 2)) / weight_sum
-            tgt_var = ((r - tgt_mean.view(3, 1, 1)) ** 2 * m3).sum(dim=(1, 2)) / weight_sum
+            src_mean = src_pixels.sum(dim=(2, 3)) / weight_sum
+            tgt_mean = tgt_pixels.sum(dim=(2, 3)) / weight_sum
+            src_var = ((x - src_mean[:, :, None, None]) ** 2 * m3).sum(dim=(2, 3)) / weight_sum
+            tgt_var = ((r - tgt_mean[:, :, None, None]) ** 2 * m3).sum(dim=(2, 3)) / weight_sum
             src_std = src_var.clamp_min(1e-6).sqrt()
             tgt_std = tgt_var.clamp_min(1e-6).sqrt()
             scale = tgt_std / src_std
             shift = tgt_mean - src_mean * scale
-            # Apply ONLY inside the mask -- never touch the unmasked region
-            # (which is the original face and is already correct).
-            adjusted = x * scale.view(3, 1, 1) + shift.view(3, 1, 1)
+            adjusted = x * scale[:, :, None, None] + shift[:, :, None, None]
             mixed = x + m3 * strength * (adjusted - x)
+            if squeeze:
+                mixed = mixed.squeeze(0)
             return mixed.to(face.dtype)
         except Exception:
             return face
@@ -370,13 +381,27 @@ class LipsyncPipeline(DiffusionPipeline):
         """
         if amount <= 0 or face is None or mask is None:
             return face
-        if face.shape[0] != 3:
-            return face
         try:
+            squeeze = False
             x = face.detach().to(torch.float32)
-            m = mask.detach().to(torch.float32)
-            if m.shape[0] == 1:
-                m = m.expand(3, -1, -1)
+            if x.dim() == 3:
+                x = x.unsqueeze(0)
+                squeeze = True
+            if x.dim() != 4 or x.shape[1] != 3:
+                return face
+            m = mask.detach().to(device=x.device, dtype=torch.float32)
+            if m.dim() == 2:
+                m = m.unsqueeze(0).unsqueeze(0)
+            elif m.dim() == 3:
+                m = m.unsqueeze(0) if m.shape[0] in (1, 3) else m.unsqueeze(1)
+            if m.dim() != 4:
+                return face
+            if m.shape[1] == 1:
+                m = m.expand(-1, 3, -1, -1)
+            if m.shape[0] == 1 and x.shape[0] > 1:
+                m = m.expand(x.shape[0], -1, -1, -1)
+            if m.shape[0] != x.shape[0]:
+                return face
             # Build a small Gaussian kernel -- radius 3 ≈ sigma 1.0
             k = 2 * radius + 1
             sigma = max(1.0, (k - 1) / 6.0)
@@ -387,14 +412,120 @@ class LipsyncPipeline(DiffusionPipeline):
             # gets its own filter, which is just the 1D Gaussian repeated).
             kx = g1.view(1, 1, 1, k).expand(3, 1, 1, k)
             ky = g1.view(1, 1, k, 1).expand(3, 1, k, 1)
-            inp = x.unsqueeze(0)
-            inp_pad = torch.nn.functional.pad(inp, (radius, radius, 0, 0), mode="reflect")
+            inp_pad = torch.nn.functional.pad(x, (radius, radius, 0, 0), mode="reflect")
             inp_pad = torch.nn.functional.pad(inp_pad, (0, 0, radius, radius), mode="reflect")
             tmp = torch.nn.functional.conv2d(inp_pad, kx, groups=3)
             blurred = torch.nn.functional.conv2d(tmp, ky, groups=3)
-            sharpened = x + amount * (x - blurred.squeeze(0))
+            sharpened = x + amount * (x - blurred)
             out = x + m * (sharpened - x)
+            if squeeze:
+                out = out.squeeze(0)
             return out.to(face.dtype)
+        except Exception:
+            return face
+
+    @staticmethod
+    def _mouth_core_mask(mask: torch.Tensor, mouth_keep: float = 0.78) -> torch.Tensor:
+        """Return the central mouth-motion area inside an inpaint mask.
+
+        `mask` is 1 where the model-generated lower face is visible. The
+        returned mask keeps the lip aperture and lip contour protected from
+        detail restoration, while allowing cheeks/chin around it to recover
+        reference texture.
+        """
+        if mask is None:
+            return mask
+        try:
+            m = mask.detach().to(torch.float32)
+            squeeze = False
+            if m.dim() == 2:
+                m = m.unsqueeze(0).unsqueeze(0)
+                squeeze = True
+            elif m.dim() == 3:
+                m = m.unsqueeze(0) if m.shape[0] in (1, 3) else m.unsqueeze(1)
+                squeeze = True
+            if m.dim() != 4:
+                return mask
+            base = m[:, 0:1]
+            B, _, H, W = base.shape
+            yy = torch.linspace(0.0, 1.0, H, dtype=torch.float32, device=base.device).view(1, 1, H, 1)
+            xx = torch.linspace(0.0, 1.0, W, dtype=torch.float32, device=base.device).view(1, 1, 1, W)
+            # Aligned-face mouth center: roughly x=0.5, y=0.66. Ellipse is
+            # intentionally wider than the aperture so lip motion survives.
+            ell = ((xx - 0.50) / 0.22) ** 2 + ((yy - 0.66) / 0.12) ** 2
+            core = (1.0 - (ell - mouth_keep) / max(1e-6, 1.0 - mouth_keep)).clamp(0.0, 1.0)
+            core = base * core.expand(B, 1, H, W)
+            if mask.dim() == 4 and mask.shape[1] == 3:
+                core = core.expand(-1, 3, -1, -1)
+            if squeeze:
+                core = core.squeeze(0)
+            return core.to(mask.dtype)
+        except Exception:
+            return mask
+
+    @staticmethod
+    def _restore_reference_detail(
+        face: torch.Tensor,
+        ref_face: torch.Tensor,
+        mask: torch.Tensor,
+        strength: float = 0.65,
+        radius: int = 3,
+    ) -> torch.Tensor:
+        """Blend original high-frequency detail back outside the mouth core.
+
+        This reduces washed cheeks/chin and mask-boundary softness while
+        preserving the generated lip opening/closing in the central mouth.
+        """
+        if strength <= 0 or face is None or ref_face is None or mask is None:
+            return face
+        if face.shape != ref_face.shape:
+            return face
+        try:
+            squeeze = False
+            x = face.detach().to(torch.float32)
+            r = ref_face.detach().to(device=x.device, dtype=torch.float32)
+            if x.dim() == 3:
+                x = x.unsqueeze(0)
+                r = r.unsqueeze(0)
+                squeeze = True
+            if x.dim() != 4 or x.shape[1] != 3:
+                return face
+            m = mask.detach().to(device=x.device, dtype=torch.float32)
+            if m.dim() == 2:
+                m = m.unsqueeze(0).unsqueeze(0)
+            elif m.dim() == 3:
+                m = m.unsqueeze(0) if m.shape[0] in (1, 3) else m.unsqueeze(1)
+            if m.dim() != 4:
+                return face
+            if m.shape[1] == 3:
+                m = m[:, 0:1]
+            if m.shape[0] == 1 and x.shape[0] > 1:
+                m = m.expand(x.shape[0], -1, -1, -1)
+            if m.shape[0] != x.shape[0]:
+                return face
+            mouth_core = LipsyncPipeline._mouth_core_mask(m).to(torch.float32)
+            detail_mask = (m * (1.0 - mouth_core)).expand(-1, 3, -1, -1)
+
+            k = 2 * radius + 1
+            sigma = max(1.0, (k - 1) / 6.0)
+            ax = torch.arange(k, dtype=torch.float32, device=x.device) - radius
+            g1 = torch.exp(-(ax ** 2) / (2 * sigma * sigma))
+            g1 = g1 / g1.sum()
+            kx = g1.view(1, 1, 1, k).expand(3, 1, 1, k)
+            ky = g1.view(1, 1, k, 1).expand(3, 1, k, 1)
+
+            def blur(inp: torch.Tensor) -> torch.Tensor:
+                padded = torch.nn.functional.pad(inp, (radius, radius, 0, 0), mode="reflect")
+                padded = torch.nn.functional.pad(padded, (0, 0, radius, radius), mode="reflect")
+                return torch.nn.functional.conv2d(
+                    torch.nn.functional.conv2d(padded, kx, groups=3), ky, groups=3
+                )
+
+            ref_detail = r - blur(r)
+            out = x + detail_mask * strength * ref_detail
+            if squeeze:
+                out = out.squeeze(0)
+            return out.clamp(-1.0, 1.0).to(face.dtype)
         except Exception:
             return face
 
@@ -545,9 +676,9 @@ class LipsyncPipeline(DiffusionPipeline):
         self,
         video_frames: np.ndarray,
         reference_embedding=None,
-        yaw_skip_threshold: float = 20.0,
-        yaw_rate_skip_threshold: float = 8.0,
-        mouth_occlusion_skip_threshold: float = 0.85,
+        yaw_skip_threshold: float = 30.0,
+        yaw_rate_skip_threshold: float = 12.0,
+        mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.20,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 4,
@@ -737,11 +868,14 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         skip_mask=None,
-        yaw_skip_threshold: float = 20.0,
-        yaw_rate_skip_threshold: float = 8.0,
-        mouth_occlusion_skip_threshold: float = 0.85,
+        yaw_skip_threshold: float = 30.0,
+        yaw_rate_skip_threshold: float = 12.0,
+        mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.20,
         apply_identity_filter: bool = True,
+        side_face_episode_pre_pad: int = 4,
+        side_face_episode_post_pad: int = 4,
+        yaw_warn_threshold_ratio: float = 0.5,
     ):
         logger.info(
             f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
@@ -762,6 +896,9 @@ class LipsyncPipeline(DiffusionPipeline):
                 mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
                 motion_blur_skip_threshold=motion_blur_skip_threshold,
                 apply_identity_filter=apply_identity_filter,
+                side_face_episode_pre_pad=side_face_episode_pre_pad,
+                side_face_episode_post_pad=side_face_episode_post_pad,
+                yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
             )
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
             loop_video_frames = []
@@ -798,6 +935,9 @@ class LipsyncPipeline(DiffusionPipeline):
                 mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
                 motion_blur_skip_threshold=motion_blur_skip_threshold,
                 apply_identity_filter=apply_identity_filter,
+                side_face_episode_pre_pad=side_face_episode_pre_pad,
+                side_face_episode_post_pad=side_face_episode_post_pad,
+                yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
             )
             skip_mask = frame_skip_mask
 
@@ -840,13 +980,11 @@ class LipsyncPipeline(DiffusionPipeline):
         # default was tuned for a different scale and skipped everything.
         quality_min_laplacian: float = 0.5,
         quality_min_sharpness_ratio: float = 0.20,
-        # Yaw-based prefilters for side faces / fast head turns. 20°/8°/frame
-        # is the empirical sweet spot: 30° lets too many "mostly-side" frames
-        # through (they render as visible blur blocks around the mouth);
-        # turning >8°/frame also produces blur because the affine alignment
-        # can't keep up. Both fall back to the original frame in restore_video.
-        yaw_skip_threshold: float = 20.0,
-        yaw_rate_skip_threshold: float = 8.0,
+        # Yaw-based prefilters for side faces / fast head turns. Defaults are
+        # conservative enough to avoid wiping most frames on profile-heavy
+        # clips, while still falling back on clearly side-on / fast-turn frames.
+        yaw_skip_threshold: float = 30.0,
+        yaw_rate_skip_threshold: float = 12.0,
         # Episode-level side-face filter: when contiguous frames exceed
         # yaw_skip_threshold, also skip pre_pad/post_pad transition frames
         # around the episode (whose yaw is in the warn band between
@@ -857,10 +995,10 @@ class LipsyncPipeline(DiffusionPipeline):
         yaw_warn_threshold_ratio: float = 0.5,
         # Mouth-occlusion prefilter: skip frames where the mouth is covered
         # by a hand, microphone, phone, mask, etc. Score 0..1; above the
-        # threshold (default 0.85 -- was 0.7, too sensitive on multi-speaker
-        # / side-face clips) the frame is treated as not-lip-syncable and
-        # the original frame is used. Set to 1.0 to disable.
-        mouth_occlusion_skip_threshold: float = 0.85,
+        # threshold the frame is treated as not-lip-syncable and the original
+        # frame is used. Default 1.0 disables this heuristic because it was
+        # too sensitive on side/profile shots and could eat most frames.
+        mouth_occlusion_skip_threshold: float = 1.0,
         # Motion-blur input filter: skip frames whose aligned face is too
         # smeared to inpaint cleanly. Default 0.20 (Laplacian variance in
         # the [-1, 1] face space; a sharp face scores ~5-20, a motion-blurred
@@ -872,6 +1010,9 @@ class LipsyncPipeline(DiffusionPipeline):
         # Unsharp-mask amount applied to the generated mouth region.
         # 0 = off, 1 = strong sharpen. Default 0.35.
         mouth_sharpen_strength: float = 0.35,
+        # Original-detail restoration outside the central mouth-motion core.
+        # 0 = off, 1 = strong reference detail. Default 0.65.
+        mouth_detail_strength: float = 0.65,
         **kwargs,
     ):
         is_train = self.unet.training
@@ -931,6 +1072,9 @@ class LipsyncPipeline(DiffusionPipeline):
             mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
             motion_blur_skip_threshold=motion_blur_skip_threshold,
             apply_identity_filter=apply_identity_filter,
+            side_face_episode_pre_pad=side_face_episode_pre_pad,
+            side_face_episode_post_pad=side_face_episode_post_pad,
+            yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
         )
         logger.info(f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, affine_matrices={len(affine_matrices)}, apply_identity_filter={apply_identity_filter}, skip_true={sum(skip_mask)}/{len(skip_mask)}")
 
@@ -1050,19 +1194,30 @@ class LipsyncPipeline(DiffusionPipeline):
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
+            generated_region_mask = (1 - masks).to(device=device, dtype=decoded_latents.dtype)
             # Per-frame color match: align generated face stats to original
             # so the soft-mask boundary in restore_img doesn't reveal a
             # tone drift. Applied inside the mask region only.
             if color_match_strength > 0:
                 decoded_latents = self._match_color_to_reference(
-                    decoded_latents, ref_pixel_values, masks, strength=color_match_strength
+                    decoded_latents, ref_pixel_values, generated_region_mask, strength=color_match_strength
+                )
+            # Restore original high-frequency skin/detail around the lips
+            # while protecting the central mouth aperture/contour where the
+            # generated motion must remain dominant.
+            if mouth_detail_strength > 0:
+                decoded_latents = self._restore_reference_detail(
+                    decoded_latents,
+                    ref_pixel_values,
+                    generated_region_mask,
+                    strength=mouth_detail_strength,
                 )
             # Mouth-region unsharp: recover high-frequency detail in the
             # generated mouth. Inpainter outputs tend to be slightly soft
             # because the prompt encourages plausible-but-not-sharp.
             if mouth_sharpen_strength > 0:
                 decoded_latents = self._unsharp_mask(
-                    decoded_latents, masks, amount=mouth_sharpen_strength
+                    decoded_latents, generated_region_mask, amount=mouth_sharpen_strength
                 )
             if i == 0:
                 with torch.no_grad():
@@ -1126,9 +1281,10 @@ class LipsyncPipeline(DiffusionPipeline):
         pre_skip = sum(skip_mask)
         quality_skip = sum(quality_skip_mask)
         effective_skip = sum(effective_skip_mask)
+        effective_generated = len(effective_skip_mask) - effective_skip
         logger.info(
             f"[Diag] skip summary: pre(loop_video)={pre_skip} quality_postfilter={quality_skip} "
-            f"effective_total={effective_skip} / {len(skip_mask)}"
+            f"effective_total={effective_skip} generated={effective_generated} / {len(skip_mask)}"
         )
         if quality_fallback_count:
             logger.info(f"[LipSync] quality_fallback_frames={quality_fallback_count} / {len(skip_mask)}")
@@ -1150,6 +1306,10 @@ class LipsyncPipeline(DiffusionPipeline):
         # Stash stats for the API layer to read (synthesize() consumes this).
         self._last_run_stats = {
             "quality_fallback_frames": quality_fallback_count,
+            "pre_skip_frames": pre_skip,
+            "quality_skip_frames": quality_skip,
+            "effective_skip_frames": effective_skip,
+            "effective_generated_frames": effective_generated,
             "yaw_skip_count": getattr(self, "_last_yaw_skip_count", 0),
             "yaw_rate_skip_count": getattr(self, "_last_yaw_rate_skip_count", 0),
             "mouth_occlusion_skip_count": getattr(self, "_last_mouth_occlusion_skip_count", 0),
@@ -1163,6 +1323,9 @@ class LipsyncPipeline(DiffusionPipeline):
             "motion_blur_skip_threshold": motion_blur_skip_threshold,
             "temporal_smoothing_enabled": temporal_smoothing_enabled,
             "quality_gate_enabled": quality_gate_enabled,
+            "color_match_strength": color_match_strength,
+            "mouth_detail_strength": mouth_detail_strength,
+            "mouth_sharpen_strength": mouth_sharpen_strength,
         }
 
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)

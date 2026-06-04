@@ -141,9 +141,9 @@ class LipSyncRequest(BaseModel):
     # Side-face / fast-turn prefilters. Frames exceeding either threshold fall
     # back to the original (no inpainting), which is the right call for blurry
     # side profiles and motion-blur turns. yaw_rate is in degrees/frame, not
-    # per second (8°/frame at 25fps ≈ 200°/sec).
-    yaw_skip_threshold: float = Field(20.0, ge=0.0, le=90.0)
-    yaw_rate_skip_threshold: float = Field(8.0, ge=0.0, le=45.0)
+    # per second (12°/frame at 25fps ≈ 300°/sec).
+    yaw_skip_threshold: float = Field(30.0, ge=0.0, le=90.0)
+    yaw_rate_skip_threshold: float = Field(12.0, ge=0.0, le=45.0)
     # Episode-level side-face filter: when N consecutive frames exceed
     # yaw_skip_threshold, also skip `pre_pad`/`post_pad` frames of
     # transition zone around the episode (frames whose yaw is between
@@ -155,7 +155,7 @@ class LipSyncRequest(BaseModel):
     side_face_episode_post_pad: int = Field(4, ge=0, le=30)
     # Warn-band ratio: yaws above `yaw_skip_threshold * ratio` but below
     # `yaw_skip_threshold` are treated as transition frames. Default 0.5
-    # = warn @ 10° for the default 20° yaw_skip_threshold.
+    # = warn @ 15° for the default 30° yaw_skip_threshold.
     yaw_warn_threshold_ratio: float = Field(0.5, ge=0.0, le=1.0)
     # Per-request inference overrides. None = use server-side setting
     # (LATENTSYNC_GUIDANCE_SCALE / LATENTSYNC_INFERENCE_STEPS / LATENTSYNC_SEED
@@ -178,11 +178,10 @@ class LipSyncRequest(BaseModel):
         None, description="Hint for DeepCache enable. None = use server default. Honored only at server startup."
     )
     # Mouth-occlusion prefilter: skip frames where the mouth is covered by
-    # a hand, microphone, phone, mask, etc. Score 0..1; threshold 0.85 =
-    # "at least 85% likely occluded". Was 0.7 -- too sensitive on multi-
-    # speaker / side-face clips where it flagged 65%+ of frames and zeroed
-    # out the output. Set to 1.0 to disable the check.
-    mouth_occlusion_skip_threshold: float = Field(0.85, ge=0.0, le=1.0)
+    # a hand, microphone, phone, mask, etc. Score 0..1. Default 1.0 disables
+    # this heuristic because the fixed-ROI dark-pixel check is too sensitive
+    # on side/profile shots and can filter most frames.
+    mouth_occlusion_skip_threshold: float = Field(1.0, ge=0.0, le=1.0)
     # Motion-blur input filter: skip frames whose aligned face is too
     # smeared to inpaint cleanly. Set to 0 to disable.
     motion_blur_skip_threshold: float = Field(0.20, ge=0.0, le=10.0)
@@ -961,6 +960,7 @@ class LatentSyncApiRuntime:
                 mouth_occlusion_skip_threshold=payload.mouth_occlusion_skip_threshold,
                 motion_blur_skip_threshold=getattr(payload, "motion_blur_skip_threshold", 0.20),
                 color_match_strength=payload.color_match_strength,
+                mouth_detail_strength=payload.mouth_detail_strength,
                 mouth_sharpen_strength=payload.mouth_sharpen_strength,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")
@@ -980,6 +980,10 @@ class LatentSyncApiRuntime:
             side_face_episode_extra_skip_count = int(
                 run_stats.get("side_face_episode_extra_skip_count", 0)
             )
+            effective_generated_frames = int(
+                run_stats.get("effective_generated_frames", source_frame_count)
+            )
+            effective_skip_frames = int(run_stats.get("effective_skip_frames", 0))
 
             return {
                 "output_path": output_path,
@@ -1011,8 +1015,8 @@ class LatentSyncApiRuntime:
                 "mouth_occlusion_skip_count": mouth_occlusion_skip_count,
                 "motion_blur_skip_count": motion_blur_skip_count,
                 "side_face_episode_extra_skip_count": side_face_episode_extra_skip_count,
-                "effective_generated_output_frames": source_frame_count,
-                "skipped_output_frames": 0,
+                "effective_generated_output_frames": effective_generated_frames,
+                "skipped_output_frames": effective_skip_frames,
                 "best_similarity": 0.0,
                 "target_identity_similarity": 0.0,
                 "target_identity_count": 0,
