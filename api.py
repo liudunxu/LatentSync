@@ -206,13 +206,13 @@ class LipSyncRequest(BaseModel):
     # smeared to inpaint cleanly. Set to 0 to disable.
     motion_blur_skip_threshold: float = Field(0.08, ge=0.0, le=10.0)
     face_jump_center_threshold: float = Field(
-        1.00,
+        0.0,
         ge=0.0,
         le=2.0,
         description="Skip frames whose landmark center jumps by more than this fraction of face size; 0 disables.",
     )
     face_jump_scale_threshold: float = Field(
-        1.40,
+        0.0,
         ge=0.0,
         le=2.0,
         description="Skip frames whose landmark face scale changes abruptly by more than this fraction; 0 disables.",
