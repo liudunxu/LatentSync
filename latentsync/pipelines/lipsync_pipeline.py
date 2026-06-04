@@ -727,14 +727,15 @@ class LipsyncPipeline(DiffusionPipeline):
         self,
         video_frames: np.ndarray,
         reference_embedding=None,
-        yaw_skip_threshold: float = 30.0,
+        yaw_skip_threshold: float = 24.0,
         yaw_rate_skip_threshold: float = 12.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.20,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 4,
         side_face_episode_post_pad: int = 4,
-        yaw_warn_threshold_ratio: float = 0.5,
+        yaw_warn_threshold_ratio: float = 0.75,
+        side_face_warn_min_run_frames: int = 3,
     ):
         logger.info(
             f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
@@ -853,6 +854,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # at the boundaries).
         yaw_warn_threshold = yaw_skip_threshold * yaw_warn_threshold_ratio
         side_face_episode_extra_skip_count = 0
+        side_face_warn_run_skip_count = 0
         if yaw_warn_threshold > 0 and (
             side_face_episode_pre_pad > 0 or side_face_episode_post_pad > 0
         ):
@@ -885,12 +887,38 @@ class LipsyncPipeline(DiffusionPipeline):
                         skip_mask[k] = True
                         side_face_episode_extra_skip_count += 1
                 i = j
+        if yaw_warn_threshold > 0 and side_face_warn_min_run_frames > 0:
+            n = len(skip_mask)
+            i = 0
+            while i < n:
+                if skip_mask[i] or yaws[i] is None or abs(yaws[i]) <= yaw_warn_threshold:
+                    i += 1
+                    continue
+                j = i
+                while (
+                    j < n
+                    and not skip_mask[j]
+                    and yaws[j] is not None
+                    and abs(yaws[j]) > yaw_warn_threshold
+                ):
+                    j += 1
+                if j - i >= side_face_warn_min_run_frames:
+                    for k in range(i, j):
+                        skip_mask[k] = True
+                        side_face_warn_run_skip_count += 1
+                i = j
         self._last_side_face_episode_extra_skip_count = side_face_episode_extra_skip_count
+        self._last_side_face_warn_run_skip_count = side_face_warn_run_skip_count
         if side_face_episode_extra_skip_count:
             logger.info(
                 f"[FaceMatch] side_face_episode_extra_skip={side_face_episode_extra_skip_count} "
                 f"(pre_pad={side_face_episode_pre_pad}, post_pad={side_face_episode_post_pad}, "
                 f"warn_threshold={yaw_warn_threshold:.1f}°)"
+            )
+        if side_face_warn_run_skip_count:
+            logger.info(
+                f"[FaceMatch] side_face_warn_run_skip={side_face_warn_run_skip_count} "
+                f"(min_run={side_face_warn_min_run_frames}, warn_threshold={yaw_warn_threshold:.1f}°)"
             )
 
         faces_tensor = torch.stack(faces)
@@ -922,14 +950,15 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         skip_mask=None,
-        yaw_skip_threshold: float = 30.0,
+        yaw_skip_threshold: float = 24.0,
         yaw_rate_skip_threshold: float = 12.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.20,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 4,
         side_face_episode_post_pad: int = 4,
-        yaw_warn_threshold_ratio: float = 0.5,
+        yaw_warn_threshold_ratio: float = 0.75,
+        side_face_warn_min_run_frames: int = 3,
     ):
         logger.info(
             f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
@@ -953,6 +982,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
                 yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
+                side_face_warn_min_run_frames=side_face_warn_min_run_frames,
             )
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
             loop_video_frames = []
@@ -992,6 +1022,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
                 yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
+                side_face_warn_min_run_frames=side_face_warn_min_run_frames,
             )
             skip_mask = frame_skip_mask
 
@@ -1027,10 +1058,9 @@ class LipsyncPipeline(DiffusionPipeline):
         quality_gate_enabled: bool = True,
         quality_min_laplacian: float = 0.25,
         quality_min_sharpness_ratio: float = 0.12,
-        # Yaw-based prefilters for side faces / fast head turns. Defaults are
-        # conservative enough to avoid wiping most frames on profile-heavy
-        # clips, while still falling back on clearly side-on / fast-turn frames.
-        yaw_skip_threshold: float = 30.0,
+        # Yaw-based prefilters for side faces / fast head turns. Defaults now
+        # prefer filtering hard profile cases over trying to synthesize them.
+        yaw_skip_threshold: float = 24.0,
         yaw_rate_skip_threshold: float = 12.0,
         # Episode-level side-face filter: when contiguous frames exceed
         # yaw_skip_threshold, also skip pre_pad/post_pad transition frames
@@ -1039,7 +1069,8 @@ class LipsyncPipeline(DiffusionPipeline):
         # Set pre_pad/post_pad to 0 to disable the padding.
         side_face_episode_pre_pad: int = 4,
         side_face_episode_post_pad: int = 4,
-        yaw_warn_threshold_ratio: float = 0.5,
+        yaw_warn_threshold_ratio: float = 0.75,
+        side_face_warn_min_run_frames: int = 3,
         # Mouth-occlusion prefilter: skip frames where the mouth is covered
         # by a hand, microphone, phone, mask, etc. Score 0..1; above the
         # threshold the frame is treated as not-lip-syncable and the original
@@ -1122,6 +1153,7 @@ class LipsyncPipeline(DiffusionPipeline):
             side_face_episode_pre_pad=side_face_episode_pre_pad,
             side_face_episode_post_pad=side_face_episode_post_pad,
             yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
+            side_face_warn_min_run_frames=side_face_warn_min_run_frames,
         )
         logger.info(f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, affine_matrices={len(affine_matrices)}, apply_identity_filter={apply_identity_filter}, skip_true={sum(skip_mask)}/{len(skip_mask)}")
 
@@ -1365,8 +1397,13 @@ class LipsyncPipeline(DiffusionPipeline):
             "side_face_episode_extra_skip_count": getattr(
                 self, "_last_side_face_episode_extra_skip_count", 0
             ),
+            "side_face_warn_run_skip_count": getattr(
+                self, "_last_side_face_warn_run_skip_count", 0
+            ),
             "yaw_skip_threshold": yaw_skip_threshold,
             "yaw_rate_skip_threshold": yaw_rate_skip_threshold,
+            "yaw_warn_threshold_ratio": yaw_warn_threshold_ratio,
+            "side_face_warn_min_run_frames": side_face_warn_min_run_frames,
             "mouth_occlusion_skip_threshold": mouth_occlusion_skip_threshold,
             "motion_blur_skip_threshold": motion_blur_skip_threshold,
             "temporal_smoothing_enabled": temporal_smoothing_enabled,

@@ -134,7 +134,7 @@ class LipSyncRequest(BaseModel):
     # back to the original (no inpainting), which is the right call for blurry
     # side profiles and motion-blur turns. yaw_rate is in degrees/frame, not
     # per second (12°/frame at 25fps ≈ 300°/sec).
-    yaw_skip_threshold: float = Field(30.0, ge=0.0, le=90.0)
+    yaw_skip_threshold: float = Field(24.0, ge=0.0, le=90.0)
     yaw_rate_skip_threshold: float = Field(12.0, ge=0.0, le=45.0)
     # Episode-level side-face filter: when N consecutive frames exceed
     # yaw_skip_threshold, also skip `pre_pad`/`post_pad` frames of
@@ -146,9 +146,15 @@ class LipSyncRequest(BaseModel):
     side_face_episode_pre_pad: int = Field(4, ge=0, le=30)
     side_face_episode_post_pad: int = Field(4, ge=0, le=30)
     # Warn-band ratio: yaws above `yaw_skip_threshold * ratio` but below
-    # `yaw_skip_threshold` are treated as transition frames. Default 0.5
-    # = warn @ 15° for the default 30° yaw_skip_threshold.
-    yaw_warn_threshold_ratio: float = Field(0.5, ge=0.0, le=1.0)
+    # `yaw_skip_threshold` are treated as transition frames / near-profile
+    # runs. Default 0.75 = warn @ 18° for the default 24° threshold.
+    yaw_warn_threshold_ratio: float = Field(0.75, ge=0.0, le=1.0)
+    side_face_warn_min_run_frames: int = Field(
+        3,
+        ge=0,
+        le=120,
+        description="Skip sustained near-profile runs above the yaw warn threshold; 0 disables.",
+    )
     # Per-request inference overrides. None = use server-side setting
     # (LATENTSYNC_GUIDANCE_SCALE / LATENTSYNC_INFERENCE_STEPS / LATENTSYNC_SEED
     # env vars, or their CLI flags). Frontend (~/Downloads/dub) sends these
@@ -949,6 +955,7 @@ class LatentSyncApiRuntime:
                 side_face_episode_pre_pad=payload.side_face_episode_pre_pad,
                 side_face_episode_post_pad=payload.side_face_episode_post_pad,
                 yaw_warn_threshold_ratio=payload.yaw_warn_threshold_ratio,
+                side_face_warn_min_run_frames=payload.side_face_warn_min_run_frames,
                 mouth_occlusion_skip_threshold=payload.mouth_occlusion_skip_threshold,
                 motion_blur_skip_threshold=getattr(payload, "motion_blur_skip_threshold", 0.20),
                 color_match_strength=payload.color_match_strength,
@@ -971,6 +978,9 @@ class LatentSyncApiRuntime:
             motion_blur_skip_count = int(run_stats.get("motion_blur_skip_count", 0))
             side_face_episode_extra_skip_count = int(
                 run_stats.get("side_face_episode_extra_skip_count", 0)
+            )
+            side_face_warn_run_skip_count = int(
+                run_stats.get("side_face_warn_run_skip_count", 0)
             )
             effective_generated_frames = int(
                 run_stats.get("effective_generated_frames", source_frame_count)
@@ -1007,6 +1017,7 @@ class LatentSyncApiRuntime:
                 "mouth_occlusion_skip_count": mouth_occlusion_skip_count,
                 "motion_blur_skip_count": motion_blur_skip_count,
                 "side_face_episode_extra_skip_count": side_face_episode_extra_skip_count,
+                "side_face_warn_run_skip_count": side_face_warn_run_skip_count,
                 "effective_generated_output_frames": effective_generated_frames,
                 "skipped_output_frames": effective_skip_frames,
                 "best_similarity": 0.0,
