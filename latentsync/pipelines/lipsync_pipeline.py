@@ -1349,6 +1349,17 @@ class LipsyncPipeline(DiffusionPipeline):
         # Original-detail restoration outside the central mouth-motion core.
         # 0 = off, 1 = strong reference detail. Default 0.65.
         mouth_detail_strength: float = 0.65,
+        # --- CodeFormer face-restoration postprocess (added 2026-06) ---
+        # When ``codeformer_restorer`` is provided and ``codeformer_enabled``
+        # is True, the pipeline runs the released CodeFormer model on every
+        # non-skipped aligned face crop right before pasting back to the
+        # full video. This sharpens the synthesized mouth and helps recover
+        # identity/edge detail that the diffusion inpainter tends to soften.
+        # Set ``codeformer_enabled=False`` to skip entirely; pass a
+        # :class:`CodeFormerRestorer` instance to actually invoke the model.
+        codeformer_enabled: bool = False,
+        codeformer_fidelity_weight: float = 0.5,
+        codeformer_restorer=None,
         **kwargs,
     ):
         is_train = self.unet.training
@@ -1729,7 +1740,53 @@ class LipsyncPipeline(DiffusionPipeline):
         )
         if quality_fallback_count:
             logger.info(f"[LipSync] quality_fallback_frames={quality_fallback_count} / {len(skip_mask)}")
-        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices, effective_skip_mask)
+        all_faces = torch.cat(synced_video_frames, dim=0)
+        # CodeFormer postprocess. We hand the restorer the *aligned* face
+        # crops (512x512, [-1, 1]) rather than the full-frame output, for
+        # three reasons:
+        #   * CodeFormer is trained on aligned faces; off-aligned inputs
+        #     produce visible edge artefacts.
+        #   * Background and clothing don't get sharpened, which would
+        #     otherwise reveal the postprocess step in the seams between
+        #     the restored face and the unchanged body.
+        #   * The restored face still goes through ``restore_img`` below,
+        #     so the existing paste-back, box-resize and affine math
+        #     apply unchanged.
+        # Frames marked skipped by the pipeline are passed through
+        # untouched (the restorer handles that internally) so the source
+        # video is never re-sharpened on top of itself.
+        self._last_codeformer_stats = {
+            "enabled": bool(codeformer_enabled),
+            "loaded": False,
+            "frames_total": int(all_faces.shape[0]),
+            "frames_enhanced": 0,
+            "frames_skipped_by_pipeline": int(sum(effective_skip_mask)),
+            "elapsed_seconds": 0.0,
+            "fidelity_weight": float(codeformer_fidelity_weight),
+            "batch_size": 0,
+            "checkpoint_path": "",
+            "error": "",
+        }
+        if codeformer_enabled:
+            if codeformer_restorer is None:
+                logger.warning(
+                    "[LipSync] codeformer_enabled=True but no restorer was passed; "
+                    "skipping CodeFormer postprocess"
+                )
+                self._last_codeformer_stats["error"] = "no restorer"
+            else:
+                logger.info(
+                    f"[LipSync] CodeFormer postprocess starting: faces={all_faces.shape}, "
+                    f"fidelity_weight={codeformer_fidelity_weight}, "
+                    f"frames_to_enhance={all_faces.shape[0] - int(sum(effective_skip_mask))}"
+                )
+                all_faces, cf_stats = codeformer_restorer.restore_faces(
+                    all_faces,
+                    skip_mask=effective_skip_mask,
+                    fidelity_weight=codeformer_fidelity_weight,
+                )
+                self._last_codeformer_stats = cf_stats.as_dict()
+        synced_video_frames = self.restore_video(all_faces, video_frames, boxes, affine_matrices, effective_skip_mask)
         logger.info(f"[LipSync] restored video frames shape={synced_video_frames.shape}")
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
@@ -1786,6 +1843,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "color_match_strength": color_match_strength,
             "mouth_detail_strength": mouth_detail_strength,
             "mouth_sharpen_strength": mouth_sharpen_strength,
+            "codeformer": self._last_codeformer_stats,
         }
 
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)

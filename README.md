@@ -15,6 +15,8 @@
 
 - `2025/03/14`: We released **LatentSync 1.5**, which **(1)** improves temporal consistency via adding temporal layer, **(2)** improves performance on Chinese videos and **(3)** reduces the VRAM requirement of the stage2 training to **20 GB** through a series of optimizations. Learn more details [here](docs/changelog_v1.5.md).
 
+- `2026/06/04`: Optional **[CodeFormer](https://github.com/sczhou/CodeFormer) face-restoration postprocess** on the synthesized 512×512 face crops, enabled per request via `codeformer_enabled=true`. See [docs/codeformer_integration.md](docs/codeformer_integration.md).
+
 ## 📖 Introduction
 
 We present *LatentSync*, an end-to-end lip-sync method based on audio-conditioned latent diffusion models without any intermediate motion representation, diverging from previous diffusion-based lip-sync methods based on pixel-space diffusion or two-stage generation. Our framework can leverage the powerful capabilities of Stable Diffusion to directly model complex audio-visual correlations.

@@ -69,6 +69,18 @@ class Settings:
     download_retries: int = int(os.getenv("API_DOWNLOAD_RETRIES", "2"))
     download_retry_backoff_seconds: float = float(os.getenv("API_DOWNLOAD_RETRY_BACKOFF_SECONDS", "1.0"))
     progress_enabled: bool = os.getenv("API_PROGRESS", "1").lower() not in {"0", "false", "no", "off"}
+    # CodeFormer (https://github.com/sczhou/CodeFormer) postprocess applied
+    # to aligned face crops after diffusion inpainting. Disabled by
+    # default -- enable per request with codeformer_enabled. Set
+    # ``LATENTSYNC_CODEFORMER_PRELOAD=1`` to load the model at server
+    # startup; otherwise it loads lazily on the first request that
+    # asks for it.
+    codeformer_checkpoint_path: str = os.getenv(
+        "LATENTSYNC_CODEFORMER_CKPT", "checkpoints/codeformer/codeformer.pth"
+    )
+    codeformer_preload: bool = os.getenv("LATENTSYNC_CODEFORMER_PRELOAD", "0").lower() in {"1", "true", "yes"}
+    codeformer_batch_size: int = int(os.getenv("LATENTSYNC_CODEFORMER_BATCH_SIZE", "16"))
+    codeformer_required: bool = os.getenv("LATENTSYNC_CODEFORMER_REQUIRED", "0").lower() in {"1", "true", "yes"}
 
 
 settings = Settings()
@@ -242,6 +254,30 @@ class LipSyncRequest(BaseModel):
     speech_gate_pre_roll_seconds: float = Field(0.04, ge=0.0, le=1.0)
     speech_gate_post_roll_seconds: float = Field(0.12, ge=0.0, le=1.0)
     speech_gate_fill_gap_seconds: float = Field(0.16, ge=0.0, le=1.0)
+    # --- CodeFormer face-restoration postprocess (added 2026-06) ---
+    # When True and the CodeFormer checkpoint is available, the aligned
+    # face crops produced by LatentSync are run through CodeFormer
+    # before being pasted back to the full video. This sharpens the
+    # synthesized mouth and recovers identity/edge detail, but adds
+    # ~1s of GPU time per ~30s of video on a modern card. Off by
+    # default so the existing API behavior is unchanged unless the
+    # caller opts in. Setting codeformer_enabled=True when the
+    # checkpoint is missing is logged and silently skipped (no error
+    # to the caller) unless ``codeformer_required`` is also set.
+    codeformer_enabled: bool = Field(
+        False,
+        description="Run CodeFormer face restoration on the aligned 512x512 face crops before paste-back.",
+    )
+    codeformer_fidelity_weight: float = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description="CodeFormer fidelity weight. 0 = sharpest, 1 = closest to input. 0.5 is the upstream default.",
+    )
+    codeformer_required: bool = Field(
+        False,
+        description="If True and codeformer_enabled=True, fail the request when the CodeFormer checkpoint is missing.",
+    )
 
 
 class FaceListRequest(BaseModel):
@@ -623,6 +659,11 @@ class LatentSyncApiRuntime:
         self.dtype = None
         self.face_embedder = None
         self.face_embedding_error = ""
+        # CodeFormer restorer is built lazily on first use to avoid
+        # ~1 GB of GPU memory when the feature is never requested.
+        self.codeformer_restorer = None
+        self.codeformer_load_attempted = False
+        self.codeformer_load_error = ""
 
     def load_detectors(self) -> None:
         if self.detectors_loaded:
@@ -721,7 +762,68 @@ class LatentSyncApiRuntime:
                 helper.set_params(cache_interval=3, cache_branch_id=0)
                 helper.enable()
 
+            if settings.codeformer_preload:
+                restorer, err = self._get_codeformer_restorer()
+                if restorer is not None and restorer.is_loaded:
+                    logger.info(
+                        "[LipSync] Preloaded CodeFormer restorer from %s (batch_size=%d)",
+                        settings.codeformer_checkpoint_path,
+                        settings.codeformer_batch_size,
+                    )
+                else:
+                    logger.warning(
+                        "[LipSync] codeformer_preload=True but model did not load: %s", err
+                    )
+
             self.loaded = True
+
+    def _get_codeformer_restorer(self) -> Tuple[Optional[object], str]:
+        """Return the singleton :class:`CodeFormerRestorer`, building it
+        on first call. Returns ``(None, reason)`` when construction
+        fails so the caller can decide whether to fail the request or
+        log and continue.
+        """
+        if self.codeformer_restorer is not None:
+            return self.codeformer_restorer, ""
+        if self.codeformer_load_attempted and self.codeformer_load_error:
+            return None, self.codeformer_load_error
+        self.codeformer_load_attempted = True
+        try:
+            from latentsync.utils.codeformer_restorer import CodeFormerRestorer
+        except Exception as exc:  # noqa: BLE001 -- the import is heavy
+            self.codeformer_load_error = (
+                f"failed to import CodeFormerRestorer: {type(exc).__name__}: {exc}"
+            )
+            logger.error("[LipSync] %s", self.codeformer_load_error)
+            return None, self.codeformer_load_error
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.codeformer_restorer = CodeFormerRestorer(
+            checkpoint_path=settings.codeformer_checkpoint_path,
+            device=device,
+            batch_size=settings.codeformer_batch_size,
+        )
+        # Eagerly probe the load so we surface "checkpoint missing" at
+        # the first request rather than after the inpainter has burned
+        # seconds of GPU time. The probe is cached in the restorer.
+        if not self.codeformer_restorer.is_loaded:
+            # _ensure_loaded is private; calling it is the only way to
+            # populate _load_error before the user actually wants the
+            # model. We tolerate the AttributeError on a refactor.
+            try:
+                self.codeformer_restorer._ensure_loaded()  # noqa: SLF001
+            except Exception as exc:  # noqa: BLE001
+                self.codeformer_load_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                logger.error("[LipSync] CodeFormer preload failed: %s", self.codeformer_load_error)
+                self.codeformer_restorer = None
+                return None, self.codeformer_load_error
+            if not self.codeformer_restorer.is_loaded:
+                self.codeformer_load_error = self.codeformer_restorer.load_error or "unknown"
+                logger.error("[LipSync] CodeFormer preload failed: %s", self.codeformer_load_error)
+                self.codeformer_restorer = None
+                return None, self.codeformer_load_error
+        return self.codeformer_restorer, ""
 
     def _detect_faces(self, frame: np.ndarray) -> List[Dict[str, object]]:
         if self.face_embedder is None:
@@ -959,6 +1061,23 @@ class LatentSyncApiRuntime:
                     "DeepCache is wired at pipeline load time -- restart the server with the new env var to apply."
                 )
 
+            # CodeFormer opt-in. The restorer is built lazily so we don't
+            # burn ~1 GB of GPU on every server boot; the first request
+            # that asks for it pays the load cost and subsequent calls
+            # share the singleton.
+            codeformer_restorer = None
+            codeformer_unavailable_reason = ""
+            if payload.codeformer_enabled:
+                codeformer_restorer, codeformer_unavailable_reason = self._get_codeformer_restorer()
+                if codeformer_restorer is None:
+                    msg = (
+                        "codeformer_enabled=True but the CodeFormer model is not available: "
+                        f"{codeformer_unavailable_reason}"
+                    )
+                    if payload.codeformer_required:
+                        raise HTTPException(status_code=503, detail=msg)
+                    logger.warning(f"[LipSync] {msg}; continuing without CodeFormer postprocess")
+
             if effective_seed != -1:
                 set_seed(effective_seed)
             else:
@@ -966,7 +1085,10 @@ class LatentSyncApiRuntime:
 
             logger.info(f"[LipSync] Starting pipeline: video={video_path}, audio={audio_path}, "
                          f"guidance_scale={effective_guidance_scale}, steps={effective_inference_steps}, "
-                         f"seed={effective_seed}, has_reference_embedding={reference_embedding is not None}")
+                         f"seed={effective_seed}, has_reference_embedding={reference_embedding is not None}, "
+                         f"codeformer_enabled={payload.codeformer_enabled}, "
+                         f"codeformer_loaded={codeformer_restorer is not None and codeformer_restorer.is_loaded}, "
+                         f"codeformer_fidelity_weight={payload.codeformer_fidelity_weight}")
             self.pipeline(
                 video_path=str(video_path),
                 audio_path=str(audio_path),
@@ -1007,6 +1129,15 @@ class LatentSyncApiRuntime:
                 mouth_detail_strength=payload.mouth_detail_strength,
                 mouth_sharpen_strength=payload.mouth_sharpen_strength,
                 mouth_temporal_stabilization_strength=payload.mouth_temporal_stabilization_strength,
+                # CodeFormer postprocess. ``codeformer_enabled`` is honoured
+                # only when ``codeformer_restorer`` actually loaded; when
+                # it didn't (e.g. checkpoint missing and not required) the
+                # pipeline logs a warning and skips. Either way, the
+                # pipeline still runs -- the failure mode is "no
+                # postprocess", not "broken output".
+                codeformer_enabled=payload.codeformer_enabled,
+                codeformer_fidelity_weight=payload.codeformer_fidelity_weight,
+                codeformer_restorer=codeformer_restorer,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")
 
@@ -1038,6 +1169,7 @@ class LatentSyncApiRuntime:
             silent_skip_frames = int(run_stats.get("silent_skip_frames", 0))
             skipped_inference_batches = int(run_stats.get("skipped_inference_batches", 0))
             skipped_inference_frames = int(run_stats.get("skipped_inference_frames", 0))
+            codeformer_stats = run_stats.get("codeformer") or {}
 
             return {
                 "output_path": output_path,
@@ -1089,6 +1221,24 @@ class LatentSyncApiRuntime:
                     "active_frames": max(0, source_frame_count - silent_skip_frames),
                     "silent_frames": silent_skip_frames,
                 },
+                "codeformer": {
+                    "requested": bool(payload.codeformer_enabled),
+                    "fidelity_weight": float(payload.codeformer_fidelity_weight),
+                    "required": bool(payload.codeformer_required),
+                    # Whether the runtime actually has a loadable model.
+                    "runtime_available": self.codeformer_restorer is not None
+                    and self.codeformer_restorer.is_loaded,
+                    "runtime_load_error": self.codeformer_load_error,
+                    "checkpoint_path": settings.codeformer_checkpoint_path,
+                    # Per-run stats from the pipeline layer.
+                    "frames_total": int(codeformer_stats.get("frames_total", 0)),
+                    "frames_enhanced": int(codeformer_stats.get("frames_enhanced", 0)),
+                    "frames_skipped_by_pipeline": int(
+                        codeformer_stats.get("frames_skipped_by_pipeline", 0)
+                    ),
+                    "elapsed_seconds": float(codeformer_stats.get("elapsed_seconds", 0.0)),
+                    "error": codeformer_stats.get("error", ""),
+                },
                 "quality_ok": True,
             }
 
@@ -1102,6 +1252,10 @@ runtime = LatentSyncApiRuntime()
 
 @app.get("/health")
 def health() -> Dict[str, object]:
+    codeformer_loaded = (
+        runtime.codeformer_restorer is not None
+        and getattr(runtime.codeformer_restorer, "is_loaded", False)
+    )
     return {
         "status": "ok",
         "detectors_loaded": runtime.detectors_loaded,
@@ -1111,6 +1265,12 @@ def health() -> Dict[str, object]:
         "face_embedding_backend": "insightface",
         "face_embedding_error": runtime.face_embedding_error,
         "port": settings.port,
+        "codeformer": {
+            "checkpoint_path": settings.codeformer_checkpoint_path,
+            "loaded": codeformer_loaded,
+            "preload_requested": settings.codeformer_preload,
+            "load_error": runtime.codeformer_load_error,
+        },
     }
 
 
@@ -1283,6 +1443,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inference_steps", type=int, default=settings.inference_steps)
     parser.add_argument("--seed", type=int, default=settings.seed)
     parser.add_argument("--enable_deepcache", action="store_true", default=settings.enable_deepcache)
+    parser.add_argument(
+        "--codeformer_checkpoint_path",
+        default=settings.codeformer_checkpoint_path,
+        help="Path to codeformer.pth; LATENTSYNC_CODEFORMER_CKPT env var also accepted.",
+    )
+    parser.add_argument(
+        "--codeformer_preload",
+        action="store_true",
+        default=settings.codeformer_preload,
+        help="Load the CodeFormer model at server startup.",
+    )
+    parser.add_argument(
+        "--codeformer_batch_size",
+        type=int,
+        default=settings.codeformer_batch_size,
+        help="Faces per CodeFormer forward pass. 16 is a safe default on 24GB GPUs.",
+    )
     return parser.parse_args()
 
 
@@ -1298,6 +1475,9 @@ if __name__ == "__main__":
     settings.inference_steps = args.inference_steps
     settings.seed = args.seed
     settings.enable_deepcache = args.enable_deepcache
+    settings.codeformer_checkpoint_path = args.codeformer_checkpoint_path
+    settings.codeformer_preload = args.codeformer_preload
+    settings.codeformer_batch_size = args.codeformer_batch_size
 
     import uvicorn
     uvicorn.run(app, host=settings.host, port=settings.port)
