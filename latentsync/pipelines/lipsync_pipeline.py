@@ -1059,8 +1059,9 @@ class LipsyncPipeline(DiffusionPipeline):
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
         quality_gate_enabled: bool = True,
-        quality_min_laplacian: float = 0.25,
-        quality_min_sharpness_ratio: float = 0.12,
+        quality_min_laplacian: float = 0.08,
+        quality_min_sharpness_ratio: float = 0.05,
+        quality_max_fallback_ratio: float = 0.45,
         # Yaw-based prefilters for side faces / fast head turns. Defaults now
         # prefer filtering hard profile cases over trying to synthesize them.
         yaw_skip_threshold: float = 24.0,
@@ -1349,11 +1350,11 @@ class LipsyncPipeline(DiffusionPipeline):
                     gen_laps.append(gen_lap)
                     ref_laps.append(ref_lap)
                     ratio = (gen_lap / ref_lap) if ref_lap > 0 else 1.0
-                    if gen_lap < quality_min_laplacian * 0.35:
+                    if gen_lap < quality_min_laplacian * 0.25:
                         quality_skip_mask[base + k] = True
                         quality_fallback_count += 1
                         logger.info(
-                            f"[Diag] mouth postfilter fallback batch{i} k{k}: gen_lap={gen_lap:.2f} < {quality_min_laplacian * 0.35:.2f}"
+                            f"[Diag] mouth postfilter fallback batch{i} k{k}: gen_lap={gen_lap:.2f} < {quality_min_laplacian * 0.25:.2f}"
                         )
                         continue
                     if gen_lap < quality_min_laplacian and ref_lap > 0 and ratio < quality_min_sharpness_ratio:
@@ -1372,9 +1373,22 @@ class LipsyncPipeline(DiffusionPipeline):
             synced_video_frames.append(decoded_latents)
 
         logger.info(f"[LipSync] decoded {len(synced_video_frames)} batches, restoring video...")
+        pre_skip = sum(skip_mask)
+        quality_candidate_count = len(skip_mask) - pre_skip
+        if (
+            quality_gate_enabled
+            and quality_max_fallback_ratio > 0
+            and quality_candidate_count > 0
+            and sum(quality_skip_mask) / quality_candidate_count > quality_max_fallback_ratio
+        ):
+            logger.warning(
+                f"[LipSync] quality gate skipped {sum(quality_skip_mask)}/{quality_candidate_count} "
+                f"candidate frames (> {quality_max_fallback_ratio:.2f}); disabling quality fallback for this run"
+            )
+            quality_skip_mask = [False] * len(quality_skip_mask)
+            quality_fallback_count = 0
         # OR-merge the quality postfilter with the original skip_mask
         effective_skip_mask = [a or b for a, b in zip(skip_mask, quality_skip_mask)]
-        pre_skip = sum(skip_mask)
         quality_skip = sum(quality_skip_mask)
         effective_skip = sum(effective_skip_mask)
         effective_generated = len(effective_skip_mask) - effective_skip
@@ -1425,6 +1439,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "temporal_smoothing_enabled": temporal_smoothing_enabled,
             "mouth_motion_preserve_strength": mouth_motion_preserve_strength,
             "quality_gate_enabled": quality_gate_enabled,
+            "quality_max_fallback_ratio": quality_max_fallback_ratio,
             "color_match_strength": color_match_strength,
             "mouth_detail_strength": mouth_detail_strength,
             "mouth_sharpen_strength": mouth_sharpen_strength,

@@ -128,8 +128,14 @@ class LipSyncRequest(BaseModel):
     # conservative: difficult frames fall back to the source video instead of
     # showing smeared lips.
     quality_gate_enabled: bool = True
-    quality_min_laplacian: float = Field(0.25, ge=0.0, le=2000.0)
-    quality_min_sharpness_ratio: float = Field(0.12, ge=0.0, le=1.0)
+    quality_min_laplacian: float = Field(0.08, ge=0.0, le=2000.0)
+    quality_min_sharpness_ratio: float = Field(0.05, ge=0.0, le=1.0)
+    quality_max_fallback_ratio: float = Field(
+        0.45,
+        ge=0.0,
+        le=1.0,
+        description="Disable quality fallback for this run if it would skip more than this fraction of non-prefiltered frames.",
+    )
     # Side-face / fast-turn prefilters. Frames exceeding either threshold fall
     # back to the original (no inpainting), which is the right call for blurry
     # side profiles and motion-blur turns. yaw_rate is in degrees/frame, not
@@ -950,6 +956,7 @@ class LatentSyncApiRuntime:
                 quality_gate_enabled=payload.quality_gate_enabled,
                 quality_min_laplacian=payload.quality_min_laplacian,
                 quality_min_sharpness_ratio=payload.quality_min_sharpness_ratio,
+                quality_max_fallback_ratio=payload.quality_max_fallback_ratio,
                 yaw_skip_threshold=payload.yaw_skip_threshold,
                 yaw_rate_skip_threshold=payload.yaw_rate_skip_threshold,
                 side_face_episode_pre_pad=payload.side_face_episode_pre_pad,
