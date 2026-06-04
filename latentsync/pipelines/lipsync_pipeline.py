@@ -667,6 +667,7 @@ class LipsyncPipeline(DiffusionPipeline):
         prev_face: Optional[torch.Tensor],
         prev_valid: bool,
         inference_skip_mask,
+        region_mask: Optional[torch.Tensor] = None,
         weights=(0.25, 0.5, 0.25),
     ):
         """3-tap temporal EMA across face crops. Returns
@@ -677,6 +678,17 @@ class LipsyncPipeline(DiffusionPipeline):
         - prev_face is only used when prev_valid is True.
         - Triangular kernel by default (weights = prev, cur, next) so the
           middle frame keeps 50% weight and neighbours each contribute 25%.
+
+        region_mask (optional): (B, 1, H, W) or (B, 3, H, W) in [0, 1] with
+        1 = "apply EMA inside this pixel" and 0 = "keep raw face unchanged".
+        When provided, the EMA output is masked so the temporal blend only
+        happens inside the inpaint region. Pixels outside the mask get the
+        raw `face_crops[k]` (i.e. the un-EMA'd face where the inpainter
+        didn't touch it). This prevents EMA from smearing previous frames'
+        content into the original-face area when the inpaint mask is wider
+        than the mouth, which was the root cause of the "previous frame's
+        different face glued in" artifact. Default None = full-face EMA
+        (legacy behavior).
         """
         B = face_crops.shape[0]
         if B == 0:
@@ -685,6 +697,30 @@ class LipsyncPipeline(DiffusionPipeline):
         smoothed = face_crops.clone()
         last_valid = prev_valid
         last_face = prev_face
+
+        # Normalize region_mask to (B, 3, H, W) for broadcasting against
+        # face_crops (B, 3, H, W). Accepts (B, H, W), (B, 1, H, W),
+        # (B, 3, H, W), or (1, *, H, W) shapes.
+        region_mask_3d: Optional[torch.Tensor] = None
+        if region_mask is not None:
+            rm = region_mask
+            if rm.dim() == 3:
+                rm = rm.unsqueeze(1)
+            if rm.dim() != 4:
+                # Fall back to no-mask behavior if shape is unexpected.
+                rm = None
+            else:
+                if rm.shape[0] == 1 and B > 1:
+                    rm = rm.expand(B, -1, -1, -1)
+                if rm.shape[0] != B:
+                    rm = None
+                else:
+                    if rm.shape[1] == 3:
+                        rm = rm[:, 0:1]
+                    elif rm.shape[1] != 1:
+                        rm = None
+                    if rm is not None:
+                        region_mask_3d = rm.expand(-1, 3, -1, -1)
 
         for k in range(B):
             if inference_skip_mask[k]:
@@ -704,6 +740,12 @@ class LipsyncPipeline(DiffusionPipeline):
             elif k == B - 1 and B > 1:
                 # Last frame: blend with its predecessor (no next frame in batch)
                 smoothed[k] = 0.5 * face_crops[k - 1] + 0.5 * face_crops[k]
+
+            # Region-mask: outside the inpaint area, use the raw face so EMA
+            # can't leak previous-frame content into the original-face area.
+            if region_mask_3d is not None:
+                mask_k = region_mask_3d[k]
+                smoothed[k] = (1.0 - mask_k) * face_crops[k] + mask_k * smoothed[k]
 
             last_face = face_crops[k]
             last_valid = True
@@ -1390,7 +1432,12 @@ class LipsyncPipeline(DiffusionPipeline):
                         f"(~0 means model output was overwritten by ref)"
                     )
 
-            # Temporal EMA across face crops (cross-batch state via prev_face)
+            # Temporal EMA across face crops (cross-batch state via prev_face).
+            # region_mask restricts the EMA to the inpaint area: outside the
+            # mask the face stays as the raw inpainter+paste-back output, so
+            # EMA can't smear previous frames' content into the original-face
+            # area (root cause of "previous frame's different face glued in"
+            # artifacts with the wider inpaint mask).
             inference_skip_mask = skip_mask[i * num_frames : (i + 1) * num_frames]
             if temporal_smoothing_enabled:
                 current_mouth_motion = decoded_latents
@@ -1399,6 +1446,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     prev_face=prev_face,
                     prev_valid=prev_valid,
                     inference_skip_mask=inference_skip_mask,
+                    region_mask=generated_region_mask,
                 )
                 if mouth_motion_preserve_strength > 0:
                     mouth_motion_mask = self._mouth_core_mask(generated_region_mask).to(
