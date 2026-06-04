@@ -129,6 +129,12 @@ class LipSyncRequest(BaseModel):
     quality_gate_enabled: bool = False
     quality_min_laplacian: float = Field(1.0, ge=0.0, le=2000.0)
     quality_min_sharpness_ratio: float = Field(0.20, ge=0.0, le=1.0)
+    # Side-face / fast-turn prefilters. Frames exceeding either threshold fall
+    # back to the original (no inpainting), which is the right call for blurry
+    # side profiles and motion-blur turns. yaw_rate is in degrees/frame, not
+    # per second (8°/frame at 25fps ≈ 200°/sec).
+    yaw_skip_threshold: float = Field(20.0, ge=0.0, le=90.0)
+    yaw_rate_skip_threshold: float = Field(8.0, ge=0.0, le=45.0)
     left_cheek_width: int = Field(75, ge=1, le=240)
     right_cheek_width: int = Field(75, ge=1, le=240)
     batch_size: int = Field(8, ge=1, le=64)
@@ -872,6 +878,8 @@ class LatentSyncApiRuntime:
                 quality_gate_enabled=payload.quality_gate_enabled,
                 quality_min_laplacian=payload.quality_min_laplacian,
                 quality_min_sharpness_ratio=payload.quality_min_sharpness_ratio,
+                yaw_skip_threshold=payload.yaw_skip_threshold,
+                yaw_rate_skip_threshold=payload.yaw_rate_skip_threshold,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")
 
@@ -884,6 +892,7 @@ class LatentSyncApiRuntime:
             run_stats = getattr(self.pipeline, "_last_run_stats", None) or {}
             quality_fallback_frames = int(run_stats.get("quality_fallback_frames", 0))
             yaw_skip_count = int(run_stats.get("yaw_skip_count", 0))
+            yaw_rate_skip_count = int(run_stats.get("yaw_rate_skip_count", 0))
 
             return {
                 "output_path": output_path,
@@ -908,6 +917,7 @@ class LatentSyncApiRuntime:
                 "generated_output_frames": source_frame_count,
                 "quality_fallback_frames": quality_fallback_frames,
                 "yaw_skip_count": yaw_skip_count,
+                "yaw_rate_skip_count": yaw_rate_skip_count,
                 "effective_generated_output_frames": source_frame_count,
                 "skipped_output_frames": 0,
                 "best_similarity": 0.0,

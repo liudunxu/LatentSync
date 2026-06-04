@@ -394,15 +394,28 @@ class LipsyncPipeline(DiffusionPipeline):
         logger.info(f"[LipSync] Main speaker from frame {best_frame_idx} with mouth_ratio={best_ratio:.4f}")
         return best_emb
 
-    def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None, yaw_skip_threshold: float = 30.0, apply_identity_filter: bool = True):
-        logger.info(f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}, apply_identity_filter={apply_identity_filter}")
+    def affine_transform_video(
+        self,
+        video_frames: np.ndarray,
+        reference_embedding=None,
+        yaw_skip_threshold: float = 20.0,
+        yaw_rate_skip_threshold: float = 8.0,
+        apply_identity_filter: bool = True,
+    ):
+        logger.info(
+            f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
+            f"frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}, "
+            f"yaw_rate_skip_threshold={yaw_rate_skip_threshold}, apply_identity_filter={apply_identity_filter}"
+        )
         faces = []
         boxes = []
         affine_matrices = []
         skip_mask = []
         yaw_skip_count = 0
+        yaw_rate_skip_count = 0
         identity_skip_count = 0
         detect_fail_count = 0
+        prev_yaw: Optional[float] = None
         print(f"Affine transforming {len(video_frames)} faces...")
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
             face, box, affine_matrix, face_emb, lmk = self.image_processor.affine_transform_with_embedding(frame)
@@ -412,24 +425,46 @@ class LipsyncPipeline(DiffusionPipeline):
                 faces.append(torch.zeros(3, self.image_processor.resolution, self.image_processor.resolution))
                 boxes.append([0, 0, 0, 0])
                 affine_matrices.append(np.eye(3))
-            else:
-                should_skip = False
-                if apply_identity_filter and reference_embedding is not None and face_emb is not None:
-                    similarity = float(np.dot(face_emb, reference_embedding))
-                    if similarity < 0.7:
-                        should_skip = True
-                        identity_skip_count += 1
-                if not should_skip and yaw_skip_threshold > 0 and lmk is not None:
-                    yaw_deg = self._estimate_yaw_degrees(lmk)
-                    if abs(yaw_deg) > yaw_skip_threshold:
-                        should_skip = True
-                        yaw_skip_count += 1
-                skip_mask.append(should_skip)
-                faces.append(face)
-                boxes.append(box)
-                affine_matrices.append(affine_matrix)
-        logger.info(f"[FaceMatch] detect_fail={detect_fail_count}, identity_skip={identity_skip_count}, yaw_skip={yaw_skip_count}")
+                prev_yaw = None  # reset so we don't carry a stale yaw across a detect-fail gap
+                continue
+            should_skip = False
+            if apply_identity_filter and reference_embedding is not None and face_emb is not None:
+                similarity = float(np.dot(face_emb, reference_embedding))
+                if similarity < 0.7:
+                    should_skip = True
+                    identity_skip_count += 1
+            yaw_deg = 0.0
+            if yaw_skip_threshold > 0 and lmk is not None:
+                yaw_deg = self._estimate_yaw_degrees(lmk)
+                if abs(yaw_deg) > yaw_skip_threshold:
+                    should_skip = True
+                    yaw_skip_count += 1
+            # Yaw-rate (deg/frame) catches the mid-turn frames where the face
+            # hasn't crossed the absolute threshold yet but is rotating fast
+            # enough that affine alignment is unreliable. Threshold is per
+            # frame, not per second, so 8°/frame ≈ 200°/sec at 25fps.
+            if (
+                not should_skip
+                and yaw_rate_skip_threshold > 0
+                and prev_yaw is not None
+                and yaw_skip_threshold > 0
+                and lmk is not None
+            ):
+                rate = abs(yaw_deg - prev_yaw)
+                if rate > yaw_rate_skip_threshold:
+                    should_skip = True
+                    yaw_rate_skip_count += 1
+            skip_mask.append(should_skip)
+            faces.append(face)
+            boxes.append(box)
+            affine_matrices.append(affine_matrix)
+            prev_yaw = yaw_deg if (yaw_skip_threshold > 0 and lmk is not None) else None
+        logger.info(
+            f"[FaceMatch] detect_fail={detect_fail_count}, identity_skip={identity_skip_count}, "
+            f"yaw_skip={yaw_skip_count}, yaw_rate_skip={yaw_rate_skip_count}"
+        )
         self._last_yaw_skip_count = yaw_skip_count
+        self._last_yaw_rate_skip_count = yaw_rate_skip_count
         faces_tensor = torch.stack(faces)
         return faces_tensor, boxes, affine_matrices, skip_mask
 
@@ -452,13 +487,33 @@ class LipsyncPipeline(DiffusionPipeline):
                 out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 
-    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray, reference_embedding=None, face_embedder=None, skip_mask=None, yaw_skip_threshold: float = 30.0, apply_identity_filter: bool = True):
-        logger.info(f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}, apply_identity_filter={apply_identity_filter}")
+    def loop_video(
+        self,
+        whisper_chunks: list,
+        video_frames: np.ndarray,
+        reference_embedding=None,
+        face_embedder=None,
+        skip_mask=None,
+        yaw_skip_threshold: float = 20.0,
+        yaw_rate_skip_threshold: float = 8.0,
+        apply_identity_filter: bool = True,
+    ):
+        logger.info(
+            f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
+            f"frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}, "
+            f"yaw_rate_skip_threshold={yaw_rate_skip_threshold}, apply_identity_filter={apply_identity_filter}"
+        )
         if reference_embedding is None and face_embedder is not None:
             reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
             logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
         if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding, yaw_skip_threshold=yaw_skip_threshold, apply_identity_filter=apply_identity_filter)
+            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(
+                video_frames,
+                reference_embedding,
+                yaw_skip_threshold=yaw_skip_threshold,
+                yaw_rate_skip_threshold=yaw_rate_skip_threshold,
+                apply_identity_filter=apply_identity_filter,
+            )
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
             loop_video_frames = []
             loop_faces = []
@@ -518,7 +573,13 @@ class LipsyncPipeline(DiffusionPipeline):
         quality_gate_enabled: bool = True,
         quality_min_laplacian: float = 15.0,
         quality_min_sharpness_ratio: float = 0.20,
-        yaw_skip_threshold: float = 30.0,
+        # Yaw-based prefilters for side faces / fast head turns. 20°/8°/frame
+        # is the empirical sweet spot: 30° lets too many "mostly-side" frames
+        # through (they render as visible blur blocks around the mouth);
+        # turning >8°/frame also produces blur because the affine alignment
+        # can't keep up. Both fall back to the original frame in restore_video.
+        yaw_skip_threshold: float = 20.0,
+        yaw_rate_skip_threshold: float = 8.0,
         **kwargs,
     ):
         is_train = self.unet.training
@@ -568,7 +629,15 @@ class LipsyncPipeline(DiffusionPipeline):
         # not reliable enough to reject other frames (false positives on
         # busy/occluded faces), so we keep all detected faces.
         apply_identity_filter = reference_embedding is not None
-        video_frames, faces, boxes, affine_matrices, skip_mask = self.loop_video(whisper_chunks, video_frames, reference_embedding=reference_embedding, face_embedder=face_embedder, yaw_skip_threshold=yaw_skip_threshold, apply_identity_filter=apply_identity_filter)
+        video_frames, faces, boxes, affine_matrices, skip_mask = self.loop_video(
+            whisper_chunks,
+            video_frames,
+            reference_embedding=reference_embedding,
+            face_embedder=face_embedder,
+            yaw_skip_threshold=yaw_skip_threshold,
+            yaw_rate_skip_threshold=yaw_rate_skip_threshold,
+            apply_identity_filter=apply_identity_filter,
+        )
         logger.info(f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, affine_matrices={len(affine_matrices)}, apply_identity_filter={apply_identity_filter}, skip_true={sum(skip_mask)}/{len(skip_mask)}")
 
         # State carried across batches for temporal EMA smoothing
@@ -774,6 +843,9 @@ class LipsyncPipeline(DiffusionPipeline):
         self._last_run_stats = {
             "quality_fallback_frames": quality_fallback_count,
             "yaw_skip_count": getattr(self, "_last_yaw_skip_count", 0),
+            "yaw_rate_skip_count": getattr(self, "_last_yaw_rate_skip_count", 0),
+            "yaw_skip_threshold": yaw_skip_threshold,
+            "yaw_rate_skip_threshold": yaw_rate_skip_threshold,
             "temporal_smoothing_enabled": temporal_smoothing_enabled,
             "quality_gate_enabled": quality_gate_enabled,
         }
