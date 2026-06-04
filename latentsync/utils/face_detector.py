@@ -9,15 +9,18 @@ INSIGHTFACE_DETECT_SIZE = 512
 
 
 class FaceDetector:
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cuda", skip_side_face_threshold=15.0):
         self.app = FaceAnalysis(
             allowed_modules=["detection", "landmark_2d_106"],
             root="checkpoints/auxiliary",
             providers=["CUDAExecutionProvider"],
         )
         self.app.prepare(ctx_id=cuda_to_int(device), det_size=(INSIGHTFACE_DETECT_SIZE, INSIGHTFACE_DETECT_SIZE))
+        self.skip_side_face_threshold = skip_side_face_threshold
+        self.last_pose_yaw = None
 
     def __call__(self, frame, threshold=0.5):
+        self.last_pose_yaw = None
         f_h, f_w, _ = frame.shape
 
         faces = self.app.get(frame)
@@ -46,7 +49,8 @@ class FaceDetector:
         pose = getattr(face, "pose", None)
         if pose is not None:
             yaw = abs(pose[1])
-            if yaw > 15:
+            self.last_pose_yaw = float(yaw)
+            if self.skip_side_face_threshold is not None and yaw > self.skip_side_face_threshold:
                 logger.debug(f"[FaceDetector] Skipping side face: yaw={yaw:.1f}")
                 return None, None
 

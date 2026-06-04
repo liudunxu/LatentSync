@@ -291,6 +291,26 @@ class LipsyncPipeline(DiffusionPipeline):
         return float(delta * 60.0)
 
     @staticmethod
+    def _select_yaw_degrees(landmark_yaw: float, pose_yaw: Optional[float]) -> float:
+        """Choose the strongest available side-face signal.
+
+        InsightFace pose yaw is usually more reliable for profile detection,
+        while landmark yaw remains a useful fallback when pose is absent. Pose
+        yaw is absolute, so we keep the landmark sign for continuity-rate
+        checks when both values are present.
+        """
+        if pose_yaw is None:
+            return landmark_yaw
+        try:
+            pose_abs = abs(float(pose_yaw))
+        except (TypeError, ValueError):
+            return landmark_yaw
+        if abs(landmark_yaw) >= pose_abs:
+            return landmark_yaw
+        sign = -1.0 if landmark_yaw < 0 else 1.0
+        return float(sign * pose_abs)
+
+    @staticmethod
     def _match_color_to_reference(
         face: torch.Tensor,
         ref_face: torch.Tensor,
@@ -733,7 +753,9 @@ class LipsyncPipeline(DiffusionPipeline):
             yaw_deg = 0.0
             yaw_was_skipped = False  # tracks the absolute yaw threshold (not yaw_rate)
             if yaw_skip_threshold > 0 and lmk is not None:
-                yaw_deg = self._estimate_yaw_degrees(lmk)
+                landmark_yaw = self._estimate_yaw_degrees(lmk)
+                pose_yaw = getattr(self.image_processor.face_detector, "last_pose_yaw", None)
+                yaw_deg = self._select_yaw_degrees(landmark_yaw, pose_yaw)
                 if abs(yaw_deg) > yaw_skip_threshold:
                     should_skip = True
                     yaw_was_skipped = True

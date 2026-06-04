@@ -53,7 +53,10 @@ class ImageProcessor:
             self.face_detector = None
             self.face_embedder = None
         else:
-            self.face_detector = FaceDetector(device=device)
+            # Let the lipsync pipeline decide whether a detected face is too
+            # side-on to synthesize. If the detector rejects it here, the
+            # pipeline can only count it as a generic detect failure.
+            self.face_detector = FaceDetector(device=device, skip_side_face_threshold=None)
             self.face_embedder = None
 
     def set_face_embedder(self, embedder):
