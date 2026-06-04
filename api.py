@@ -124,6 +124,15 @@ class LipSyncRequest(BaseModel):
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.35, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.18, ge=0.0, le=0.6)
+    # Inpaint mask override. None = use the server-side default
+    # (self.config.data.mask_image_path, usually latentsync/utils/mask.png).
+    # Set to "latentsync/utils/mask5.png" to use the tight mouth-only mask,
+    # which keeps identity/expression intact by leaving cheeks/chin untouched.
+    # Path is resolved relative to the project root at call time.
+    mask_image_path: Optional[str] = Field(
+        None,
+        description="Override the inpaint mask path. None = use server default (mask.png).",
+    )
     # Postfilter catches generated frames where the mouth ROI is clearly
     # blurry or much softer than the original mouth ROI. This is intentionally
     # conservative: difficult frames fall back to the source video instead of
@@ -968,7 +977,7 @@ class LatentSyncApiRuntime:
                 weight_dtype=self.dtype,
                 width=self.config.data.resolution,
                 height=self.config.data.resolution,
-                mask_image_path=self.config.data.mask_image_path,
+                mask_image_path=payload.mask_image_path or self.config.data.mask_image_path,
                 temp_dir=str(job_output_dir / "temp"),
                 reference_embedding=reference_embedding,
                 face_embedder=runtime.face_embedder,
