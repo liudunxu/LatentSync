@@ -62,9 +62,17 @@ class Settings:
     unet_config_path: str = os.getenv("LATENTSYNC_UNET_CONFIG", "configs/unet/stage2_512.yaml")
     inference_ckpt_path: str = os.getenv("LATENTSYNC_INFERENCE_CKPT", "checkpoints/latentsync_unet.pt")
     guidance_scale: float = float(os.getenv("LATENTSYNC_GUIDANCE_SCALE", "2.0"))
-    inference_steps: int = int(os.getenv("LATENTSYNC_INFERENCE_STEPS", "30"))
+    # 40 steps is the sweet spot: 50 has near-zero perceptual gain but ~25% more
+    # wall-time. Below 30, lip detail starts to soften and frame-to-frame motion
+    # loses high-frequency components. Override via LATENTSYNC_INFERENCE_STEPS.
+    inference_steps: int = int(os.getenv("LATENTSYNC_INFERENCE_STEPS", "40"))
     seed: int = int(os.getenv("LATENTSYNC_SEED", "1247"))
-    enable_deepcache: bool = os.getenv("LATENTSYNC_ENABLE_DEEPCACHE", "1").lower() in {"1", "true", "yes"}
+    # DeepCache (cache_interval=3) reuses UNet features every 3 steps. It cuts
+    # ~30% wall-time but visibly degrades lip motion on speaking videos -- the
+    # mouth looks "deepfakey" because UNet features can't follow fast audio-driven
+    # changes. Default OFF; enable with LATENTSYNC_ENABLE_DEEPCACHE=1 if you want
+    # the speed and can tolerate the softness.
+    enable_deepcache: bool = os.getenv("LATENTSYNC_ENABLE_DEEPCACHE", "0").lower() in {"1", "true", "yes"}
     max_download_bytes: int = int(os.getenv("API_MAX_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
     download_retries: int = int(os.getenv("API_DOWNLOAD_RETRIES", "2"))
     download_retry_backoff_seconds: float = float(os.getenv("API_DOWNLOAD_RETRY_BACKOFF_SECONDS", "1.0"))
