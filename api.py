@@ -866,6 +866,9 @@ class LatentSyncApiRuntime:
                 temp_dir=str(job_output_dir / "temp"),
                 reference_embedding=reference_embedding,
                 face_embedder=runtime.face_embedder,
+                quality_gate_enabled=payload.quality_gate_enabled,
+                quality_min_laplacian=payload.quality_min_laplacian,
+                quality_min_sharpness_ratio=payload.quality_min_sharpness_ratio,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")
 
@@ -873,6 +876,11 @@ class LatentSyncApiRuntime:
                 source_frame_count, source_fps = _read_video_info(video_path)
             except Exception:
                 source_frame_count, source_fps = 0, 25.0
+
+            # Pull real stats from the pipeline (stashed by the pipeline __call__).
+            run_stats = getattr(self.pipeline, "_last_run_stats", None) or {}
+            quality_fallback_frames = int(run_stats.get("quality_fallback_frames", 0))
+            yaw_skip_count = int(run_stats.get("yaw_skip_count", 0))
 
             return {
                 "output_path": output_path,
@@ -895,7 +903,8 @@ class LatentSyncApiRuntime:
                 "matched_or_filled_source_frames": source_frame_count,
                 "eligible_source_frames": source_frame_count,
                 "generated_output_frames": source_frame_count,
-                "quality_fallback_frames": 0,
+                "quality_fallback_frames": quality_fallback_frames,
+                "yaw_skip_count": yaw_skip_count,
                 "effective_generated_output_frames": source_frame_count,
                 "skipped_output_frames": 0,
                 "best_similarity": 0.0,

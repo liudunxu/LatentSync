@@ -104,7 +104,7 @@ class ImageProcessor:
                 if emb is not None:
                     embedding = np.asarray(emb, dtype=np.float32)
 
-        return face, box, affine_matrix, embedding
+        return face, box, affine_matrix, embedding, landmark_2d_106
 
     def preprocess_fixed_mask_image(self, image: torch.Tensor, affine_transform=False):
         if affine_transform:

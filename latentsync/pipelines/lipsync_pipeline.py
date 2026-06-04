@@ -264,6 +264,102 @@ class LipsyncPipeline(DiffusionPipeline):
         except (IndexError, TypeError):
             return 0.0
 
+    @staticmethod
+    def _estimate_yaw_degrees(lmk: np.ndarray) -> float:
+        """Rough yaw estimation in degrees from 106-point landmarks.
+        0 ≈ frontal; positive means the face is turned so the nose appears
+        shifted to the subject's right in the image. Used as a coarse
+        prefilter to skip lip-sync on heavily side-on faces where the
+        affine alignment becomes unreliable.
+        """
+        if lmk is None or len(lmk) < 106:
+            return 0.0
+        try:
+            pt_left_eye = np.mean(lmk[[43, 48, 49, 51, 50]], axis=0)
+            pt_right_eye = np.mean(lmk[101:106], axis=0)
+            pt_nose = np.mean(lmk[[74, 77, 83, 86]], axis=0)
+        except (IndexError, TypeError):
+            return 0.0
+        inter_ocular = float(pt_right_eye[0] - pt_left_eye[0])
+        if abs(inter_ocular) < 1e-3:
+            return 0.0
+        expected = inter_ocular / 2.0
+        nose_to_left = float(abs(pt_nose[0] - pt_left_eye[0]))
+        # Positive when the nose is left of the eye midpoint (subject's right turn)
+        delta = (expected - nose_to_left) / expected
+        # Empirically: delta=0.5 ≈ 30°, delta=1.0 ≈ 60°. Keep linear, conservative.
+        return float(delta * 60.0)
+
+    @staticmethod
+    def _face_sharpness(face: torch.Tensor) -> float:
+        """Laplacian variance as a sharpness proxy. face shape (3, H, W), any dtype/range.
+        Returns 0.0 on failure. Uses kornia if available, falls back to torch conv."""
+        try:
+            import kornia.filters as kf
+            lap = kf.laplacian(face.unsqueeze(0), kernel_size=3).squeeze(0)
+            return float(lap.pow(2).mean().item())
+        except Exception:
+            try:
+                import torch.nn.functional as F
+                kernel = torch.tensor(
+                    [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+                    dtype=face.dtype, device=face.device,
+                ).view(1, 1, 3, 3)
+                gray = face.mean(dim=0, keepdim=True).unsqueeze(0)
+                lap = F.conv2d(gray, kernel, padding=1)
+                return float(lap.pow(2).mean().item())
+            except Exception:
+                return 0.0
+
+    @staticmethod
+    def _smooth_face_sequence(
+        face_crops: torch.Tensor,
+        prev_face: Optional[torch.Tensor],
+        prev_valid: bool,
+        inference_skip_mask,
+        weights=(0.25, 0.5, 0.25),
+    ):
+        """3-tap temporal EMA across face crops. Returns
+        (smoothed, last_face, last_valid).
+
+        - Skips any frame where inference_skip_mask[k] is True and resets the
+          carry state so the next valid frame doesn't blend in a zero placeholder.
+        - prev_face is only used when prev_valid is True.
+        - Triangular kernel by default (weights = prev, cur, next) so the
+          middle frame keeps 50% weight and neighbours each contribute 25%.
+        """
+        B = face_crops.shape[0]
+        if B == 0:
+            return face_crops, prev_face, prev_valid
+        w_prev, w_cur, w_next = weights
+        smoothed = face_crops.clone()
+        last_valid = prev_valid
+        last_face = prev_face
+
+        for k in range(B):
+            if inference_skip_mask[k]:
+                # Zero-placeholder face from affine_transform_video: don't
+                # pollute neighbours; reset carry.
+                last_face = None
+                last_valid = False
+                continue
+
+            if k == 0 and last_valid and last_face is not None:
+                if B > 1:
+                    smoothed[0] = w_prev * last_face + w_cur * face_crops[0] + w_next * face_crops[1]
+                else:
+                    smoothed[0] = 0.5 * last_face + 0.5 * face_crops[0]
+            elif 0 < k < B - 1:
+                smoothed[k] = w_prev * face_crops[k - 1] + w_cur * face_crops[k] + w_next * face_crops[k + 1]
+            elif k == B - 1 and B > 1:
+                # Last frame: blend with its predecessor (no next frame in batch)
+                smoothed[k] = 0.5 * face_crops[k - 1] + 0.5 * face_crops[k]
+
+            last_face = face_crops[k]
+            last_valid = True
+
+        return smoothed, last_face, last_valid
+
     def detect_main_speaker_embedding(self, video_frames: np.ndarray, face_embedder) -> Optional[np.ndarray]:
         if face_embedder is None or len(video_frames) == 0:
             return None
@@ -293,16 +389,20 @@ class LipsyncPipeline(DiffusionPipeline):
         logger.info(f"[LipSync] Main speaker from frame {best_frame_idx} with mouth_ratio={best_ratio:.4f}")
         return best_emb
 
-    def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None):
-        logger.info(f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}")
+    def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None, yaw_skip_threshold: float = 30.0):
+        logger.info(f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}")
         faces = []
         boxes = []
         affine_matrices = []
         skip_mask = []
+        yaw_skip_count = 0
+        identity_skip_count = 0
+        detect_fail_count = 0
         print(f"Affine transforming {len(video_frames)} faces...")
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
-            face, box, affine_matrix, face_emb = self.image_processor.affine_transform_with_embedding(frame)
+            face, box, affine_matrix, face_emb, lmk = self.image_processor.affine_transform_with_embedding(frame)
             if face is None:
+                detect_fail_count += 1
                 skip_mask.append(True)
                 faces.append(torch.zeros(3, self.image_processor.resolution, self.image_processor.resolution))
                 boxes.append([0, 0, 0, 0])
@@ -311,11 +411,20 @@ class LipsyncPipeline(DiffusionPipeline):
                 should_skip = False
                 if reference_embedding is not None and face_emb is not None:
                     similarity = float(np.dot(face_emb, reference_embedding))
-                    should_skip = similarity < 0.7
+                    if similarity < 0.7:
+                        should_skip = True
+                        identity_skip_count += 1
+                if not should_skip and yaw_skip_threshold > 0 and lmk is not None:
+                    yaw_deg = self._estimate_yaw_degrees(lmk)
+                    if abs(yaw_deg) > yaw_skip_threshold:
+                        should_skip = True
+                        yaw_skip_count += 1
                 skip_mask.append(should_skip)
                 faces.append(face)
                 boxes.append(box)
                 affine_matrices.append(affine_matrix)
+        logger.info(f"[FaceMatch] detect_fail={detect_fail_count}, identity_skip={identity_skip_count}, yaw_skip={yaw_skip_count}")
+        self._last_yaw_skip_count = yaw_skip_count
         faces_tensor = torch.stack(faces)
         return faces_tensor, boxes, affine_matrices, skip_mask
 
@@ -338,13 +447,13 @@ class LipsyncPipeline(DiffusionPipeline):
                 out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 
-    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray, reference_embedding=None, face_embedder=None, skip_mask=None):
-        logger.info(f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}")
+    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray, reference_embedding=None, face_embedder=None, skip_mask=None, yaw_skip_threshold: float = 30.0):
+        logger.info(f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}")
         if reference_embedding is None and face_embedder is not None:
             reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
             logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
         if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding)
+            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding, yaw_skip_threshold=yaw_skip_threshold)
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
             loop_video_frames = []
             loop_faces = []
@@ -372,7 +481,7 @@ class LipsyncPipeline(DiffusionPipeline):
             skip_mask = loop_skip_mask[: len(whisper_chunks)]
         else:
             video_frames = video_frames[: len(whisper_chunks)]
-            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding)
+            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding, yaw_skip_threshold=yaw_skip_threshold)
             skip_mask = frame_skip_mask
 
         return video_frames, faces, boxes, affine_matrices, skip_mask
@@ -399,6 +508,12 @@ class LipsyncPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         reference_embedding=None,
         face_embedder=None,
+        # --- quality / temporal gating (added 2026-06) ---
+        temporal_smoothing_enabled: bool = True,
+        quality_gate_enabled: bool = True,
+        quality_min_laplacian: float = 15.0,
+        quality_min_sharpness_ratio: float = 0.20,
+        yaw_skip_threshold: float = 30.0,
         **kwargs,
     ):
         is_train = self.unet.training
@@ -442,8 +557,14 @@ class LipsyncPipeline(DiffusionPipeline):
         video_frames = read_video(video_path, use_decord=False)
         logger.info(f"[LipSync] video_frames shape={video_frames.shape}")
 
-        video_frames, faces, boxes, affine_matrices, skip_mask = self.loop_video(whisper_chunks, video_frames, reference_embedding=reference_embedding, face_embedder=face_embedder)
+        video_frames, faces, boxes, affine_matrices, skip_mask = self.loop_video(whisper_chunks, video_frames, reference_embedding=reference_embedding, face_embedder=face_embedder, yaw_skip_threshold=yaw_skip_threshold)
         logger.info(f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, affine_matrices={len(affine_matrices)}, skip_mask={skip_mask}")
+
+        # State carried across batches for temporal EMA smoothing
+        prev_face: Optional[torch.Tensor] = None
+        prev_valid: bool = False
+        quality_fallback_count: int = 0
+        quality_skip_mask: List[bool] = [False] * len(skip_mask)
 
         synced_video_frames = []
 
@@ -534,10 +655,43 @@ class LipsyncPipeline(DiffusionPipeline):
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
+
+            # Temporal EMA across face crops (cross-batch state via prev_face)
+            inference_skip_mask = skip_mask[i * num_frames : (i + 1) * num_frames]
+            if temporal_smoothing_enabled:
+                decoded_latents, prev_face, prev_valid = self._smooth_face_sequence(
+                    decoded_latents,
+                    prev_face=prev_face,
+                    prev_valid=prev_valid,
+                    inference_skip_mask=inference_skip_mask,
+                )
+
+            # Quality postfilter: flag frames whose generated face is too blurry
+            # to be worth showing. Checked AFTER paste so the value domain is [-1, 1].
+            if quality_gate_enabled:
+                B = decoded_latents.shape[0]
+                base = i * num_frames
+                for k in range(B):
+                    if inference_skip_mask[k]:
+                        continue  # already going to fall back to original
+                    gen_lap = self._face_sharpness(decoded_latents[k])
+                    if gen_lap < quality_min_laplacian:
+                        quality_skip_mask[base + k] = True
+                        quality_fallback_count += 1
+                        continue
+                    ref_lap = self._face_sharpness(ref_pixel_values[k])
+                    if ref_lap > 0 and (gen_lap / ref_lap) < quality_min_sharpness_ratio:
+                        quality_skip_mask[base + k] = True
+                        quality_fallback_count += 1
+
             synced_video_frames.append(decoded_latents)
 
         logger.info(f"[LipSync] decoded {len(synced_video_frames)} batches, restoring video...")
-        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices, skip_mask)
+        # OR-merge the quality postfilter with the original skip_mask
+        effective_skip_mask = [a or b for a, b in zip(skip_mask, quality_skip_mask)]
+        if quality_fallback_count:
+            logger.info(f"[LipSync] quality_fallback_frames={quality_fallback_count} / {len(skip_mask)}")
+        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices, effective_skip_mask)
         logger.info(f"[LipSync] restored video frames shape={synced_video_frames.shape}")
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
@@ -551,6 +705,14 @@ class LipsyncPipeline(DiffusionPipeline):
         os.makedirs(temp_dir, exist_ok=True)
 
         write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps)
+
+        # Stash stats for the API layer to read (synthesize() consumes this).
+        self._last_run_stats = {
+            "quality_fallback_frames": quality_fallback_count,
+            "yaw_skip_count": getattr(self, "_last_yaw_skip_count", 0),
+            "temporal_smoothing_enabled": temporal_smoothing_enabled,
+            "quality_gate_enabled": quality_gate_enabled,
+        }
 
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
