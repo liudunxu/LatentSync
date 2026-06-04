@@ -652,9 +652,36 @@ class LipsyncPipeline(DiffusionPipeline):
 
             # Recover the pixel values
             decoded_latents = self.decode_latents(latents)
+            # Diagnostic: show the mask convention and how much the model is
+            # actually deviating from the input on the first batch.
+            if i == 0:
+                with torch.no_grad():
+                    mask_first = masks[0, 0]  # (H, W) in [0, 1]
+                    logger.info(
+                        f"[Diag] batch0 mask: min={mask_first.min().item():.3f} "
+                        f"max={mask_first.max().item():.3f} mean={mask_first.mean().item():.3f} "
+                        f"frac_inpaint={float((mask_first < 0.5).float().mean().item()):.3f}"
+                    )
+                    decoded_first = decoded_latents[0]
+                    ref_first = ref_pixel_values[0]
+                    diff = (decoded_first - ref_first).abs().mean().item()
+                    logger.info(
+                        f"[Diag] batch0 frame0: decoded range [{decoded_first.min().item():.2f}, {decoded_first.max().item():.2f}] "
+                        f"ref range [{ref_first.min().item():.2f}, {ref_first.max().item():.2f}] "
+                        f"mean|decoded-ref|={diff:.4f}"
+                    )
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
+            if i == 0:
+                with torch.no_grad():
+                    combined_first = decoded_latents[0]
+                    ref_first = ref_pixel_values[0]
+                    diff = (combined_first - ref_first).abs().mean().item()
+                    logger.info(
+                        f"[Diag] batch0 frame0 after paste: mean|combined-ref|={diff:.4f} "
+                        f"(~0 means model output was overwritten by ref)"
+                    )
 
             # Temporal EMA across face crops (cross-batch state via prev_face)
             inference_skip_mask = skip_mask[i * num_frames : (i + 1) * num_frames]
@@ -671,24 +698,47 @@ class LipsyncPipeline(DiffusionPipeline):
             if quality_gate_enabled:
                 B = decoded_latents.shape[0]
                 base = i * num_frames
+                gen_laps = []
+                ref_laps = []
                 for k in range(B):
                     if inference_skip_mask[k]:
                         continue  # already going to fall back to original
                     gen_lap = self._face_sharpness(decoded_latents[k])
+                    ref_lap = self._face_sharpness(ref_pixel_values[k])
+                    gen_laps.append(gen_lap)
+                    ref_laps.append(ref_lap)
                     if gen_lap < quality_min_laplacian:
                         quality_skip_mask[base + k] = True
                         quality_fallback_count += 1
+                        logger.info(
+                            f"[Diag] postfilter fallback batch{i} k{k}: gen_lap={gen_lap:.2f} < {quality_min_laplacian}"
+                        )
                         continue
-                    ref_lap = self._face_sharpness(ref_pixel_values[k])
                     if ref_lap > 0 and (gen_lap / ref_lap) < quality_min_sharpness_ratio:
                         quality_skip_mask[base + k] = True
                         quality_fallback_count += 1
+                        logger.info(
+                            f"[Diag] postfilter fallback batch{i} k{k}: gen_lap={gen_lap:.2f} / ref_lap={ref_lap:.2f} = {gen_lap/ref_lap:.3f} < {quality_min_sharpness_ratio}"
+                        )
+                if i == 0 and gen_laps:
+                    import statistics
+                    logger.info(
+                        f"[Diag] batch0 laplacian: gen min={min(gen_laps):.2f} max={max(gen_laps):.2f} median={statistics.median(gen_laps):.2f} "
+                        f"ref min={min(ref_laps):.2f} max={max(ref_laps):.2f} median={statistics.median(ref_laps):.2f}"
+                    )
 
             synced_video_frames.append(decoded_latents)
 
         logger.info(f"[LipSync] decoded {len(synced_video_frames)} batches, restoring video...")
         # OR-merge the quality postfilter with the original skip_mask
         effective_skip_mask = [a or b for a, b in zip(skip_mask, quality_skip_mask)]
+        pre_skip = sum(skip_mask)
+        quality_skip = sum(quality_skip_mask)
+        effective_skip = sum(effective_skip_mask)
+        logger.info(
+            f"[Diag] skip summary: pre(loop_video)={pre_skip} quality_postfilter={quality_skip} "
+            f"effective_total={effective_skip} / {len(skip_mask)}"
+        )
         if quality_fallback_count:
             logger.info(f"[LipSync] quality_fallback_frames={quality_fallback_count} / {len(skip_mask)}")
         synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices, effective_skip_mask)
