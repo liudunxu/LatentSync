@@ -62,6 +62,21 @@ class ImageProcessor:
     def set_face_embedder(self, embedder):
         self.face_embedder = embedder
 
+    @staticmethod
+    def _bbox_iou(left, right) -> float:
+        lx1, ly1, lx2, ly2 = [float(v) for v in left]
+        rx1, ry1, rx2, ry2 = [float(v) for v in right]
+        ix1, iy1 = max(lx1, rx1), max(ly1, ry1)
+        ix2, iy2 = min(lx2, rx2), min(ly2, ry2)
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        left_area = max(0.0, lx2 - lx1) * max(0.0, ly2 - ly1)
+        right_area = max(0.0, rx2 - rx1) * max(0.0, ry2 - ry1)
+        union = left_area + right_area - inter
+        return float(inter / union) if union > 0 else 0.0
+
     def affine_transform(self, image: torch.Tensor) -> np.ndarray:
         if self.face_detector is None:
             raise NotImplementedError("Using the CPU for face detection is not supported")
@@ -84,8 +99,8 @@ class ImageProcessor:
     def affine_transform_with_embedding(self, image: torch.Tensor):
         if self.face_detector is None:
             raise NotImplementedError("Using the CPU for face detection is not supported")
-        bbox, landmark_2d_106 = self.face_detector(image)
-        if bbox is None:
+        source_bbox, landmark_2d_106 = self.face_detector(image)
+        if source_bbox is None:
             return None, None, None, None
 
         pt_left_eye = np.mean(landmark_2d_106[[43, 48, 49, 51, 50]], axis=0)
@@ -101,9 +116,21 @@ class ImageProcessor:
 
         embedding = None
         if self.face_embedder is not None:
-            faces = self.face_embedder.get(image.astype(np.uint8) if image.dtype != np.uint8 else image)
-            if faces:
-                emb = getattr(faces[0], "normed_embedding", None)
+            detected_faces = self.face_embedder.get(image.astype(np.uint8) if image.dtype != np.uint8 else image)
+            best_face = None
+            best_iou = -1.0
+            for detected_face in detected_faces:
+                detected_bbox = getattr(detected_face, "bbox", None)
+                if detected_bbox is None:
+                    continue
+                iou = self._bbox_iou(source_bbox, detected_bbox)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_face = detected_face
+            if best_face is None and detected_faces:
+                best_face = detected_faces[0]
+            if best_face is not None:
+                emb = getattr(best_face, "normed_embedding", None)
                 if emb is not None:
                     embedding = np.asarray(emb, dtype=np.float32)
 

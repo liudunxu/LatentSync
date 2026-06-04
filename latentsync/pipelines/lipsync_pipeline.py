@@ -667,6 +667,7 @@ class LipsyncPipeline(DiffusionPipeline):
         prev_face: Optional[torch.Tensor],
         prev_valid: bool,
         inference_skip_mask,
+        continuity_break_mask=None,
         region_mask: Optional[torch.Tensor] = None,
         weights=(0.25, 0.5, 0.25),
     ):
@@ -675,6 +676,9 @@ class LipsyncPipeline(DiffusionPipeline):
 
         - Skips any frame where inference_skip_mask[k] is True and resets the
           carry state so the next valid frame doesn't blend in a zero placeholder.
+        - continuity_break_mask[k] resets temporal carry before frame k and
+          prevents k from blending with k-1. This is used at detected face
+          switches so the previous person/shot cannot leak into the new one.
         - prev_face is only used when prev_valid is True.
         - Triangular kernel by default (weights = prev, cur, next) so the
           middle frame keeps 50% weight and neighbours each contribute 25%.
@@ -697,6 +701,11 @@ class LipsyncPipeline(DiffusionPipeline):
         smoothed = face_crops.clone()
         last_valid = prev_valid
         last_face = prev_face
+        continuity_break_mask = list(continuity_break_mask or [])
+        if len(continuity_break_mask) < B:
+            continuity_break_mask = continuity_break_mask + [False] * (B - len(continuity_break_mask))
+        elif len(continuity_break_mask) > B:
+            continuity_break_mask = continuity_break_mask[:B]
 
         # Normalize region_mask to (B, 3, H, W) for broadcasting against
         # face_crops (B, 3, H, W). Accepts (B, H, W), (B, 1, H, W),
@@ -723,6 +732,10 @@ class LipsyncPipeline(DiffusionPipeline):
                         region_mask_3d = rm.expand(-1, 3, -1, -1)
 
         for k in range(B):
+            if continuity_break_mask[k]:
+                last_face = None
+                last_valid = False
+
             if inference_skip_mask[k]:
                 # Zero-placeholder face from affine_transform_video: don't
                 # pollute neighbours; reset carry.
@@ -730,16 +743,23 @@ class LipsyncPipeline(DiffusionPipeline):
                 last_valid = False
                 continue
 
-            if k == 0 and last_valid and last_face is not None:
-                if B > 1:
-                    smoothed[0] = w_prev * last_face + w_cur * face_crops[0] + w_next * face_crops[1]
-                else:
-                    smoothed[0] = 0.5 * last_face + 0.5 * face_crops[0]
-            elif 0 < k < B - 1:
-                smoothed[k] = w_prev * face_crops[k - 1] + w_cur * face_crops[k] + w_next * face_crops[k + 1]
-            elif k == B - 1 and B > 1:
-                # Last frame: blend with its predecessor (no next frame in batch)
-                smoothed[k] = 0.5 * face_crops[k - 1] + 0.5 * face_crops[k]
+            weighted = w_cur * face_crops[k]
+            total_weight = w_cur
+
+            if k == 0:
+                if last_valid and last_face is not None:
+                    weighted = weighted + w_prev * last_face.to(face_crops.device)
+                    total_weight += w_prev
+            elif not inference_skip_mask[k - 1] and not continuity_break_mask[k]:
+                weighted = weighted + w_prev * face_crops[k - 1]
+                total_weight += w_prev
+
+            if k + 1 < B and not inference_skip_mask[k + 1] and not continuity_break_mask[k + 1]:
+                weighted = weighted + w_next * face_crops[k + 1]
+                total_weight += w_next
+
+            if total_weight > w_cur:
+                smoothed[k] = weighted / total_weight
 
             # Region-mask: outside the inpaint area, use the raw face so EMA
             # can't leak previous-frame content into the original-face area.
@@ -823,10 +843,15 @@ class LipsyncPipeline(DiffusionPipeline):
         mouth_occlusion_skip_count = 0
         motion_blur_skip_count = 0
         face_jump_skip_count = 0
+        temporal_identity_break_count = 0
+        temporal_geometry_break_count = 0
         identity_skip_count = 0
         detect_fail_count = 0
         prev_yaw: Optional[float] = None
         prev_motion_state = None
+        prev_temporal_motion_state = None
+        prev_temporal_embedding = None
+        continuity_break_mask = []
         print(f"Affine transforming {len(video_frames)} faces...")
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
             affine_result = self.image_processor.affine_transform_with_embedding(frame)
@@ -845,6 +870,9 @@ class LipsyncPipeline(DiffusionPipeline):
                 yaw_skip_reasons.append(False)
                 prev_yaw = None  # reset so we don't carry a stale yaw across a detect-fail gap
                 prev_motion_state = None
+                prev_temporal_motion_state = None
+                prev_temporal_embedding = None
+                continuity_break_mask.append(True)
                 continue
             should_skip = False
             if apply_identity_filter and reference_embedding is not None and face_emb is not None:
@@ -899,6 +927,32 @@ class LipsyncPipeline(DiffusionPipeline):
                 ):
                     should_skip = True
                     face_jump_skip_count += 1
+            continuity_break = False
+            if not should_skip:
+                if face_emb is not None and prev_temporal_embedding is not None:
+                    continuity_similarity = float(np.dot(face_emb, prev_temporal_embedding))
+                    if continuity_similarity < 0.70:
+                        continuity_break = True
+                        temporal_identity_break_count += 1
+                if (
+                    motion_state is not None
+                    and prev_temporal_motion_state is not None
+                    and (face_jump_center_threshold > 0 or face_jump_scale_threshold > 0)
+                ):
+                    center, size = motion_state
+                    prev_center, prev_size = prev_temporal_motion_state
+                    center_shift = float(np.linalg.norm(center - prev_center) / max(prev_size, 1.0))
+                    scale_shift = float(abs(size - prev_size) / max(prev_size, 1.0))
+                    geometry_break = (
+                        face_jump_center_threshold > 0
+                        and center_shift > face_jump_center_threshold * 0.65
+                    ) or (
+                        face_jump_scale_threshold > 0
+                        and scale_shift > face_jump_scale_threshold * 0.65
+                    )
+                    if geometry_break:
+                        continuity_break = True
+                        temporal_geometry_break_count += 1
             # Mouth occlusion: skip frames where the mouth is covered by a
             # hand, microphone, phone, mask, etc. Cheap pixel-ratio check on
             # the aligned face -- no model load.
@@ -922,6 +976,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     should_skip = True
                     motion_blur_skip_count += 1
             skip_mask.append(should_skip)
+            continuity_break_mask.append(should_skip or continuity_break)
             yaws.append(yaw_deg if (yaw_skip_threshold > 0 and yaw_available) else None)
             yaw_skip_reasons.append(yaw_was_skipped)
             faces.append(face)
@@ -930,12 +985,20 @@ class LipsyncPipeline(DiffusionPipeline):
             prev_yaw = yaw_deg if (yaw_skip_threshold > 0 and yaw_available) else None
             if not should_skip and motion_state is not None:
                 prev_motion_state = motion_state
+                prev_temporal_motion_state = motion_state
+            if not should_skip and face_emb is not None:
+                prev_temporal_embedding = face_emb
+            if should_skip:
+                prev_temporal_motion_state = None
+                prev_temporal_embedding = None
         logger.info(
             f"[FaceMatch] detect_fail={detect_fail_count}, identity_skip={identity_skip_count}, "
             f"yaw_skip={yaw_skip_count}, yaw_rate_skip={yaw_rate_skip_count}, "
             f"mouth_occlusion_skip={mouth_occlusion_skip_count}, "
             f"motion_blur_skip={motion_blur_skip_count}, "
-            f"face_jump_skip={face_jump_skip_count}"
+            f"face_jump_skip={face_jump_skip_count}, "
+            f"temporal_identity_break={temporal_identity_break_count}, "
+            f"temporal_geometry_break={temporal_geometry_break_count}"
         )
         self._last_yaw_skip_count = yaw_skip_count
         self._last_yaw_rate_skip_count = yaw_rate_skip_count
@@ -975,6 +1038,7 @@ class LipsyncPipeline(DiffusionPipeline):
                         and abs(yaws[k]) > yaw_warn_threshold
                     ):
                         skip_mask[k] = True
+                        continuity_break_mask[k] = True
                         side_face_episode_extra_skip_count += 1
                 # expand right into post_pad window
                 for k in range(j, min(n, j + side_face_episode_post_pad)):
@@ -984,6 +1048,7 @@ class LipsyncPipeline(DiffusionPipeline):
                         and abs(yaws[k]) > yaw_warn_threshold
                     ):
                         skip_mask[k] = True
+                        continuity_break_mask[k] = True
                         side_face_episode_extra_skip_count += 1
                 i = j
         if yaw_warn_threshold > 0 and side_face_warn_min_run_frames > 0:
@@ -1004,6 +1069,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 if j - i >= side_face_warn_min_run_frames:
                     for k in range(i, j):
                         skip_mask[k] = True
+                        continuity_break_mask[k] = True
                         side_face_warn_run_skip_count += 1
                 i = j
         self._last_side_face_episode_extra_skip_count = side_face_episode_extra_skip_count
@@ -1021,7 +1087,7 @@ class LipsyncPipeline(DiffusionPipeline):
             )
 
         faces_tensor = torch.stack(faces)
-        return faces_tensor, boxes, affine_matrices, skip_mask
+        return faces_tensor, boxes, affine_matrices, skip_mask, continuity_break_mask
 
     def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, skip_mask=None):
         video_frames = video_frames[: len(faces)]
@@ -1075,7 +1141,7 @@ class LipsyncPipeline(DiffusionPipeline):
             reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
             logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
         if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(
+            faces, boxes, affine_matrices, frame_skip_mask, frame_continuity_break_mask = self.affine_transform_video(
                 video_frames,
                 reference_embedding,
                 yaw_skip_threshold=yaw_skip_threshold,
@@ -1096,6 +1162,7 @@ class LipsyncPipeline(DiffusionPipeline):
             loop_boxes = []
             loop_affine_matrices = []
             loop_skip_mask = []
+            loop_continuity_break_mask = []
             for i in range(num_loops):
                 if i % 2 == 0:
                     loop_video_frames.append(video_frames)
@@ -1103,21 +1170,32 @@ class LipsyncPipeline(DiffusionPipeline):
                     loop_boxes += boxes
                     loop_affine_matrices += affine_matrices
                     loop_skip_mask += frame_skip_mask
+                    loop_continuity_break_mask += [
+                        (True if i > 0 and k == 0 else value)
+                        for k, value in enumerate(frame_continuity_break_mask)
+                    ]
                 else:
                     loop_video_frames.append(video_frames[::-1])
                     loop_faces.append(faces.flip(0))
                     loop_boxes += boxes[::-1]
                     loop_affine_matrices += affine_matrices[::-1]
                     loop_skip_mask += frame_skip_mask[::-1]
+                    n_breaks = len(frame_continuity_break_mask)
+                    reversed_breaks = [
+                        True if k == 0 else frame_continuity_break_mask[n_breaks - k]
+                        for k in range(n_breaks)
+                    ]
+                    loop_continuity_break_mask += reversed_breaks
 
             video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
             faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
             boxes = loop_boxes[: len(whisper_chunks)]
             affine_matrices = loop_affine_matrices[: len(whisper_chunks)]
             skip_mask = loop_skip_mask[: len(whisper_chunks)]
+            continuity_break_mask = loop_continuity_break_mask[: len(whisper_chunks)]
         else:
             video_frames = video_frames[: len(whisper_chunks)]
-            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(
+            faces, boxes, affine_matrices, frame_skip_mask, continuity_break_mask = self.affine_transform_video(
                 video_frames,
                 reference_embedding,
                 yaw_skip_threshold=yaw_skip_threshold,
@@ -1134,7 +1212,7 @@ class LipsyncPipeline(DiffusionPipeline):
             )
             skip_mask = frame_skip_mask
 
-        return video_frames, faces, boxes, affine_matrices, skip_mask
+        return video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask
 
     @torch.no_grad()
     def __call__(
@@ -1260,7 +1338,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # not reliable enough to reject other frames (false positives on
         # busy/occluded faces), so we keep all detected faces.
         apply_identity_filter = reference_embedding is not None
-        video_frames, faces, boxes, affine_matrices, skip_mask = self.loop_video(
+        video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask = self.loop_video(
             whisper_chunks,
             video_frames,
             reference_embedding=reference_embedding,
@@ -1277,7 +1355,12 @@ class LipsyncPipeline(DiffusionPipeline):
             yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
             side_face_warn_min_run_frames=side_face_warn_min_run_frames,
         )
-        logger.info(f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, affine_matrices={len(affine_matrices)}, apply_identity_filter={apply_identity_filter}, skip_true={sum(skip_mask)}/{len(skip_mask)}")
+        logger.info(
+            f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, "
+            f"affine_matrices={len(affine_matrices)}, apply_identity_filter={apply_identity_filter}, "
+            f"skip_true={sum(skip_mask)}/{len(skip_mask)}, "
+            f"continuity_break_true={sum(continuity_break_mask)}/{len(continuity_break_mask)}"
+        )
 
         # State carried across batches for temporal EMA smoothing
         prev_face: Optional[torch.Tensor] = None
@@ -1439,6 +1522,7 @@ class LipsyncPipeline(DiffusionPipeline):
             # area (root cause of "previous frame's different face glued in"
             # artifacts with the wider inpaint mask).
             inference_skip_mask = skip_mask[i * num_frames : (i + 1) * num_frames]
+            inference_continuity_break_mask = continuity_break_mask[i * num_frames : (i + 1) * num_frames]
             if temporal_smoothing_enabled:
                 current_mouth_motion = decoded_latents
                 decoded_latents, prev_face, prev_valid = self._smooth_face_sequence(
@@ -1446,6 +1530,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     prev_face=prev_face,
                     prev_valid=prev_valid,
                     inference_skip_mask=inference_skip_mask,
+                    continuity_break_mask=inference_continuity_break_mask,
                     region_mask=generated_region_mask,
                 )
                 if mouth_motion_preserve_strength > 0:
@@ -1468,10 +1553,11 @@ class LipsyncPipeline(DiffusionPipeline):
                 if mouth_stabilize_mask.dim() == 4 and mouth_stabilize_mask.shape[1] == 1:
                     mouth_stabilize_mask = mouth_stabilize_mask.expand(-1, 3, -1, -1)
                 for k in range(decoded_latents.shape[0]):
-                    if inference_skip_mask[k]:
+                    if inference_skip_mask[k] or inference_continuity_break_mask[k]:
                         prev_mouth_stabilized = None
                         prev_mouth_stabilized_valid = False
-                        continue
+                        if inference_skip_mask[k]:
+                            continue
                     current_frame = decoded_latents[k]
                     if prev_mouth_stabilized_valid and prev_mouth_stabilized is not None:
                         stabilized = (
