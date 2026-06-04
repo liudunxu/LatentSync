@@ -809,8 +809,8 @@ class LipsyncPipeline(DiffusionPipeline):
         yaw_rate_skip_threshold: float = 28.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.08,
-        face_jump_center_threshold: float = 0.60,
-        face_jump_scale_threshold: float = 0.80,
+        face_jump_center_threshold: float = 1.00,
+        face_jump_scale_threshold: float = 1.40,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 0,
         side_face_episode_post_pad: int = 0,
@@ -1174,8 +1174,8 @@ class LipsyncPipeline(DiffusionPipeline):
         yaw_rate_skip_threshold: float = 28.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.08,
-        face_jump_center_threshold: float = 0.60,
-        face_jump_scale_threshold: float = 0.80,
+        face_jump_center_threshold: float = 1.00,
+        face_jump_scale_threshold: float = 1.40,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 0,
         side_face_episode_post_pad: int = 0,
@@ -1333,8 +1333,8 @@ class LipsyncPipeline(DiffusionPipeline):
         motion_blur_skip_threshold: float = 0.08,
         # Face-jump input filter: skip frames where landmark center/scale
         # changes abruptly, which usually means detection/alignment jumped.
-        face_jump_center_threshold: float = 0.60,
-        face_jump_scale_threshold: float = 0.80,
+        face_jump_center_threshold: float = 1.00,
+        face_jump_scale_threshold: float = 1.40,
         # Audio-energy prefilter: skip sustained silent runs before diffusion.
         silent_skip_enabled: bool = False,
         silent_rms_threshold: float = 0.003,
