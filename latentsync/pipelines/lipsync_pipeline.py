@@ -291,6 +291,114 @@ class LipsyncPipeline(DiffusionPipeline):
         return float(delta * 60.0)
 
     @staticmethod
+    def _match_color_to_reference(
+        face: torch.Tensor,
+        ref_face: torch.Tensor,
+        mask: torch.Tensor,
+        strength: float = 0.6,
+    ) -> torch.Tensor:
+        """Per-frame mean+std color transfer from `face` to match `ref_face`,
+        applied only inside the mask region of `face`.
+
+        Why: the inpainter outputs the full 512x512 face, but only the masked
+        region (lower face) is "new" -- the rest is supposed to be a no-op
+        pass-through. In practice the diffusion inpainter slightly drifts
+        the whole face's color statistics, and the soft-mask boundary in
+        restore_img feathers that drift into the visible mouth. Aligning
+        the generated face's per-channel mean/std to the original (where
+        the original is sharp and unmasked) makes the seam invisible.
+
+        Args:
+            face: (3, H, W) generated face in [-1, 1] (after paste step).
+            ref_face: (3, H, W) original face in [-1, 1] -- same shape, no paste.
+            mask: (1, H, W) in [0, 1] (1 = generated region).
+            strength: 0 = no transfer, 1 = full transfer.
+
+        Returns:
+            face with color statistics transferred; shape unchanged.
+        """
+        if strength <= 0 or face is None or ref_face is None or mask is None:
+            return face
+        if face.shape != ref_face.shape or face.shape[0] != 3:
+            return face
+        try:
+            x = face.detach().to(torch.float32)
+            r = ref_face.detach().to(torch.float32)
+            m1 = mask.detach().to(torch.float32)
+            # Normalize mask to (3, H, W) for elementwise mul, and a per-
+            # channel weight tensor (1, H, W) for stats so the per-channel
+            # mean/std isn't diluted by a 3x broadcast.
+            if m1.dim() == 3:
+                if m1.shape[0] == 3:
+                    m3 = m1
+                    m_w = m1[0:1]
+                else:  # (1, H, W)
+                    m3 = m1.expand(3, -1, -1)
+                    m_w = m1
+            else:  # (H, W)
+                m3 = m1.unsqueeze(0).expand(3, -1, -1)
+                m_w = m1.unsqueeze(0)
+            weight_sum = m_w.sum(dim=(1, 2)).clamp_min(1.0).expand(3)
+            src_pixels = x * m3
+            tgt_pixels = r * m3
+            src_mean = src_pixels.sum(dim=(1, 2)) / weight_sum
+            tgt_mean = tgt_pixels.sum(dim=(1, 2)) / weight_sum
+            src_var = ((x - src_mean.view(3, 1, 1)) ** 2 * m3).sum(dim=(1, 2)) / weight_sum
+            tgt_var = ((r - tgt_mean.view(3, 1, 1)) ** 2 * m3).sum(dim=(1, 2)) / weight_sum
+            src_std = src_var.clamp_min(1e-6).sqrt()
+            tgt_std = tgt_var.clamp_min(1e-6).sqrt()
+            scale = tgt_std / src_std
+            shift = tgt_mean - src_mean * scale
+            # Apply ONLY inside the mask -- never touch the unmasked region
+            # (which is the original face and is already correct).
+            adjusted = x * scale.view(3, 1, 1) + shift.view(3, 1, 1)
+            mixed = x + m3 * strength * (adjusted - x)
+            return mixed.to(face.dtype)
+        except Exception:
+            return face
+
+    @staticmethod
+    def _unsharp_mask(face: torch.Tensor, mask: torch.Tensor, amount: float = 0.35, radius: int = 3) -> torch.Tensor:
+        """Light unsharp mask applied only inside `mask` (1 = sharpen, 0 = leave).
+
+        Standard unsharp: original + amount * (original - blur(original)).
+        amount=0 disables, 0.3-0.5 is typical, >0.7 looks "crunchy".
+
+        We use a separable Gaussian via 2 convs (faster than full kernel)
+        and cast to fp32 for the conv since the [-1, 1] deltas would
+        underflow in fp16.
+        """
+        if amount <= 0 or face is None or mask is None:
+            return face
+        if face.shape[0] != 3:
+            return face
+        try:
+            x = face.detach().to(torch.float32)
+            m = mask.detach().to(torch.float32)
+            if m.shape[0] == 1:
+                m = m.expand(3, -1, -1)
+            # Build a small Gaussian kernel -- radius 3 ≈ sigma 1.0
+            k = 2 * radius + 1
+            sigma = max(1.0, (k - 1) / 6.0)
+            ax = torch.arange(k, dtype=torch.float32, device=x.device) - radius
+            g1 = torch.exp(-(ax ** 2) / (2 * sigma * sigma))
+            g1 = g1 / g1.sum()
+            # Per-channel separable 1D convs (groups=3 so each input channel
+            # gets its own filter, which is just the 1D Gaussian repeated).
+            kx = g1.view(1, 1, 1, k).expand(3, 1, 1, k)
+            ky = g1.view(1, 1, k, 1).expand(3, 1, k, 1)
+            inp = x.unsqueeze(0)
+            inp_pad = torch.nn.functional.pad(inp, (radius, radius, 0, 0), mode="reflect")
+            inp_pad = torch.nn.functional.pad(inp_pad, (0, 0, radius, radius), mode="reflect")
+            tmp = torch.nn.functional.conv2d(inp_pad, kx, groups=3)
+            blurred = torch.nn.functional.conv2d(tmp, ky, groups=3)
+            sharpened = x + amount * (x - blurred.squeeze(0))
+            out = x + m * (sharpened - x)
+            return out.to(face.dtype)
+        except Exception:
+            return face
+
+    @staticmethod
     def _mouth_occlusion_score(face: torch.Tensor) -> float:
         """Heuristic mouth-visibility score in [0, 1].
 
@@ -440,6 +548,7 @@ class LipsyncPipeline(DiffusionPipeline):
         yaw_skip_threshold: float = 20.0,
         yaw_rate_skip_threshold: float = 8.0,
         mouth_occlusion_skip_threshold: float = 0.7,
+        motion_blur_skip_threshold: float = 0.20,
         apply_identity_filter: bool = True,
     ):
         logger.info(
@@ -447,6 +556,7 @@ class LipsyncPipeline(DiffusionPipeline):
             f"frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}, "
             f"yaw_rate_skip_threshold={yaw_rate_skip_threshold}, "
             f"mouth_occlusion_skip_threshold={mouth_occlusion_skip_threshold}, "
+            f"motion_blur_skip_threshold={motion_blur_skip_threshold}, "
             f"apply_identity_filter={apply_identity_filter}"
         )
         faces = []
@@ -456,6 +566,7 @@ class LipsyncPipeline(DiffusionPipeline):
         yaw_skip_count = 0
         yaw_rate_skip_count = 0
         mouth_occlusion_skip_count = 0
+        motion_blur_skip_count = 0
         identity_skip_count = 0
         detect_fail_count = 0
         prev_yaw: Optional[float] = None
@@ -473,7 +584,7 @@ class LipsyncPipeline(DiffusionPipeline):
             should_skip = False
             if apply_identity_filter and reference_embedding is not None and face_emb is not None:
                 similarity = float(np.dot(face_emb, reference_embedding))
-                if similarity < 0.7:
+                if similarity < 0.8:
                     should_skip = True
                     identity_skip_count += 1
             yaw_deg = 0.0
@@ -505,6 +616,16 @@ class LipsyncPipeline(DiffusionPipeline):
                 if occ > mouth_occlusion_skip_threshold:
                     should_skip = True
                     mouth_occlusion_skip_count += 1
+            # Motion blur: if the whole input face is already smeared (e.g.
+            # fast head turn or camera shake), the inpainter cannot recover
+            # a clean lip -- the output is at best as blurry as the input.
+            # Reuse _face_sharpness on the aligned face; a sharp still face
+            # scores ~5-20, a motion-blurred one scores well below 1.0.
+            if not should_skip and motion_blur_skip_threshold > 0:
+                face_sharp = self._face_sharpness(face)
+                if face_sharp < motion_blur_skip_threshold:
+                    should_skip = True
+                    motion_blur_skip_count += 1
             skip_mask.append(should_skip)
             faces.append(face)
             boxes.append(box)
@@ -513,11 +634,13 @@ class LipsyncPipeline(DiffusionPipeline):
         logger.info(
             f"[FaceMatch] detect_fail={detect_fail_count}, identity_skip={identity_skip_count}, "
             f"yaw_skip={yaw_skip_count}, yaw_rate_skip={yaw_rate_skip_count}, "
-            f"mouth_occlusion_skip={mouth_occlusion_skip_count}"
+            f"mouth_occlusion_skip={mouth_occlusion_skip_count}, "
+            f"motion_blur_skip={motion_blur_skip_count}"
         )
         self._last_yaw_skip_count = yaw_skip_count
         self._last_yaw_rate_skip_count = yaw_rate_skip_count
         self._last_mouth_occlusion_skip_count = mouth_occlusion_skip_count
+        self._last_motion_blur_skip_count = motion_blur_skip_count
         faces_tensor = torch.stack(faces)
         return faces_tensor, boxes, affine_matrices, skip_mask
 
@@ -550,13 +673,15 @@ class LipsyncPipeline(DiffusionPipeline):
         yaw_skip_threshold: float = 20.0,
         yaw_rate_skip_threshold: float = 8.0,
         mouth_occlusion_skip_threshold: float = 0.7,
+        motion_blur_skip_threshold: float = 0.20,
         apply_identity_filter: bool = True,
     ):
         logger.info(
             f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
             f"frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}, "
             f"yaw_rate_skip_threshold={yaw_rate_skip_threshold}, "
-            f"mouth_occlusion_skip_threshold={mouth_occlusion_skip_threshold}, apply_identity_filter={apply_identity_filter}"
+            f"mouth_occlusion_skip_threshold={mouth_occlusion_skip_threshold}, "
+            f"motion_blur_skip_threshold={motion_blur_skip_threshold}, apply_identity_filter={apply_identity_filter}"
         )
         if reference_embedding is None and face_embedder is not None:
             reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
@@ -568,6 +693,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 yaw_skip_threshold=yaw_skip_threshold,
                 yaw_rate_skip_threshold=yaw_rate_skip_threshold,
                 mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
+                motion_blur_skip_threshold=motion_blur_skip_threshold,
                 apply_identity_filter=apply_identity_filter,
             )
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
@@ -603,6 +729,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 yaw_skip_threshold=yaw_skip_threshold,
                 yaw_rate_skip_threshold=yaw_rate_skip_threshold,
                 mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
+                motion_blur_skip_threshold=motion_blur_skip_threshold,
                 apply_identity_filter=apply_identity_filter,
             )
             skip_mask = frame_skip_mask
@@ -658,6 +785,17 @@ class LipsyncPipeline(DiffusionPipeline):
         # threshold (default 0.7) the frame is treated as not-lip-syncable
         # and the original frame is used.
         mouth_occlusion_skip_threshold: float = 0.7,
+        # Motion-blur input filter: skip frames whose aligned face is too
+        # smeared to inpaint cleanly. Default 0.20 (Laplacian variance in
+        # the [-1, 1] face space; a sharp face scores ~5-20, a motion-blurred
+        # one <1.0). Set to 0 to disable.
+        motion_blur_skip_threshold: float = 0.20,
+        # Per-frame color transfer from generated to original (inside the
+        # mask). 0 = off, 1 = full mean+std match. Default 0.60.
+        color_match_strength: float = 0.60,
+        # Unsharp-mask amount applied to the generated mouth region.
+        # 0 = off, 1 = strong sharpen. Default 0.35.
+        mouth_sharpen_strength: float = 0.35,
         **kwargs,
     ):
         is_train = self.unet.training
@@ -715,6 +853,7 @@ class LipsyncPipeline(DiffusionPipeline):
             yaw_skip_threshold=yaw_skip_threshold,
             yaw_rate_skip_threshold=yaw_rate_skip_threshold,
             mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
+            motion_blur_skip_threshold=motion_blur_skip_threshold,
             apply_identity_filter=apply_identity_filter,
         )
         logger.info(f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, affine_matrices={len(affine_matrices)}, apply_identity_filter={apply_identity_filter}, skip_true={sum(skip_mask)}/{len(skip_mask)}")
@@ -835,6 +974,20 @@ class LipsyncPipeline(DiffusionPipeline):
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
+            # Per-frame color match: align generated face stats to original
+            # so the soft-mask boundary in restore_img doesn't reveal a
+            # tone drift. Applied inside the mask region only.
+            if color_match_strength > 0:
+                decoded_latents = self._match_color_to_reference(
+                    decoded_latents, ref_pixel_values, masks, strength=color_match_strength
+                )
+            # Mouth-region unsharp: recover high-frequency detail in the
+            # generated mouth. Inpainter outputs tend to be slightly soft
+            # because the prompt encourages plausible-but-not-sharp.
+            if mouth_sharpen_strength > 0:
+                decoded_latents = self._unsharp_mask(
+                    decoded_latents, masks, amount=mouth_sharpen_strength
+                )
             if i == 0:
                 with torch.no_grad():
                     combined_first = decoded_latents[0].detach().cpu()
@@ -924,9 +1077,11 @@ class LipsyncPipeline(DiffusionPipeline):
             "yaw_skip_count": getattr(self, "_last_yaw_skip_count", 0),
             "yaw_rate_skip_count": getattr(self, "_last_yaw_rate_skip_count", 0),
             "mouth_occlusion_skip_count": getattr(self, "_last_mouth_occlusion_skip_count", 0),
+            "motion_blur_skip_count": getattr(self, "_last_motion_blur_skip_count", 0),
             "yaw_skip_threshold": yaw_skip_threshold,
             "yaw_rate_skip_threshold": yaw_rate_skip_threshold,
             "mouth_occlusion_skip_threshold": mouth_occlusion_skip_threshold,
+            "motion_blur_skip_threshold": motion_blur_skip_threshold,
             "temporal_smoothing_enabled": temporal_smoothing_enabled,
             "quality_gate_enabled": quality_gate_enabled,
         }

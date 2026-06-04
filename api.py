@@ -143,6 +143,9 @@ class LipSyncRequest(BaseModel):
     # a hand, microphone, phone, mask, etc. Score 0..1; threshold 0.7 = "at
     # least 70% likely occluded". Set to 1.0 to disable the check.
     mouth_occlusion_skip_threshold: float = Field(0.7, ge=0.0, le=1.0)
+    # Motion-blur input filter: skip frames whose aligned face is too
+    # smeared to inpaint cleanly. Set to 0 to disable.
+    motion_blur_skip_threshold: float = Field(0.20, ge=0.0, le=10.0)
     left_cheek_width: int = Field(75, ge=1, le=240)
     right_cheek_width: int = Field(75, ge=1, le=240)
     batch_size: int = Field(8, ge=1, le=64)
@@ -889,6 +892,9 @@ class LatentSyncApiRuntime:
                 yaw_skip_threshold=payload.yaw_skip_threshold,
                 yaw_rate_skip_threshold=payload.yaw_rate_skip_threshold,
                 mouth_occlusion_skip_threshold=payload.mouth_occlusion_skip_threshold,
+                motion_blur_skip_threshold=getattr(payload, "motion_blur_skip_threshold", 0.20),
+                color_match_strength=payload.color_match_strength,
+                mouth_sharpen_strength=payload.mouth_sharpen_strength,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")
 
@@ -903,6 +909,7 @@ class LatentSyncApiRuntime:
             yaw_skip_count = int(run_stats.get("yaw_skip_count", 0))
             yaw_rate_skip_count = int(run_stats.get("yaw_rate_skip_count", 0))
             mouth_occlusion_skip_count = int(run_stats.get("mouth_occlusion_skip_count", 0))
+            motion_blur_skip_count = int(run_stats.get("motion_blur_skip_count", 0))
 
             return {
                 "output_path": output_path,
@@ -929,6 +936,7 @@ class LatentSyncApiRuntime:
                 "yaw_skip_count": yaw_skip_count,
                 "yaw_rate_skip_count": yaw_rate_skip_count,
                 "mouth_occlusion_skip_count": mouth_occlusion_skip_count,
+                "motion_blur_skip_count": motion_blur_skip_count,
                 "effective_generated_output_frames": source_frame_count,
                 "skipped_output_frames": 0,
                 "best_similarity": 0.0,
