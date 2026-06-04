@@ -138,10 +138,10 @@ class LipSyncRequest(BaseModel):
     # conservative: difficult frames fall back to the source video instead of
     # showing smeared lips.
     quality_gate_enabled: bool = True
-    quality_min_laplacian: float = Field(0.08, ge=0.0, le=2000.0)
-    quality_min_sharpness_ratio: float = Field(0.12, ge=0.0, le=1.0)
+    quality_min_laplacian: float = Field(0.04, ge=0.0, le=2000.0)
+    quality_min_sharpness_ratio: float = Field(0.05, ge=0.0, le=1.0)
     quality_ref_min_laplacian: float = Field(
-        0.30,
+        1.00,
         ge=0.0,
         le=2000.0,
         description="Only apply generated/reference sharpness-ratio fallback when the source mouth ROI is at least this sharp.",
@@ -155,9 +155,9 @@ class LipSyncRequest(BaseModel):
     # Side-face / fast-turn prefilters. Frames exceeding either threshold fall
     # back to the original (no inpainting), which is the right call for blurry
     # side profiles and motion-blur turns. yaw_rate is in degrees/frame, not
-    # per second (18°/frame at 25fps ≈ 450°/sec).
-    yaw_skip_threshold: float = Field(35.0, ge=0.0, le=90.0)
-    yaw_rate_skip_threshold: float = Field(18.0, ge=0.0, le=45.0)
+    # per second (28°/frame at 25fps ≈ 700°/sec).
+    yaw_skip_threshold: float = Field(45.0, ge=0.0, le=90.0)
+    yaw_rate_skip_threshold: float = Field(28.0, ge=0.0, le=45.0)
     # Episode-level side-face filter: when N consecutive frames exceed
     # yaw_skip_threshold, also skip `pre_pad`/`post_pad` frames of
     # transition zone around the episode (frames whose yaw is between
@@ -169,7 +169,7 @@ class LipSyncRequest(BaseModel):
     side_face_episode_post_pad: int = Field(0, ge=0, le=30)
     # Warn-band ratio: yaws above `yaw_skip_threshold * ratio` but below
     # `yaw_skip_threshold` are treated as transition frames / near-profile
-    # runs. Default 0.75 = warn @ 26.25° for the default 35° threshold.
+    # runs. Default 0.75 = warn @ 33.75° for the default 45° threshold.
     yaw_warn_threshold_ratio: float = Field(0.75, ge=0.0, le=1.0)
     side_face_warn_min_run_frames: int = Field(
         0,
@@ -204,15 +204,15 @@ class LipSyncRequest(BaseModel):
     mouth_occlusion_skip_threshold: float = Field(1.0, ge=0.0, le=1.0)
     # Motion-blur input filter: skip frames whose aligned face is too
     # smeared to inpaint cleanly. Set to 0 to disable.
-    motion_blur_skip_threshold: float = Field(0.15, ge=0.0, le=10.0)
+    motion_blur_skip_threshold: float = Field(0.08, ge=0.0, le=10.0)
     face_jump_center_threshold: float = Field(
-        0.35,
+        0.60,
         ge=0.0,
         le=2.0,
         description="Skip frames whose landmark center jumps by more than this fraction of face size; 0 disables.",
     )
     face_jump_scale_threshold: float = Field(
-        0.45,
+        0.80,
         ge=0.0,
         le=2.0,
         description="Skip frames whose landmark face scale changes abruptly by more than this fraction; 0 disables.",
@@ -235,7 +235,7 @@ class LipSyncRequest(BaseModel):
         le=120.0,
         description="0 disables capping; high-fps videos default to 25fps audio features",
     )
-    speech_gate_enabled: bool = True
+    speech_gate_enabled: bool = False
     speech_gate_relative_db: float = Field(-42.0, ge=-80.0, le=0.0)
     speech_gate_min_rms: float = Field(0.00035, ge=0.0, le=1.0)
     speech_gate_window_seconds: float = Field(0.12, ge=0.02, le=0.5)
@@ -993,9 +993,16 @@ class LatentSyncApiRuntime:
                 yaw_warn_threshold_ratio=payload.yaw_warn_threshold_ratio,
                 side_face_warn_min_run_frames=payload.side_face_warn_min_run_frames,
                 mouth_occlusion_skip_threshold=payload.mouth_occlusion_skip_threshold,
-                motion_blur_skip_threshold=getattr(payload, "motion_blur_skip_threshold", 0.35),
+                motion_blur_skip_threshold=getattr(payload, "motion_blur_skip_threshold", 0.08),
                 face_jump_center_threshold=payload.face_jump_center_threshold,
                 face_jump_scale_threshold=payload.face_jump_scale_threshold,
+                silent_skip_enabled=payload.speech_gate_enabled,
+                silent_rms_threshold=payload.speech_gate_min_rms,
+                silent_min_run_frames=max(
+                    1,
+                    int(round(payload.speech_gate_fill_gap_seconds * float(self.config.data.video_fps))),
+                ),
+                silent_pad_frames=0,
                 color_match_strength=payload.color_match_strength,
                 mouth_detail_strength=payload.mouth_detail_strength,
                 mouth_sharpen_strength=payload.mouth_sharpen_strength,
@@ -1025,7 +1032,12 @@ class LatentSyncApiRuntime:
             effective_generated_frames = int(
                 run_stats.get("effective_generated_frames", source_frame_count)
             )
+            pre_skip_frames = int(run_stats.get("pre_skip_frames", 0))
+            quality_skip_frames = int(run_stats.get("quality_skip_frames", 0))
             effective_skip_frames = int(run_stats.get("effective_skip_frames", 0))
+            silent_skip_frames = int(run_stats.get("silent_skip_frames", 0))
+            skipped_inference_batches = int(run_stats.get("skipped_inference_batches", 0))
+            skipped_inference_frames = int(run_stats.get("skipped_inference_frames", 0))
 
             return {
                 "output_path": output_path,
@@ -1052,6 +1064,8 @@ class LatentSyncApiRuntime:
                 "eligible_source_frames": source_frame_count,
                 "generated_output_frames": source_frame_count,
                 "quality_fallback_frames": quality_fallback_frames,
+                "prefilter_skip_frames": pre_skip_frames,
+                "quality_skip_frames": quality_skip_frames,
                 "yaw_skip_count": yaw_skip_count,
                 "yaw_rate_skip_count": yaw_rate_skip_count,
                 "mouth_occlusion_skip_count": mouth_occlusion_skip_count,
@@ -1059,6 +1073,9 @@ class LatentSyncApiRuntime:
                 "face_jump_skip_count": face_jump_skip_count,
                 "side_face_episode_extra_skip_count": side_face_episode_extra_skip_count,
                 "side_face_warn_run_skip_count": side_face_warn_run_skip_count,
+                "silent_skip_frames": silent_skip_frames,
+                "skipped_inference_batches": skipped_inference_batches,
+                "skipped_inference_frames": skipped_inference_frames,
                 "effective_generated_output_frames": effective_generated_frames,
                 "skipped_output_frames": effective_skip_frames,
                 "best_similarity": 0.0,
@@ -1068,9 +1085,9 @@ class LatentSyncApiRuntime:
                 "target_identity_source": "none",
                 "face_identity_backend": "embedding" if payload.require_face_embedding else "visual",
                 "speech_gate": {
-                    "enabled": False,
-                    "active_frames": source_frame_count,
-                    "silent_frames": 0,
+                    "enabled": payload.speech_gate_enabled,
+                    "active_frames": max(0, source_frame_count - silent_skip_frames),
+                    "silent_frames": silent_skip_frames,
                 },
                 "quality_ok": True,
             }

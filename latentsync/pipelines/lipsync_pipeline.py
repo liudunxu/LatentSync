@@ -805,12 +805,12 @@ class LipsyncPipeline(DiffusionPipeline):
         self,
         video_frames: np.ndarray,
         reference_embedding=None,
-        yaw_skip_threshold: float = 35.0,
-        yaw_rate_skip_threshold: float = 18.0,
+        yaw_skip_threshold: float = 45.0,
+        yaw_rate_skip_threshold: float = 28.0,
         mouth_occlusion_skip_threshold: float = 1.0,
-        motion_blur_skip_threshold: float = 0.15,
-        face_jump_center_threshold: float = 0.35,
-        face_jump_scale_threshold: float = 0.45,
+        motion_blur_skip_threshold: float = 0.08,
+        face_jump_center_threshold: float = 0.60,
+        face_jump_scale_threshold: float = 0.80,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 0,
         side_face_episode_post_pad: int = 0,
@@ -971,7 +971,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 mouth_sharp = self._mouth_sharpness(face)
                 if (
                     face_sharp < motion_blur_skip_threshold
-                    or mouth_sharp < motion_blur_skip_threshold * 0.5
+                    and mouth_sharp < motion_blur_skip_threshold * 0.5
                 ):
                     should_skip = True
                     motion_blur_skip_count += 1
@@ -1108,6 +1108,61 @@ class LipsyncPipeline(DiffusionPipeline):
                 out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 
+    def _silent_frame_mask(
+        self,
+        audio_samples: torch.Tensor,
+        frame_count: int,
+        video_fps: float,
+        audio_sample_rate: int,
+        rms_threshold: float,
+        min_run_frames: int,
+        pad_frames: int,
+    ) -> List[bool]:
+        if frame_count <= 0 or rms_threshold <= 0 or video_fps <= 0:
+            return [False] * max(0, frame_count)
+
+        audio_np = audio_samples.detach().float().cpu().numpy()
+        if audio_np.ndim > 1:
+            audio_np = audio_np.reshape(-1)
+        mask = []
+        for idx in range(frame_count):
+            start = int(idx / video_fps * audio_sample_rate)
+            end = int((idx + 1) / video_fps * audio_sample_rate)
+            frame_audio = audio_np[start:min(end, len(audio_np))]
+            if frame_audio.size == 0:
+                mask.append(True)
+                continue
+            rms = float(np.sqrt(np.mean(np.square(frame_audio), dtype=np.float64)))
+            mask.append(rms < rms_threshold)
+
+        if min_run_frames > 1:
+            filtered = [False] * len(mask)
+            i = 0
+            while i < len(mask):
+                if not mask[i]:
+                    i += 1
+                    continue
+                j = i
+                while j < len(mask) and mask[j]:
+                    j += 1
+                if j - i >= min_run_frames:
+                    left = max(0, i - pad_frames)
+                    right = min(len(mask), j + pad_frames)
+                    for k in range(left, right):
+                        filtered[k] = True
+                i = j
+            mask = filtered
+        elif pad_frames > 0:
+            padded = mask[:]
+            for idx, value in enumerate(mask):
+                if not value:
+                    continue
+                for k in range(max(0, idx - pad_frames), min(len(mask), idx + pad_frames + 1)):
+                    padded[k] = True
+            mask = padded
+
+        return mask
+
     def loop_video(
         self,
         whisper_chunks: list,
@@ -1115,12 +1170,12 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         skip_mask=None,
-        yaw_skip_threshold: float = 35.0,
-        yaw_rate_skip_threshold: float = 18.0,
+        yaw_skip_threshold: float = 45.0,
+        yaw_rate_skip_threshold: float = 28.0,
         mouth_occlusion_skip_threshold: float = 1.0,
-        motion_blur_skip_threshold: float = 0.15,
-        face_jump_center_threshold: float = 0.35,
-        face_jump_scale_threshold: float = 0.45,
+        motion_blur_skip_threshold: float = 0.08,
+        face_jump_center_threshold: float = 0.60,
+        face_jump_scale_threshold: float = 0.80,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 0,
         side_face_episode_post_pad: int = 0,
@@ -1248,14 +1303,14 @@ class LipsyncPipeline(DiffusionPipeline):
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
         quality_gate_enabled: bool = True,
-        quality_min_laplacian: float = 0.08,
-        quality_min_sharpness_ratio: float = 0.12,
-        quality_ref_min_laplacian: float = 0.30,
+        quality_min_laplacian: float = 0.04,
+        quality_min_sharpness_ratio: float = 0.05,
+        quality_ref_min_laplacian: float = 1.00,
         quality_max_fallback_ratio: float = 0.80,
         # Yaw-based prefilters for side faces / fast head turns. Defaults are
         # intentionally permissive so clear frontal faces are not filtered out.
-        yaw_skip_threshold: float = 35.0,
-        yaw_rate_skip_threshold: float = 18.0,
+        yaw_skip_threshold: float = 45.0,
+        yaw_rate_skip_threshold: float = 28.0,
         # Episode-level side-face filter: when contiguous frames exceed
         # yaw_skip_threshold, also skip pre_pad/post_pad transition frames
         # around the episode (whose yaw is in the warn band between
@@ -1272,14 +1327,19 @@ class LipsyncPipeline(DiffusionPipeline):
         # too sensitive on side/profile shots and could eat most frames.
         mouth_occlusion_skip_threshold: float = 1.0,
         # Motion-blur input filter: skip frames whose aligned face is too
-        # smeared to inpaint cleanly. Default 0.15 (Laplacian variance in
+        # smeared to inpaint cleanly. Default 0.08 (Laplacian variance in
         # the [-1, 1] face space; a sharp face scores ~5-20, a motion-blurred
         # one <1.0). Set to 0 to disable.
-        motion_blur_skip_threshold: float = 0.15,
+        motion_blur_skip_threshold: float = 0.08,
         # Face-jump input filter: skip frames where landmark center/scale
         # changes abruptly, which usually means detection/alignment jumped.
-        face_jump_center_threshold: float = 0.35,
-        face_jump_scale_threshold: float = 0.45,
+        face_jump_center_threshold: float = 0.60,
+        face_jump_scale_threshold: float = 0.80,
+        # Audio-energy prefilter: skip sustained silent runs before diffusion.
+        silent_skip_enabled: bool = False,
+        silent_rms_threshold: float = 0.003,
+        silent_min_run_frames: int = 8,
+        silent_pad_frames: int = 0,
         # Per-frame color transfer from generated to original (inside the
         # mask). 0 = off, 1 = full mean+std match. Default 0.60.
         color_match_strength: float = 0.60,
@@ -1355,6 +1415,25 @@ class LipsyncPipeline(DiffusionPipeline):
             yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
             side_face_warn_min_run_frames=side_face_warn_min_run_frames,
         )
+        silent_skip_mask = [False] * len(skip_mask)
+        if silent_skip_enabled:
+            silent_skip_mask = self._silent_frame_mask(
+                audio_samples,
+                frame_count=len(skip_mask),
+                video_fps=float(video_fps),
+                audio_sample_rate=audio_sample_rate,
+                rms_threshold=silent_rms_threshold,
+                min_run_frames=silent_min_run_frames,
+                pad_frames=silent_pad_frames,
+            )
+            silent_skip_count = sum(silent_skip_mask)
+            if silent_skip_count:
+                skip_mask = [a or b for a, b in zip(skip_mask, silent_skip_mask)]
+                continuity_break_mask = [a or b for a, b in zip(continuity_break_mask, silent_skip_mask)]
+            logger.info(
+                f"[LipSync] silent_skip={silent_skip_count}/{len(silent_skip_mask)} "
+                f"(threshold={silent_rms_threshold}, min_run={silent_min_run_frames}, pad={silent_pad_frames})"
+            )
         logger.info(
             f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, "
             f"affine_matrices={len(affine_matrices)}, apply_identity_filter={apply_identity_filter}, "
@@ -1387,17 +1466,32 @@ class LipsyncPipeline(DiffusionPipeline):
 
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
         logger.info(f"[LipSync] num_inferences={num_inferences}, num_frames={num_frames}, add_audio_layer={self.unet.add_audio_layer}")
+        skipped_inference_batches = 0
+        skipped_inference_frames = 0
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+            batch_start = i * num_frames
+            batch_end = min((i + 1) * num_frames, len(whisper_chunks))
+            inference_skip_mask = skip_mask[batch_start:batch_end]
+            inference_continuity_break_mask = continuity_break_mask[batch_start:batch_end]
+            inference_faces = faces[batch_start:batch_end]
+            if inference_skip_mask and all(inference_skip_mask):
+                skipped_inference_batches += 1
+                skipped_inference_frames += len(inference_skip_mask)
+                prev_face = None
+                prev_valid = False
+                prev_mouth_stabilized = None
+                prev_mouth_stabilized_valid = False
+                synced_video_frames.append(inference_faces.to(device=device, dtype=weight_dtype))
+                continue
             if self.unet.add_audio_layer:
-                audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
+                audio_embeds = torch.stack(whisper_chunks[batch_start:batch_end])
                 audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
                 if do_classifier_free_guidance:
                     null_audio_embeds = torch.zeros_like(audio_embeds)
                     audio_embeds = torch.cat([null_audio_embeds, audio_embeds])
             else:
                 audio_embeds = None
-            inference_faces = faces[i * num_frames : (i + 1) * num_frames]
-            latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames]
+            latents = all_latents[:, :, batch_start:batch_end]
             ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
                 inference_faces, affine_transform=False
             )
@@ -1521,8 +1615,6 @@ class LipsyncPipeline(DiffusionPipeline):
             # EMA can't smear previous frames' content into the original-face
             # area (root cause of "previous frame's different face glued in"
             # artifacts with the wider inpaint mask).
-            inference_skip_mask = skip_mask[i * num_frames : (i + 1) * num_frames]
-            inference_continuity_break_mask = continuity_break_mask[i * num_frames : (i + 1) * num_frames]
             if temporal_smoothing_enabled:
                 current_mouth_motion = decoded_latents
                 decoded_latents, prev_face, prev_valid = self._smooth_face_sequence(
@@ -1631,7 +1723,9 @@ class LipsyncPipeline(DiffusionPipeline):
         effective_generated = len(effective_skip_mask) - effective_skip
         logger.info(
             f"[Diag] skip summary: pre(loop_video)={pre_skip} quality_postfilter={quality_skip} "
-            f"effective_total={effective_skip} generated={effective_generated} / {len(skip_mask)}"
+            f"effective_total={effective_skip} generated={effective_generated} / {len(skip_mask)} "
+            f"inference_short_circuit_batches={skipped_inference_batches} "
+            f"inference_short_circuit_frames={skipped_inference_frames}"
         )
         if quality_fallback_count:
             logger.info(f"[LipSync] quality_fallback_frames={quality_fallback_count} / {len(skip_mask)}")
@@ -1657,6 +1751,13 @@ class LipsyncPipeline(DiffusionPipeline):
             "quality_skip_frames": quality_skip,
             "effective_skip_frames": effective_skip,
             "effective_generated_frames": effective_generated,
+            "silent_skip_frames": sum(silent_skip_mask),
+            "silent_skip_enabled": silent_skip_enabled,
+            "silent_rms_threshold": silent_rms_threshold,
+            "silent_min_run_frames": silent_min_run_frames,
+            "silent_pad_frames": silent_pad_frames,
+            "skipped_inference_batches": skipped_inference_batches,
+            "skipped_inference_frames": skipped_inference_frames,
             "yaw_skip_count": getattr(self, "_last_yaw_skip_count", 0),
             "yaw_rate_skip_count": getattr(self, "_last_yaw_rate_skip_count", 0),
             "mouth_occlusion_skip_count": getattr(self, "_last_mouth_occlusion_skip_count", 0),
