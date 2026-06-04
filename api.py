@@ -130,7 +130,13 @@ class LipSyncRequest(BaseModel):
     # showing smeared lips.
     quality_gate_enabled: bool = True
     quality_min_laplacian: float = Field(0.08, ge=0.0, le=2000.0)
-    quality_min_sharpness_ratio: float = Field(0.05, ge=0.0, le=1.0)
+    quality_min_sharpness_ratio: float = Field(0.12, ge=0.0, le=1.0)
+    quality_ref_min_laplacian: float = Field(
+        0.30,
+        ge=0.0,
+        le=2000.0,
+        description="Only apply generated/reference sharpness-ratio fallback when the source mouth ROI is at least this sharp.",
+    )
     quality_max_fallback_ratio: float = Field(
         0.45,
         ge=0.0,
@@ -957,6 +963,7 @@ class LatentSyncApiRuntime:
                 quality_gate_enabled=payload.quality_gate_enabled,
                 quality_min_laplacian=payload.quality_min_laplacian,
                 quality_min_sharpness_ratio=payload.quality_min_sharpness_ratio,
+                quality_ref_min_laplacian=payload.quality_ref_min_laplacian,
                 quality_max_fallback_ratio=payload.quality_max_fallback_ratio,
                 yaw_skip_threshold=payload.yaw_skip_threshold,
                 yaw_rate_skip_threshold=payload.yaw_rate_skip_threshold,

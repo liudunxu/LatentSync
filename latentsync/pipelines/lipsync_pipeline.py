@@ -1063,7 +1063,8 @@ class LipsyncPipeline(DiffusionPipeline):
         # recovery, and conservative enough to keep closed/low-texture mouths.
         quality_gate_enabled: bool = True,
         quality_min_laplacian: float = 0.08,
-        quality_min_sharpness_ratio: float = 0.05,
+        quality_min_sharpness_ratio: float = 0.12,
+        quality_ref_min_laplacian: float = 0.30,
         quality_max_fallback_ratio: float = 0.45,
         # Yaw-based prefilters for side faces / fast head turns. Defaults now
         # prefer filtering side/profile cases over trying to synthesize them.
@@ -1387,11 +1388,11 @@ class LipsyncPipeline(DiffusionPipeline):
                             f"[Diag] mouth postfilter fallback batch{i} k{k}: gen_lap={gen_lap:.2f} < {quality_min_laplacian * 0.25:.2f}"
                         )
                         continue
-                    if gen_lap < quality_min_laplacian and ref_lap > 0 and ratio < quality_min_sharpness_ratio:
+                    if ref_lap >= quality_ref_min_laplacian and ratio < quality_min_sharpness_ratio:
                         quality_skip_mask[base + k] = True
                         quality_fallback_count += 1
                         logger.info(
-                            f"[Diag] mouth postfilter fallback batch{i} k{k}: gen_lap={gen_lap:.2f} / ref_lap={ref_lap:.2f} = {ratio:.3f} < {quality_min_sharpness_ratio}"
+                            f"[Diag] mouth postfilter fallback batch{i} k{k}: gen_lap={gen_lap:.2f} / ref_lap={ref_lap:.2f} = {ratio:.3f} < {quality_min_sharpness_ratio} (ref_lap >= {quality_ref_min_laplacian})"
                         )
                 if i == 0 and gen_laps:
                     import statistics
@@ -1470,6 +1471,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "mouth_motion_preserve_strength": mouth_motion_preserve_strength,
             "mouth_temporal_stabilization_strength": mouth_temporal_stabilization_strength,
             "quality_gate_enabled": quality_gate_enabled,
+            "quality_ref_min_laplacian": quality_ref_min_laplacian,
             "quality_max_fallback_ratio": quality_max_fallback_ratio,
             "color_match_strength": color_match_strength,
             "mouth_detail_strength": mouth_detail_strength,
