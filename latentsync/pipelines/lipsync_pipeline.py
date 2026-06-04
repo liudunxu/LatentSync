@@ -547,7 +547,7 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         yaw_skip_threshold: float = 20.0,
         yaw_rate_skip_threshold: float = 8.0,
-        mouth_occlusion_skip_threshold: float = 0.7,
+        mouth_occlusion_skip_threshold: float = 0.85,
         motion_blur_skip_threshold: float = 0.20,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 4,
@@ -739,7 +739,7 @@ class LipsyncPipeline(DiffusionPipeline):
         skip_mask=None,
         yaw_skip_threshold: float = 20.0,
         yaw_rate_skip_threshold: float = 8.0,
-        mouth_occlusion_skip_threshold: float = 0.7,
+        mouth_occlusion_skip_threshold: float = 0.85,
         motion_blur_skip_threshold: float = 0.20,
         apply_identity_filter: bool = True,
     ):
@@ -857,9 +857,10 @@ class LipsyncPipeline(DiffusionPipeline):
         yaw_warn_threshold_ratio: float = 0.5,
         # Mouth-occlusion prefilter: skip frames where the mouth is covered
         # by a hand, microphone, phone, mask, etc. Score 0..1; above the
-        # threshold (default 0.7) the frame is treated as not-lip-syncable
-        # and the original frame is used.
-        mouth_occlusion_skip_threshold: float = 0.7,
+        # threshold (default 0.85 -- was 0.7, too sensitive on multi-speaker
+        # / side-face clips) the frame is treated as not-lip-syncable and
+        # the original frame is used. Set to 1.0 to disable.
+        mouth_occlusion_skip_threshold: float = 0.85,
         # Motion-blur input filter: skip frames whose aligned face is too
         # smeared to inpaint cleanly. Default 0.20 (Laplacian variance in
         # the [-1, 1] face space; a sharp face scores ~5-20, a motion-blurred

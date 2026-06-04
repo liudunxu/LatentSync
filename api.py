@@ -178,9 +178,11 @@ class LipSyncRequest(BaseModel):
         None, description="Hint for DeepCache enable. None = use server default. Honored only at server startup."
     )
     # Mouth-occlusion prefilter: skip frames where the mouth is covered by
-    # a hand, microphone, phone, mask, etc. Score 0..1; threshold 0.7 = "at
-    # least 70% likely occluded". Set to 1.0 to disable the check.
-    mouth_occlusion_skip_threshold: float = Field(0.7, ge=0.0, le=1.0)
+    # a hand, microphone, phone, mask, etc. Score 0..1; threshold 0.85 =
+    # "at least 85% likely occluded". Was 0.7 -- too sensitive on multi-
+    # speaker / side-face clips where it flagged 65%+ of frames and zeroed
+    # out the output. Set to 1.0 to disable the check.
+    mouth_occlusion_skip_threshold: float = Field(0.85, ge=0.0, le=1.0)
     # Motion-blur input filter: skip frames whose aligned face is too
     # smeared to inpaint cleanly. Set to 0 to disable.
     motion_blur_skip_threshold: float = Field(0.20, ge=0.0, le=10.0)
