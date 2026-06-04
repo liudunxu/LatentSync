@@ -123,11 +123,15 @@ class LipSyncRequest(BaseModel):
     color_match_strength: float = Field(0.60, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.35, ge=0.0, le=1.0)
-    # Postfilter was over-aggressive in practice (silently fell back to the
-    # original video when the laplacian function returned 0 due to fp16
-    # underflow). Default OFF; clients that want it can set true in the request.
-    quality_gate_enabled: bool = False
-    quality_min_laplacian: float = Field(1.0, ge=0.0, le=2000.0)
+    # Postfilter catches generated frames that look blurry at the mouth --
+    # the inpainter occasionally produces a soft, smeared block instead of
+    # a clean lip. The earlier fp16 underflow that caused the postfilter to
+    # silently kill every frame has been fixed (cast to fp32 in
+    # _face_sharpness); default ON with conservative thresholds. Set to
+    # false in the request if you want every frame to come from the model
+    # even if it's blurry.
+    quality_gate_enabled: bool = True
+    quality_min_laplacian: float = Field(0.5, ge=0.0, le=2000.0)
     quality_min_sharpness_ratio: float = Field(0.20, ge=0.0, le=1.0)
     # Side-face / fast-turn prefilters. Frames exceeding either threshold fall
     # back to the original (no inpainting), which is the right call for blurry
@@ -135,6 +139,10 @@ class LipSyncRequest(BaseModel):
     # per second (8°/frame at 25fps ≈ 200°/sec).
     yaw_skip_threshold: float = Field(20.0, ge=0.0, le=90.0)
     yaw_rate_skip_threshold: float = Field(8.0, ge=0.0, le=45.0)
+    # Mouth-occlusion prefilter: skip frames where the mouth is covered by
+    # a hand, microphone, phone, mask, etc. Score 0..1; threshold 0.7 = "at
+    # least 70% likely occluded". Set to 1.0 to disable the check.
+    mouth_occlusion_skip_threshold: float = Field(0.7, ge=0.0, le=1.0)
     left_cheek_width: int = Field(75, ge=1, le=240)
     right_cheek_width: int = Field(75, ge=1, le=240)
     batch_size: int = Field(8, ge=1, le=64)
@@ -880,6 +888,7 @@ class LatentSyncApiRuntime:
                 quality_min_sharpness_ratio=payload.quality_min_sharpness_ratio,
                 yaw_skip_threshold=payload.yaw_skip_threshold,
                 yaw_rate_skip_threshold=payload.yaw_rate_skip_threshold,
+                mouth_occlusion_skip_threshold=payload.mouth_occlusion_skip_threshold,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")
 
@@ -893,6 +902,7 @@ class LatentSyncApiRuntime:
             quality_fallback_frames = int(run_stats.get("quality_fallback_frames", 0))
             yaw_skip_count = int(run_stats.get("yaw_skip_count", 0))
             yaw_rate_skip_count = int(run_stats.get("yaw_rate_skip_count", 0))
+            mouth_occlusion_skip_count = int(run_stats.get("mouth_occlusion_skip_count", 0))
 
             return {
                 "output_path": output_path,
@@ -918,6 +928,7 @@ class LatentSyncApiRuntime:
                 "quality_fallback_frames": quality_fallback_frames,
                 "yaw_skip_count": yaw_skip_count,
                 "yaw_rate_skip_count": yaw_rate_skip_count,
+                "mouth_occlusion_skip_count": mouth_occlusion_skip_count,
                 "effective_generated_output_frames": source_frame_count,
                 "skipped_output_frames": 0,
                 "best_similarity": 0.0,
