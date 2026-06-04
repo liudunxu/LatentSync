@@ -123,6 +123,7 @@ class LipSyncRequest(BaseModel):
     color_match_strength: float = Field(0.60, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.35, ge=0.0, le=1.0)
+    mouth_temporal_stabilization_strength: float = Field(0.18, ge=0.0, le=0.6)
     # Postfilter catches generated frames where the mouth ROI is clearly
     # blurry or much softer than the original mouth ROI. This is intentionally
     # conservative: difficult frames fall back to the source video instead of
@@ -968,6 +969,7 @@ class LatentSyncApiRuntime:
                 color_match_strength=payload.color_match_strength,
                 mouth_detail_strength=payload.mouth_detail_strength,
                 mouth_sharpen_strength=payload.mouth_sharpen_strength,
+                mouth_temporal_stabilization_strength=payload.mouth_temporal_stabilization_strength,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")
 

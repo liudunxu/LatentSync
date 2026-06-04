@@ -1055,6 +1055,9 @@ class LipsyncPipeline(DiffusionPipeline):
         # Preserve current-frame mouth-core motion after temporal smoothing.
         # 0 = fully smoothed mouth, 1 = keep generated current-frame mouth.
         mouth_motion_preserve_strength: float = 0.45,
+        # Lightly stabilize mouth-core color/detail between consecutive valid
+        # generated frames to reduce flicker without freezing lip motion.
+        mouth_temporal_stabilization_strength: float = 0.18,
         # Postfilter: skip frames where the generated mouth ROI is clearly
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
@@ -1164,6 +1167,8 @@ class LipsyncPipeline(DiffusionPipeline):
         # State carried across batches for temporal EMA smoothing
         prev_face: Optional[torch.Tensor] = None
         prev_valid: bool = False
+        prev_mouth_stabilized: Optional[torch.Tensor] = None
+        prev_mouth_stabilized_valid: bool = False
         quality_fallback_count: int = 0
         quality_skip_mask: List[bool] = [False] * len(skip_mask)
 
@@ -1334,6 +1339,31 @@ class LipsyncPipeline(DiffusionPipeline):
                         * mouth_motion_preserve_strength
                         * (current_mouth_motion - decoded_latents)
                     )
+            if mouth_temporal_stabilization_strength > 0:
+                mouth_stabilize_mask = self._mouth_core_mask(generated_region_mask).to(
+                    device=decoded_latents.device,
+                    dtype=decoded_latents.dtype,
+                )
+                if mouth_stabilize_mask.dim() == 4 and mouth_stabilize_mask.shape[1] == 1:
+                    mouth_stabilize_mask = mouth_stabilize_mask.expand(-1, 3, -1, -1)
+                for k in range(decoded_latents.shape[0]):
+                    if inference_skip_mask[k]:
+                        prev_mouth_stabilized = None
+                        prev_mouth_stabilized_valid = False
+                        continue
+                    current_frame = decoded_latents[k]
+                    if prev_mouth_stabilized_valid and prev_mouth_stabilized is not None:
+                        stabilized = (
+                            current_frame
+                            + mouth_stabilize_mask[k]
+                            * mouth_temporal_stabilization_strength
+                            * (prev_mouth_stabilized.to(current_frame.device) - current_frame)
+                        )
+                        decoded_latents[k] = stabilized
+                        prev_mouth_stabilized = stabilized.detach()
+                    else:
+                        prev_mouth_stabilized = current_frame.detach()
+                    prev_mouth_stabilized_valid = True
 
             # Quality postfilter: flag frames whose generated mouth ROI is too
             # blurry to be worth showing. Checked AFTER paste/detail recovery.
@@ -1438,6 +1468,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "motion_blur_skip_threshold": motion_blur_skip_threshold,
             "temporal_smoothing_enabled": temporal_smoothing_enabled,
             "mouth_motion_preserve_strength": mouth_motion_preserve_strength,
+            "mouth_temporal_stabilization_strength": mouth_temporal_stabilization_strength,
             "quality_gate_enabled": quality_gate_enabled,
             "quality_max_fallback_ratio": quality_max_fallback_ratio,
             "color_match_strength": color_match_strength,
