@@ -141,7 +141,7 @@ class LipSyncRequest(BaseModel):
     # back to the original (no inpainting), which is the right call for blurry
     # side profiles and motion-blur turns. yaw_rate is in degrees/frame, not
     # per second (10°/frame at 25fps ≈ 250°/sec).
-    yaw_skip_threshold: float = Field(18.0, ge=0.0, le=90.0)
+    yaw_skip_threshold: float = Field(34.0, ge=0.0, le=90.0)
     yaw_rate_skip_threshold: float = Field(10.0, ge=0.0, le=45.0)
     # Episode-level side-face filter: when N consecutive frames exceed
     # yaw_skip_threshold, also skip `pre_pad`/`post_pad` frames of
@@ -154,10 +154,10 @@ class LipSyncRequest(BaseModel):
     side_face_episode_post_pad: int = Field(4, ge=0, le=30)
     # Warn-band ratio: yaws above `yaw_skip_threshold * ratio` but below
     # `yaw_skip_threshold` are treated as transition frames / near-profile
-    # runs. Default 0.70 = warn @ 12.6° for the default 18° threshold.
-    yaw_warn_threshold_ratio: float = Field(0.70, ge=0.0, le=1.0)
+    # runs. Default 0.75 = warn @ 25.5° for the default 34° threshold.
+    yaw_warn_threshold_ratio: float = Field(0.75, ge=0.0, le=1.0)
     side_face_warn_min_run_frames: int = Field(
-        2,
+        0,
         ge=0,
         le=120,
         description="Skip sustained near-profile runs above the yaw warn threshold; 0 disables.",
