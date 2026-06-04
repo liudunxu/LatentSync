@@ -550,6 +550,9 @@ class LipsyncPipeline(DiffusionPipeline):
         mouth_occlusion_skip_threshold: float = 0.7,
         motion_blur_skip_threshold: float = 0.20,
         apply_identity_filter: bool = True,
+        side_face_episode_pre_pad: int = 4,
+        side_face_episode_post_pad: int = 4,
+        yaw_warn_threshold_ratio: float = 0.5,
     ):
         logger.info(
             f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
@@ -563,6 +566,13 @@ class LipsyncPipeline(DiffusionPipeline):
         boxes = []
         affine_matrices = []
         skip_mask = []
+        # Parallel arrays used by the episode-level side-face filter below:
+        #   yaws[k] is the per-frame yaw in degrees (None for detect-fail frames)
+        #   yaw_skip_reasons[k] is True iff THIS frame was skipped for yaw alone
+        #     (not for identity / occlusion / blur / detect-fail -- those don't
+        #     represent a "side face" and shouldn't trigger the episode pad).
+        yaws: List[Optional[float]] = []
+        yaw_skip_reasons: List[bool] = []
         yaw_skip_count = 0
         yaw_rate_skip_count = 0
         mouth_occlusion_skip_count = 0
@@ -579,6 +589,8 @@ class LipsyncPipeline(DiffusionPipeline):
                 faces.append(torch.zeros(3, self.image_processor.resolution, self.image_processor.resolution))
                 boxes.append([0, 0, 0, 0])
                 affine_matrices.append(np.eye(3))
+                yaws.append(None)
+                yaw_skip_reasons.append(False)
                 prev_yaw = None  # reset so we don't carry a stale yaw across a detect-fail gap
                 continue
             should_skip = False
@@ -588,10 +600,12 @@ class LipsyncPipeline(DiffusionPipeline):
                     should_skip = True
                     identity_skip_count += 1
             yaw_deg = 0.0
+            yaw_was_skipped = False  # tracks the absolute yaw threshold (not yaw_rate)
             if yaw_skip_threshold > 0 and lmk is not None:
                 yaw_deg = self._estimate_yaw_degrees(lmk)
                 if abs(yaw_deg) > yaw_skip_threshold:
                     should_skip = True
+                    yaw_was_skipped = True
                     yaw_skip_count += 1
             # Yaw-rate (deg/frame) catches the mid-turn frames where the face
             # hasn't crossed the absolute threshold yet but is rotating fast
@@ -627,6 +641,8 @@ class LipsyncPipeline(DiffusionPipeline):
                     should_skip = True
                     motion_blur_skip_count += 1
             skip_mask.append(should_skip)
+            yaws.append(yaw_deg if (yaw_skip_threshold > 0 and lmk is not None) else None)
+            yaw_skip_reasons.append(yaw_was_skipped)
             faces.append(face)
             boxes.append(box)
             affine_matrices.append(affine_matrix)
@@ -641,6 +657,57 @@ class LipsyncPipeline(DiffusionPipeline):
         self._last_yaw_rate_skip_count = yaw_rate_skip_count
         self._last_mouth_occlusion_skip_count = mouth_occlusion_skip_count
         self._last_motion_blur_skip_count = motion_blur_skip_count
+
+        # Episode-level side-face filter: a contiguous run of yaw-skipped
+        # frames represents a single turning motion. The frames immediately
+        # before/after the run typically have yaw in the warn band (e.g.
+        # 10-20° for the default 20° threshold) where affine alignment is
+        # still unreliable; we extend the skip_mask to include those
+        # transition frames so the whole turn becomes a single side-face
+        # episode (instead of a fragmentary skip that lets blur sneak in
+        # at the boundaries).
+        yaw_warn_threshold = yaw_skip_threshold * yaw_warn_threshold_ratio
+        side_face_episode_extra_skip_count = 0
+        if yaw_warn_threshold > 0 and (
+            side_face_episode_pre_pad > 0 or side_face_episode_post_pad > 0
+        ):
+            n = len(skip_mask)
+            i = 0
+            while i < n:
+                if not yaw_skip_reasons[i]:
+                    i += 1
+                    continue
+                # find run end (contiguous yaw-skipped frames)
+                j = i
+                while j < n and yaw_skip_reasons[j]:
+                    j += 1
+                # expand left into pre_pad window
+                for k in range(max(0, i - side_face_episode_pre_pad), i):
+                    if (
+                        not skip_mask[k]
+                        and yaws[k] is not None
+                        and abs(yaws[k]) > yaw_warn_threshold
+                    ):
+                        skip_mask[k] = True
+                        side_face_episode_extra_skip_count += 1
+                # expand right into post_pad window
+                for k in range(j, min(n, j + side_face_episode_post_pad)):
+                    if (
+                        not skip_mask[k]
+                        and yaws[k] is not None
+                        and abs(yaws[k]) > yaw_warn_threshold
+                    ):
+                        skip_mask[k] = True
+                        side_face_episode_extra_skip_count += 1
+                i = j
+        self._last_side_face_episode_extra_skip_count = side_face_episode_extra_skip_count
+        if side_face_episode_extra_skip_count:
+            logger.info(
+                f"[FaceMatch] side_face_episode_extra_skip={side_face_episode_extra_skip_count} "
+                f"(pre_pad={side_face_episode_pre_pad}, post_pad={side_face_episode_post_pad}, "
+                f"warn_threshold={yaw_warn_threshold:.1f}°)"
+            )
+
         faces_tensor = torch.stack(faces)
         return faces_tensor, boxes, affine_matrices, skip_mask
 
@@ -766,7 +833,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # inpainter produces a smeared mouth. See _face_sharpness for
         # why we cast to fp32 (avoids the underflow that used to make
         # this misfire on every frame).
-        quality_gate_enabled: bool = True,
+        quality_gate_enabled: bool = False,
         # Default 0.5 because aligned 512x512 faces in [-1, 1] typically
         # score 0.5..20.0 on a real mouth; a normal mouth is well above
         # this; a smeared/blurred mouth sits below. The previous 15.0
@@ -780,6 +847,14 @@ class LipsyncPipeline(DiffusionPipeline):
         # can't keep up. Both fall back to the original frame in restore_video.
         yaw_skip_threshold: float = 20.0,
         yaw_rate_skip_threshold: float = 8.0,
+        # Episode-level side-face filter: when contiguous frames exceed
+        # yaw_skip_threshold, also skip pre_pad/post_pad transition frames
+        # around the episode (whose yaw is in the warn band between
+        # yaw_skip_threshold * yaw_warn_threshold_ratio and yaw_skip_threshold).
+        # Set pre_pad/post_pad to 0 to disable the padding.
+        side_face_episode_pre_pad: int = 4,
+        side_face_episode_post_pad: int = 4,
+        yaw_warn_threshold_ratio: float = 0.5,
         # Mouth-occlusion prefilter: skip frames where the mouth is covered
         # by a hand, microphone, phone, mask, etc. Score 0..1; above the
         # threshold (default 0.7) the frame is treated as not-lip-syncable
@@ -1078,6 +1153,9 @@ class LipsyncPipeline(DiffusionPipeline):
             "yaw_rate_skip_count": getattr(self, "_last_yaw_rate_skip_count", 0),
             "mouth_occlusion_skip_count": getattr(self, "_last_mouth_occlusion_skip_count", 0),
             "motion_blur_skip_count": getattr(self, "_last_motion_blur_skip_count", 0),
+            "side_face_episode_extra_skip_count": getattr(
+                self, "_last_side_face_episode_extra_skip_count", 0
+            ),
             "yaw_skip_threshold": yaw_skip_threshold,
             "yaw_rate_skip_threshold": yaw_rate_skip_threshold,
             "mouth_occlusion_skip_threshold": mouth_occlusion_skip_threshold,

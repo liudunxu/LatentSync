@@ -130,7 +130,12 @@ class LipSyncRequest(BaseModel):
     # _face_sharpness); default ON with conservative thresholds. Set to
     # false in the request if you want every frame to come from the model
     # even if it's blurry.
-    quality_gate_enabled: bool = True
+    # Default OFF: the postfilter's gen_lap returns 0.00 on every frame
+    # (root cause TBD: likely fp16/conv silent failure on the post-paste
+    # face tensor), which made it flag 100% of frames and fall back to
+    # the original video. Re-enable per request once the underlying
+    # _face_sharpness path is fixed.
+    quality_gate_enabled: bool = False
     quality_min_laplacian: float = Field(0.5, ge=0.0, le=2000.0)
     quality_min_sharpness_ratio: float = Field(0.20, ge=0.0, le=1.0)
     # Side-face / fast-turn prefilters. Frames exceeding either threshold fall
@@ -139,6 +144,19 @@ class LipSyncRequest(BaseModel):
     # per second (8°/frame at 25fps ≈ 200°/sec).
     yaw_skip_threshold: float = Field(20.0, ge=0.0, le=90.0)
     yaw_rate_skip_threshold: float = Field(8.0, ge=0.0, le=45.0)
+    # Episode-level side-face filter: when N consecutive frames exceed
+    # yaw_skip_threshold, also skip `pre_pad`/`post_pad` frames of
+    # transition zone around the episode (frames whose yaw is between
+    # yaw_warn_threshold and yaw_skip_threshold -- the face is clearly
+    # turning and the affine alignment is unreliable there). Set
+    # pre_pad/post_pad to 0 to disable the padding and only do the
+    # per-frame yaw skip.
+    side_face_episode_pre_pad: int = Field(4, ge=0, le=30)
+    side_face_episode_post_pad: int = Field(4, ge=0, le=30)
+    # Warn-band ratio: yaws above `yaw_skip_threshold * ratio` but below
+    # `yaw_skip_threshold` are treated as transition frames. Default 0.5
+    # = warn @ 10° for the default 20° yaw_skip_threshold.
+    yaw_warn_threshold_ratio: float = Field(0.5, ge=0.0, le=1.0)
     # Mouth-occlusion prefilter: skip frames where the mouth is covered by
     # a hand, microphone, phone, mask, etc. Score 0..1; threshold 0.7 = "at
     # least 70% likely occluded". Set to 1.0 to disable the check.
@@ -891,6 +909,9 @@ class LatentSyncApiRuntime:
                 quality_min_sharpness_ratio=payload.quality_min_sharpness_ratio,
                 yaw_skip_threshold=payload.yaw_skip_threshold,
                 yaw_rate_skip_threshold=payload.yaw_rate_skip_threshold,
+                side_face_episode_pre_pad=payload.side_face_episode_pre_pad,
+                side_face_episode_post_pad=payload.side_face_episode_post_pad,
+                yaw_warn_threshold_ratio=payload.yaw_warn_threshold_ratio,
                 mouth_occlusion_skip_threshold=payload.mouth_occlusion_skip_threshold,
                 motion_blur_skip_threshold=getattr(payload, "motion_blur_skip_threshold", 0.20),
                 color_match_strength=payload.color_match_strength,
@@ -910,6 +931,9 @@ class LatentSyncApiRuntime:
             yaw_rate_skip_count = int(run_stats.get("yaw_rate_skip_count", 0))
             mouth_occlusion_skip_count = int(run_stats.get("mouth_occlusion_skip_count", 0))
             motion_blur_skip_count = int(run_stats.get("motion_blur_skip_count", 0))
+            side_face_episode_extra_skip_count = int(
+                run_stats.get("side_face_episode_extra_skip_count", 0)
+            )
 
             return {
                 "output_path": output_path,
@@ -937,6 +961,7 @@ class LatentSyncApiRuntime:
                 "yaw_rate_skip_count": yaw_rate_skip_count,
                 "mouth_occlusion_skip_count": mouth_occlusion_skip_count,
                 "motion_blur_skip_count": motion_blur_skip_count,
+                "side_face_episode_extra_skip_count": side_face_episode_extra_skip_count,
                 "effective_generated_output_frames": source_frame_count,
                 "skipped_output_frames": 0,
                 "best_similarity": 0.0,
