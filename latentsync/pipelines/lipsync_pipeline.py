@@ -615,6 +615,37 @@ class LipsyncPipeline(DiffusionPipeline):
             return 0.0
 
     @staticmethod
+    def _mouth_roi(face: torch.Tensor) -> Optional[torch.Tensor]:
+        """Crop the aligned-face mouth band. Supports (3,H,W) or (B,3,H,W)."""
+        if face is None or face.numel() == 0:
+            return None
+        try:
+            if face.dim() == 3:
+                H, W = face.shape[1], face.shape[2]
+                y0, y1 = int(H * 0.55), int(H * 0.74)
+                x0, x1 = int(W * 0.30), int(W * 0.70)
+                return face[:, y0:y1, x0:x1]
+            if face.dim() == 4:
+                H, W = face.shape[2], face.shape[3]
+                y0, y1 = int(H * 0.55), int(H * 0.74)
+                x0, x1 = int(W * 0.30), int(W * 0.70)
+                return face[:, :, y0:y1, x0:x1]
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _mouth_sharpness(face: torch.Tensor) -> float:
+        """Laplacian variance on the aligned mouth ROI."""
+        roi = LipsyncPipeline._mouth_roi(face)
+        if roi is None or roi.numel() == 0:
+            return 0.0
+        if roi.dim() == 4:
+            scores = [LipsyncPipeline._face_sharpness(roi[k]) for k in range(roi.shape[0])]
+            return float(np.mean(scores)) if scores else 0.0
+        return LipsyncPipeline._face_sharpness(roi)
+
+    @staticmethod
     def _smooth_face_sequence(
         face_crops: torch.Tensor,
         prev_face: Optional[torch.Tensor],
@@ -790,7 +821,8 @@ class LipsyncPipeline(DiffusionPipeline):
             # scores ~5-20, a motion-blurred one scores well below 1.0.
             if not should_skip and motion_blur_skip_threshold > 0:
                 face_sharp = self._face_sharpness(face)
-                if face_sharp < motion_blur_skip_threshold:
+                mouth_sharp = self._mouth_sharpness(face)
+                if face_sharp < motion_blur_skip_threshold and mouth_sharp < motion_blur_skip_threshold:
                     should_skip = True
                     motion_blur_skip_count += 1
             skip_mask.append(should_skip)
@@ -989,19 +1021,12 @@ class LipsyncPipeline(DiffusionPipeline):
         face_embedder=None,
         # --- quality / temporal gating (added 2026-06) ---
         temporal_smoothing_enabled: bool = True,
-        # Postfilter: skip frames where the generated face is unsharp
-        # (Laplacian variance below threshold) or much softer than the
-        # original. Catches the "blurry block" failure mode where the
-        # inpainter produces a smeared mouth. See _face_sharpness for
-        # why we cast to fp32 (avoids the underflow that used to make
-        # this misfire on every frame).
-        quality_gate_enabled: bool = False,
-        # Default 0.5 because aligned 512x512 faces in [-1, 1] typically
-        # score 0.5..20.0 on a real mouth; a normal mouth is well above
-        # this; a smeared/blurred mouth sits below. The previous 15.0
-        # default was tuned for a different scale and skipped everything.
-        quality_min_laplacian: float = 0.5,
-        quality_min_sharpness_ratio: float = 0.20,
+        # Postfilter: skip frames where the generated mouth ROI is clearly
+        # blurrier than the original mouth ROI. Checked after paste/detail
+        # recovery, and conservative enough to keep closed/low-texture mouths.
+        quality_gate_enabled: bool = True,
+        quality_min_laplacian: float = 0.25,
+        quality_min_sharpness_ratio: float = 0.12,
         # Yaw-based prefilters for side faces / fast head turns. Defaults are
         # conservative enough to avoid wiping most frames on profile-heavy
         # clips, while still falling back on clearly side-on / fast-turn frames.
@@ -1261,8 +1286,8 @@ class LipsyncPipeline(DiffusionPipeline):
                     inference_skip_mask=inference_skip_mask,
                 )
 
-            # Quality postfilter: flag frames whose generated face is too blurry
-            # to be worth showing. Checked AFTER paste so the value domain is [-1, 1].
+            # Quality postfilter: flag frames whose generated mouth ROI is too
+            # blurry to be worth showing. Checked AFTER paste/detail recovery.
             if quality_gate_enabled:
                 B = decoded_latents.shape[0]
                 base = i * num_frames
@@ -1271,27 +1296,28 @@ class LipsyncPipeline(DiffusionPipeline):
                 for k in range(B):
                     if inference_skip_mask[k]:
                         continue  # already going to fall back to original
-                    gen_lap = self._face_sharpness(decoded_latents[k])
-                    ref_lap = self._face_sharpness(ref_pixel_values[k])
+                    gen_lap = self._mouth_sharpness(decoded_latents[k])
+                    ref_lap = self._mouth_sharpness(ref_pixel_values[k])
                     gen_laps.append(gen_lap)
                     ref_laps.append(ref_lap)
-                    if gen_lap < quality_min_laplacian:
+                    ratio = (gen_lap / ref_lap) if ref_lap > 0 else 1.0
+                    if gen_lap < quality_min_laplacian * 0.35:
                         quality_skip_mask[base + k] = True
                         quality_fallback_count += 1
                         logger.info(
-                            f"[Diag] postfilter fallback batch{i} k{k}: gen_lap={gen_lap:.2f} < {quality_min_laplacian}"
+                            f"[Diag] mouth postfilter fallback batch{i} k{k}: gen_lap={gen_lap:.2f} < {quality_min_laplacian * 0.35:.2f}"
                         )
                         continue
-                    if ref_lap > 0 and (gen_lap / ref_lap) < quality_min_sharpness_ratio:
+                    if gen_lap < quality_min_laplacian and ref_lap > 0 and ratio < quality_min_sharpness_ratio:
                         quality_skip_mask[base + k] = True
                         quality_fallback_count += 1
                         logger.info(
-                            f"[Diag] postfilter fallback batch{i} k{k}: gen_lap={gen_lap:.2f} / ref_lap={ref_lap:.2f} = {gen_lap/ref_lap:.3f} < {quality_min_sharpness_ratio}"
+                            f"[Diag] mouth postfilter fallback batch{i} k{k}: gen_lap={gen_lap:.2f} / ref_lap={ref_lap:.2f} = {ratio:.3f} < {quality_min_sharpness_ratio}"
                         )
                 if i == 0 and gen_laps:
                     import statistics
                     logger.info(
-                        f"[Diag] batch0 laplacian: gen min={min(gen_laps):.2f} max={max(gen_laps):.2f} median={statistics.median(gen_laps):.2f} "
+                        f"[Diag] batch0 mouth laplacian: gen min={min(gen_laps):.2f} max={max(gen_laps):.2f} median={statistics.median(gen_laps):.2f} "
                         f"ref min={min(ref_laps):.2f} max={max(ref_laps):.2f} median={statistics.median(ref_laps):.2f}"
                     )
 

@@ -123,21 +123,13 @@ class LipSyncRequest(BaseModel):
     color_match_strength: float = Field(0.60, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.35, ge=0.0, le=1.0)
-    # Postfilter catches generated frames that look blurry at the mouth --
-    # the inpainter occasionally produces a soft, smeared block instead of
-    # a clean lip. The earlier fp16 underflow that caused the postfilter to
-    # silently kill every frame has been fixed (cast to fp32 in
-    # _face_sharpness); default ON with conservative thresholds. Set to
-    # false in the request if you want every frame to come from the model
-    # even if it's blurry.
-    # Default OFF: the postfilter's gen_lap returns 0.00 on every frame
-    # (root cause TBD: likely fp16/conv silent failure on the post-paste
-    # face tensor), which made it flag 100% of frames and fall back to
-    # the original video. Re-enable per request once the underlying
-    # _face_sharpness path is fixed.
-    quality_gate_enabled: bool = False
-    quality_min_laplacian: float = Field(0.5, ge=0.0, le=2000.0)
-    quality_min_sharpness_ratio: float = Field(0.20, ge=0.0, le=1.0)
+    # Postfilter catches generated frames where the mouth ROI is clearly
+    # blurry or much softer than the original mouth ROI. This is intentionally
+    # conservative: difficult frames fall back to the source video instead of
+    # showing smeared lips.
+    quality_gate_enabled: bool = True
+    quality_min_laplacian: float = Field(0.25, ge=0.0, le=2000.0)
+    quality_min_sharpness_ratio: float = Field(0.12, ge=0.0, le=1.0)
     # Side-face / fast-turn prefilters. Frames exceeding either threshold fall
     # back to the original (no inpainting), which is the right call for blurry
     # side profiles and motion-blur turns. yaw_rate is in degrees/frame, not
