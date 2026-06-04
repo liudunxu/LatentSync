@@ -146,9 +146,9 @@ class LipSyncRequest(BaseModel):
     # Side-face / fast-turn prefilters. Frames exceeding either threshold fall
     # back to the original (no inpainting), which is the right call for blurry
     # side profiles and motion-blur turns. yaw_rate is in degrees/frame, not
-    # per second (10°/frame at 25fps ≈ 250°/sec).
+    # per second (8°/frame at 25fps ≈ 200°/sec).
     yaw_skip_threshold: float = Field(22.0, ge=0.0, le=90.0)
-    yaw_rate_skip_threshold: float = Field(10.0, ge=0.0, le=45.0)
+    yaw_rate_skip_threshold: float = Field(8.0, ge=0.0, le=45.0)
     # Episode-level side-face filter: when N consecutive frames exceed
     # yaw_skip_threshold, also skip `pre_pad`/`post_pad` frames of
     # transition zone around the episode (frames whose yaw is between
@@ -195,7 +195,7 @@ class LipSyncRequest(BaseModel):
     mouth_occlusion_skip_threshold: float = Field(1.0, ge=0.0, le=1.0)
     # Motion-blur input filter: skip frames whose aligned face is too
     # smeared to inpaint cleanly. Set to 0 to disable.
-    motion_blur_skip_threshold: float = Field(0.20, ge=0.0, le=10.0)
+    motion_blur_skip_threshold: float = Field(0.35, ge=0.0, le=10.0)
     left_cheek_width: int = Field(75, ge=1, le=240)
     right_cheek_width: int = Field(75, ge=1, le=240)
     batch_size: int = Field(8, ge=1, le=64)
@@ -972,7 +972,7 @@ class LatentSyncApiRuntime:
                 yaw_warn_threshold_ratio=payload.yaw_warn_threshold_ratio,
                 side_face_warn_min_run_frames=payload.side_face_warn_min_run_frames,
                 mouth_occlusion_skip_threshold=payload.mouth_occlusion_skip_threshold,
-                motion_blur_skip_threshold=getattr(payload, "motion_blur_skip_threshold", 0.20),
+                motion_blur_skip_threshold=getattr(payload, "motion_blur_skip_threshold", 0.35),
                 color_match_strength=payload.color_match_strength,
                 mouth_detail_strength=payload.mouth_detail_strength,
                 mouth_sharpen_strength=payload.mouth_sharpen_strength,

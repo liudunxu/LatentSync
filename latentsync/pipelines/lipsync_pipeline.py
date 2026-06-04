@@ -728,9 +728,9 @@ class LipsyncPipeline(DiffusionPipeline):
         video_frames: np.ndarray,
         reference_embedding=None,
         yaw_skip_threshold: float = 22.0,
-        yaw_rate_skip_threshold: float = 10.0,
+        yaw_rate_skip_threshold: float = 8.0,
         mouth_occlusion_skip_threshold: float = 1.0,
-        motion_blur_skip_threshold: float = 0.20,
+        motion_blur_skip_threshold: float = 0.35,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 4,
         side_face_episode_post_pad: int = 4,
@@ -828,7 +828,10 @@ class LipsyncPipeline(DiffusionPipeline):
             if not should_skip and motion_blur_skip_threshold > 0:
                 face_sharp = self._face_sharpness(face)
                 mouth_sharp = self._mouth_sharpness(face)
-                if face_sharp < motion_blur_skip_threshold and mouth_sharp < motion_blur_skip_threshold:
+                if (
+                    face_sharp < motion_blur_skip_threshold
+                    or mouth_sharp < motion_blur_skip_threshold * 0.5
+                ):
                     should_skip = True
                     motion_blur_skip_count += 1
             skip_mask.append(should_skip)
@@ -956,9 +959,9 @@ class LipsyncPipeline(DiffusionPipeline):
         face_embedder=None,
         skip_mask=None,
         yaw_skip_threshold: float = 22.0,
-        yaw_rate_skip_threshold: float = 10.0,
+        yaw_rate_skip_threshold: float = 8.0,
         mouth_occlusion_skip_threshold: float = 1.0,
-        motion_blur_skip_threshold: float = 0.20,
+        motion_blur_skip_threshold: float = 0.35,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 4,
         side_face_episode_post_pad: int = 4,
@@ -1074,7 +1077,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # Yaw-based prefilters for side faces / fast head turns. Defaults now
         # prefer filtering side/profile cases over trying to synthesize them.
         yaw_skip_threshold: float = 22.0,
-        yaw_rate_skip_threshold: float = 10.0,
+        yaw_rate_skip_threshold: float = 8.0,
         # Episode-level side-face filter: when contiguous frames exceed
         # yaw_skip_threshold, also skip pre_pad/post_pad transition frames
         # around the episode (whose yaw is in the warn band between
@@ -1091,10 +1094,10 @@ class LipsyncPipeline(DiffusionPipeline):
         # too sensitive on side/profile shots and could eat most frames.
         mouth_occlusion_skip_threshold: float = 1.0,
         # Motion-blur input filter: skip frames whose aligned face is too
-        # smeared to inpaint cleanly. Default 0.20 (Laplacian variance in
+        # smeared to inpaint cleanly. Default 0.35 (Laplacian variance in
         # the [-1, 1] face space; a sharp face scores ~5-20, a motion-blurred
         # one <1.0). Set to 0 to disable.
-        motion_blur_skip_threshold: float = 0.20,
+        motion_blur_skip_threshold: float = 0.35,
         # Per-frame color transfer from generated to original (inside the
         # mask). 0 = off, 1 = full mean+std match. Default 0.60.
         color_match_strength: float = 0.60,
