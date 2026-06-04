@@ -147,7 +147,7 @@ class LipSyncRequest(BaseModel):
         description="Only apply generated/reference sharpness-ratio fallback when the source mouth ROI is at least this sharp.",
     )
     quality_max_fallback_ratio: float = Field(
-        0.45,
+        0.80,
         ge=0.0,
         le=1.0,
         description="Disable quality fallback for this run if it would skip more than this fraction of non-prefiltered frames.",
@@ -155,9 +155,9 @@ class LipSyncRequest(BaseModel):
     # Side-face / fast-turn prefilters. Frames exceeding either threshold fall
     # back to the original (no inpainting), which is the right call for blurry
     # side profiles and motion-blur turns. yaw_rate is in degrees/frame, not
-    # per second (8°/frame at 25fps ≈ 200°/sec).
-    yaw_skip_threshold: float = Field(22.0, ge=0.0, le=90.0)
-    yaw_rate_skip_threshold: float = Field(8.0, ge=0.0, le=45.0)
+    # per second (18°/frame at 25fps ≈ 450°/sec).
+    yaw_skip_threshold: float = Field(35.0, ge=0.0, le=90.0)
+    yaw_rate_skip_threshold: float = Field(18.0, ge=0.0, le=45.0)
     # Episode-level side-face filter: when N consecutive frames exceed
     # yaw_skip_threshold, also skip `pre_pad`/`post_pad` frames of
     # transition zone around the episode (frames whose yaw is between
@@ -165,11 +165,11 @@ class LipSyncRequest(BaseModel):
     # turning and the affine alignment is unreliable there). Set
     # pre_pad/post_pad to 0 to disable the padding and only do the
     # per-frame yaw skip.
-    side_face_episode_pre_pad: int = Field(4, ge=0, le=30)
-    side_face_episode_post_pad: int = Field(4, ge=0, le=30)
+    side_face_episode_pre_pad: int = Field(0, ge=0, le=30)
+    side_face_episode_post_pad: int = Field(0, ge=0, le=30)
     # Warn-band ratio: yaws above `yaw_skip_threshold * ratio` but below
     # `yaw_skip_threshold` are treated as transition frames / near-profile
-    # runs. Default 0.75 = warn @ 16.5° for the default 22° threshold.
+    # runs. Default 0.75 = warn @ 26.25° for the default 35° threshold.
     yaw_warn_threshold_ratio: float = Field(0.75, ge=0.0, le=1.0)
     side_face_warn_min_run_frames: int = Field(
         0,
@@ -204,15 +204,15 @@ class LipSyncRequest(BaseModel):
     mouth_occlusion_skip_threshold: float = Field(1.0, ge=0.0, le=1.0)
     # Motion-blur input filter: skip frames whose aligned face is too
     # smeared to inpaint cleanly. Set to 0 to disable.
-    motion_blur_skip_threshold: float = Field(0.35, ge=0.0, le=10.0)
+    motion_blur_skip_threshold: float = Field(0.15, ge=0.0, le=10.0)
     face_jump_center_threshold: float = Field(
-        0.18,
+        0.35,
         ge=0.0,
         le=2.0,
         description="Skip frames whose landmark center jumps by more than this fraction of face size; 0 disables.",
     )
     face_jump_scale_threshold: float = Field(
-        0.25,
+        0.45,
         ge=0.0,
         le=2.0,
         description="Skip frames whose landmark face scale changes abruptly by more than this fraction; 0 disables.",

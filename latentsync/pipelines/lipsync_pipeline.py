@@ -805,15 +805,15 @@ class LipsyncPipeline(DiffusionPipeline):
         self,
         video_frames: np.ndarray,
         reference_embedding=None,
-        yaw_skip_threshold: float = 22.0,
-        yaw_rate_skip_threshold: float = 8.0,
+        yaw_skip_threshold: float = 35.0,
+        yaw_rate_skip_threshold: float = 18.0,
         mouth_occlusion_skip_threshold: float = 1.0,
-        motion_blur_skip_threshold: float = 0.35,
-        face_jump_center_threshold: float = 0.18,
-        face_jump_scale_threshold: float = 0.25,
+        motion_blur_skip_threshold: float = 0.15,
+        face_jump_center_threshold: float = 0.35,
+        face_jump_scale_threshold: float = 0.45,
         apply_identity_filter: bool = True,
-        side_face_episode_pre_pad: int = 4,
-        side_face_episode_post_pad: int = 4,
+        side_face_episode_pre_pad: int = 0,
+        side_face_episode_post_pad: int = 0,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
     ):
@@ -1115,15 +1115,15 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         skip_mask=None,
-        yaw_skip_threshold: float = 22.0,
-        yaw_rate_skip_threshold: float = 8.0,
+        yaw_skip_threshold: float = 35.0,
+        yaw_rate_skip_threshold: float = 18.0,
         mouth_occlusion_skip_threshold: float = 1.0,
-        motion_blur_skip_threshold: float = 0.35,
-        face_jump_center_threshold: float = 0.18,
-        face_jump_scale_threshold: float = 0.25,
+        motion_blur_skip_threshold: float = 0.15,
+        face_jump_center_threshold: float = 0.35,
+        face_jump_scale_threshold: float = 0.45,
         apply_identity_filter: bool = True,
-        side_face_episode_pre_pad: int = 4,
-        side_face_episode_post_pad: int = 4,
+        side_face_episode_pre_pad: int = 0,
+        side_face_episode_post_pad: int = 0,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
     ):
@@ -1251,18 +1251,18 @@ class LipsyncPipeline(DiffusionPipeline):
         quality_min_laplacian: float = 0.08,
         quality_min_sharpness_ratio: float = 0.12,
         quality_ref_min_laplacian: float = 0.30,
-        quality_max_fallback_ratio: float = 0.45,
-        # Yaw-based prefilters for side faces / fast head turns. Defaults now
-        # prefer filtering side/profile cases over trying to synthesize them.
-        yaw_skip_threshold: float = 22.0,
-        yaw_rate_skip_threshold: float = 8.0,
+        quality_max_fallback_ratio: float = 0.80,
+        # Yaw-based prefilters for side faces / fast head turns. Defaults are
+        # intentionally permissive so clear frontal faces are not filtered out.
+        yaw_skip_threshold: float = 35.0,
+        yaw_rate_skip_threshold: float = 18.0,
         # Episode-level side-face filter: when contiguous frames exceed
         # yaw_skip_threshold, also skip pre_pad/post_pad transition frames
         # around the episode (whose yaw is in the warn band between
         # yaw_skip_threshold * yaw_warn_threshold_ratio and yaw_skip_threshold).
         # Set pre_pad/post_pad to 0 to disable the padding.
-        side_face_episode_pre_pad: int = 4,
-        side_face_episode_post_pad: int = 4,
+        side_face_episode_pre_pad: int = 0,
+        side_face_episode_post_pad: int = 0,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
         # Mouth-occlusion prefilter: skip frames where the mouth is covered
@@ -1272,14 +1272,14 @@ class LipsyncPipeline(DiffusionPipeline):
         # too sensitive on side/profile shots and could eat most frames.
         mouth_occlusion_skip_threshold: float = 1.0,
         # Motion-blur input filter: skip frames whose aligned face is too
-        # smeared to inpaint cleanly. Default 0.35 (Laplacian variance in
+        # smeared to inpaint cleanly. Default 0.15 (Laplacian variance in
         # the [-1, 1] face space; a sharp face scores ~5-20, a motion-blurred
         # one <1.0). Set to 0 to disable.
-        motion_blur_skip_threshold: float = 0.35,
+        motion_blur_skip_threshold: float = 0.15,
         # Face-jump input filter: skip frames where landmark center/scale
         # changes abruptly, which usually means detection/alignment jumped.
-        face_jump_center_threshold: float = 0.18,
-        face_jump_scale_threshold: float = 0.25,
+        face_jump_center_threshold: float = 0.35,
+        face_jump_scale_threshold: float = 0.45,
         # Per-frame color transfer from generated to original (inside the
         # mask). 0 = off, 1 = full mean+std match. Default 0.60.
         color_match_strength: float = 0.60,
