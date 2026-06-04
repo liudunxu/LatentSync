@@ -765,7 +765,12 @@ class LipsyncPipeline(DiffusionPipeline):
         prev_yaw: Optional[float] = None
         print(f"Affine transforming {len(video_frames)} faces...")
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
-            face, box, affine_matrix, face_emb, lmk = self.image_processor.affine_transform_with_embedding(frame)
+            affine_result = self.image_processor.affine_transform_with_embedding(frame)
+            if len(affine_result) == 5:
+                face, box, affine_matrix, face_emb, lmk = affine_result
+            else:
+                face, box, affine_matrix, face_emb = affine_result
+                lmk = None
             if face is None:
                 detect_fail_count += 1
                 skip_mask.append(True)
