@@ -293,23 +293,28 @@ class LipsyncPipeline(DiffusionPipeline):
     @staticmethod
     def _face_sharpness(face: torch.Tensor) -> float:
         """Laplacian variance as a sharpness proxy. face shape (3, H, W), any dtype/range.
-        Returns 0.0 on failure. Uses kornia if available, falls back to torch conv."""
+        Returns 0.0 on failure.
+
+        Implementation note: we always cast to float32 before computing. The previous
+        version ran the conv in fp16 (the dtype of the paste step output) and the
+        squared-laplacian underflowed to 0 for every face, which caused the postfilter
+        to flag 100% of frames and fall back to the original video. fp32 is ~free at
+        512x512 and gives stable variance values in the ~0.5–20 range.
+        """
+        if face is None or face.numel() == 0:
+            return 0.0
         try:
-            import kornia.filters as kf
-            lap = kf.laplacian(face.unsqueeze(0), kernel_size=3).squeeze(0)
+            x = face.detach().to(torch.float32)
+            kernel = torch.tensor(
+                [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+                dtype=torch.float32,
+                device=x.device,
+            ).view(1, 1, 3, 3)
+            gray = x.mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, H, W)
+            lap = torch.nn.functional.conv2d(gray, kernel, padding=1)
             return float(lap.pow(2).mean().item())
         except Exception:
-            try:
-                import torch.nn.functional as F
-                kernel = torch.tensor(
-                    [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
-                    dtype=face.dtype, device=face.device,
-                ).view(1, 1, 3, 3)
-                gray = face.mean(dim=0, keepdim=True).unsqueeze(0)
-                lap = F.conv2d(gray, kernel, padding=1)
-                return float(lap.pow(2).mean().item())
-            except Exception:
-                return 0.0
+            return 0.0
 
     @staticmethod
     def _smooth_face_sequence(

@@ -62,9 +62,9 @@ class Settings:
     unet_config_path: str = os.getenv("LATENTSYNC_UNET_CONFIG", "configs/unet/stage2_512.yaml")
     inference_ckpt_path: str = os.getenv("LATENTSYNC_INFERENCE_CKPT", "checkpoints/latentsync_unet.pt")
     guidance_scale: float = float(os.getenv("LATENTSYNC_GUIDANCE_SCALE", "2.0"))
-    inference_steps: int = int(os.getenv("LATENTSYNC_INFERENCE_STEPS", "50"))
+    inference_steps: int = int(os.getenv("LATENTSYNC_INFERENCE_STEPS", "30"))
     seed: int = int(os.getenv("LATENTSYNC_SEED", "1247"))
-    enable_deepcache: bool = os.getenv("LATENTSYNC_ENABLE_DEEPCACHE", "0").lower() in {"1", "true", "yes"}
+    enable_deepcache: bool = os.getenv("LATENTSYNC_ENABLE_DEEPCACHE", "1").lower() in {"1", "true", "yes"}
     max_download_bytes: int = int(os.getenv("API_MAX_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
     download_retries: int = int(os.getenv("API_DOWNLOAD_RETRIES", "2"))
     download_retry_backoff_seconds: float = float(os.getenv("API_DOWNLOAD_RETRY_BACKOFF_SECONDS", "1.0"))
@@ -123,8 +123,11 @@ class LipSyncRequest(BaseModel):
     color_match_strength: float = Field(0.60, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.35, ge=0.0, le=1.0)
-    quality_gate_enabled: bool = True
-    quality_min_laplacian: float = Field(15.0, ge=0.0, le=2000.0)
+    # Postfilter was over-aggressive in practice (silently fell back to the
+    # original video when the laplacian function returned 0 due to fp16
+    # underflow). Default OFF; clients that want it can set true in the request.
+    quality_gate_enabled: bool = False
+    quality_min_laplacian: float = Field(1.0, ge=0.0, le=2000.0)
     quality_min_sharpness_ratio: float = Field(0.20, ge=0.0, le=1.0)
     left_cheek_width: int = Field(75, ge=1, le=240)
     right_cheek_width: int = Field(75, ge=1, le=240)
