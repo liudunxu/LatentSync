@@ -311,6 +311,22 @@ class LipsyncPipeline(DiffusionPipeline):
         return float(sign * pose_abs)
 
     @staticmethod
+    def _landmark_motion_state(lmk: np.ndarray):
+        if lmk is None or len(lmk) == 0:
+            return None
+        try:
+            pts = np.asarray(lmk, dtype=np.float32)
+            x0, y0 = np.min(pts[:, 0]), np.min(pts[:, 1])
+            x1, y1 = np.max(pts[:, 0]), np.max(pts[:, 1])
+            size = float(max(x1 - x0, y1 - y0))
+            if size <= 1e-3:
+                return None
+            center = np.array([(x0 + x1) * 0.5, (y0 + y1) * 0.5], dtype=np.float32)
+            return center, size
+        except Exception:
+            return None
+
+    @staticmethod
     def _match_color_to_reference(
         face: torch.Tensor,
         ref_face: torch.Tensor,
@@ -731,6 +747,8 @@ class LipsyncPipeline(DiffusionPipeline):
         yaw_rate_skip_threshold: float = 8.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.35,
+        face_jump_center_threshold: float = 0.18,
+        face_jump_scale_threshold: float = 0.25,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 4,
         side_face_episode_post_pad: int = 4,
@@ -743,6 +761,8 @@ class LipsyncPipeline(DiffusionPipeline):
             f"yaw_rate_skip_threshold={yaw_rate_skip_threshold}, "
             f"mouth_occlusion_skip_threshold={mouth_occlusion_skip_threshold}, "
             f"motion_blur_skip_threshold={motion_blur_skip_threshold}, "
+            f"face_jump_center_threshold={face_jump_center_threshold}, "
+            f"face_jump_scale_threshold={face_jump_scale_threshold}, "
             f"apply_identity_filter={apply_identity_filter}"
         )
         faces = []
@@ -760,9 +780,11 @@ class LipsyncPipeline(DiffusionPipeline):
         yaw_rate_skip_count = 0
         mouth_occlusion_skip_count = 0
         motion_blur_skip_count = 0
+        face_jump_skip_count = 0
         identity_skip_count = 0
         detect_fail_count = 0
         prev_yaw: Optional[float] = None
+        prev_motion_state = None
         print(f"Affine transforming {len(video_frames)} faces...")
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
             affine_result = self.image_processor.affine_transform_with_embedding(frame)
@@ -780,6 +802,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 yaws.append(None)
                 yaw_skip_reasons.append(False)
                 prev_yaw = None  # reset so we don't carry a stale yaw across a detect-fail gap
+                prev_motion_state = None
                 continue
             should_skip = False
             if apply_identity_filter and reference_embedding is not None and face_emb is not None:
@@ -788,11 +811,13 @@ class LipsyncPipeline(DiffusionPipeline):
                     should_skip = True
                     identity_skip_count += 1
             yaw_deg = 0.0
+            yaw_available = False
             yaw_was_skipped = False  # tracks the absolute yaw threshold (not yaw_rate)
-            if yaw_skip_threshold > 0 and lmk is not None:
-                landmark_yaw = self._estimate_yaw_degrees(lmk)
+            if yaw_skip_threshold > 0:
+                landmark_yaw = self._estimate_yaw_degrees(lmk) if lmk is not None else 0.0
                 pose_yaw = getattr(self.image_processor.face_detector, "last_pose_yaw", None)
-                yaw_deg = self._select_yaw_degrees(landmark_yaw, pose_yaw)
+                yaw_available = lmk is not None or pose_yaw is not None
+                yaw_deg = self._select_yaw_degrees(landmark_yaw, pose_yaw) if yaw_available else 0.0
                 if abs(yaw_deg) > yaw_skip_threshold:
                     should_skip = True
                     yaw_was_skipped = True
@@ -806,12 +831,32 @@ class LipsyncPipeline(DiffusionPipeline):
                 and yaw_rate_skip_threshold > 0
                 and prev_yaw is not None
                 and yaw_skip_threshold > 0
-                and lmk is not None
+                and yaw_available
             ):
                 rate = abs(yaw_deg - prev_yaw)
                 if rate > yaw_rate_skip_threshold:
                     should_skip = True
                     yaw_rate_skip_count += 1
+            motion_state = self._landmark_motion_state(lmk)
+            if (
+                not should_skip
+                and motion_state is not None
+                and prev_motion_state is not None
+                and (face_jump_center_threshold > 0 or face_jump_scale_threshold > 0)
+            ):
+                center, size = motion_state
+                prev_center, prev_size = prev_motion_state
+                center_shift = float(np.linalg.norm(center - prev_center) / max(prev_size, 1.0))
+                scale_shift = float(abs(size - prev_size) / max(prev_size, 1.0))
+                if (
+                    face_jump_center_threshold > 0
+                    and center_shift > face_jump_center_threshold
+                ) or (
+                    face_jump_scale_threshold > 0
+                    and scale_shift > face_jump_scale_threshold
+                ):
+                    should_skip = True
+                    face_jump_skip_count += 1
             # Mouth occlusion: skip frames where the mouth is covered by a
             # hand, microphone, phone, mask, etc. Cheap pixel-ratio check on
             # the aligned face -- no model load.
@@ -835,27 +880,31 @@ class LipsyncPipeline(DiffusionPipeline):
                     should_skip = True
                     motion_blur_skip_count += 1
             skip_mask.append(should_skip)
-            yaws.append(yaw_deg if (yaw_skip_threshold > 0 and lmk is not None) else None)
+            yaws.append(yaw_deg if (yaw_skip_threshold > 0 and yaw_available) else None)
             yaw_skip_reasons.append(yaw_was_skipped)
             faces.append(face)
             boxes.append(box)
             affine_matrices.append(affine_matrix)
-            prev_yaw = yaw_deg if (yaw_skip_threshold > 0 and lmk is not None) else None
+            prev_yaw = yaw_deg if (yaw_skip_threshold > 0 and yaw_available) else None
+            if not should_skip and motion_state is not None:
+                prev_motion_state = motion_state
         logger.info(
             f"[FaceMatch] detect_fail={detect_fail_count}, identity_skip={identity_skip_count}, "
             f"yaw_skip={yaw_skip_count}, yaw_rate_skip={yaw_rate_skip_count}, "
             f"mouth_occlusion_skip={mouth_occlusion_skip_count}, "
-            f"motion_blur_skip={motion_blur_skip_count}"
+            f"motion_blur_skip={motion_blur_skip_count}, "
+            f"face_jump_skip={face_jump_skip_count}"
         )
         self._last_yaw_skip_count = yaw_skip_count
         self._last_yaw_rate_skip_count = yaw_rate_skip_count
         self._last_mouth_occlusion_skip_count = mouth_occlusion_skip_count
         self._last_motion_blur_skip_count = motion_blur_skip_count
+        self._last_face_jump_skip_count = face_jump_skip_count
 
         # Episode-level side-face filter: a contiguous run of yaw-skipped
         # frames represents a single turning motion. The frames immediately
         # before/after the run typically have yaw in the warn band (e.g.
-        # 10-20° for the default 20° threshold) where affine alignment is
+        # 16.5-22° for the default 22° threshold) where affine alignment is
         # still unreliable; we extend the skip_mask to include those
         # transition frames so the whole turn becomes a single side-face
         # episode (instead of a fragmentary skip that lets blur sneak in
@@ -962,6 +1011,8 @@ class LipsyncPipeline(DiffusionPipeline):
         yaw_rate_skip_threshold: float = 8.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.35,
+        face_jump_center_threshold: float = 0.18,
+        face_jump_scale_threshold: float = 0.25,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 4,
         side_face_episode_post_pad: int = 4,
@@ -973,7 +1024,10 @@ class LipsyncPipeline(DiffusionPipeline):
             f"frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}, "
             f"yaw_rate_skip_threshold={yaw_rate_skip_threshold}, "
             f"mouth_occlusion_skip_threshold={mouth_occlusion_skip_threshold}, "
-            f"motion_blur_skip_threshold={motion_blur_skip_threshold}, apply_identity_filter={apply_identity_filter}"
+            f"motion_blur_skip_threshold={motion_blur_skip_threshold}, "
+            f"face_jump_center_threshold={face_jump_center_threshold}, "
+            f"face_jump_scale_threshold={face_jump_scale_threshold}, "
+            f"apply_identity_filter={apply_identity_filter}"
         )
         if reference_embedding is None and face_embedder is not None:
             reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
@@ -986,6 +1040,8 @@ class LipsyncPipeline(DiffusionPipeline):
                 yaw_rate_skip_threshold=yaw_rate_skip_threshold,
                 mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
                 motion_blur_skip_threshold=motion_blur_skip_threshold,
+                face_jump_center_threshold=face_jump_center_threshold,
+                face_jump_scale_threshold=face_jump_scale_threshold,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
@@ -1026,6 +1082,8 @@ class LipsyncPipeline(DiffusionPipeline):
                 yaw_rate_skip_threshold=yaw_rate_skip_threshold,
                 mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
                 motion_blur_skip_threshold=motion_blur_skip_threshold,
+                face_jump_center_threshold=face_jump_center_threshold,
+                face_jump_scale_threshold=face_jump_scale_threshold,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
@@ -1098,6 +1156,10 @@ class LipsyncPipeline(DiffusionPipeline):
         # the [-1, 1] face space; a sharp face scores ~5-20, a motion-blurred
         # one <1.0). Set to 0 to disable.
         motion_blur_skip_threshold: float = 0.35,
+        # Face-jump input filter: skip frames where landmark center/scale
+        # changes abruptly, which usually means detection/alignment jumped.
+        face_jump_center_threshold: float = 0.18,
+        face_jump_scale_threshold: float = 0.25,
         # Per-frame color transfer from generated to original (inside the
         # mask). 0 = off, 1 = full mean+std match. Default 0.60.
         color_match_strength: float = 0.60,
@@ -1165,6 +1227,8 @@ class LipsyncPipeline(DiffusionPipeline):
             yaw_rate_skip_threshold=yaw_rate_skip_threshold,
             mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
             motion_blur_skip_threshold=motion_blur_skip_threshold,
+            face_jump_center_threshold=face_jump_center_threshold,
+            face_jump_scale_threshold=face_jump_scale_threshold,
             apply_identity_filter=apply_identity_filter,
             side_face_episode_pre_pad=side_face_episode_pre_pad,
             side_face_episode_post_pad=side_face_episode_post_pad,
@@ -1463,6 +1527,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "yaw_rate_skip_count": getattr(self, "_last_yaw_rate_skip_count", 0),
             "mouth_occlusion_skip_count": getattr(self, "_last_mouth_occlusion_skip_count", 0),
             "motion_blur_skip_count": getattr(self, "_last_motion_blur_skip_count", 0),
+            "face_jump_skip_count": getattr(self, "_last_face_jump_skip_count", 0),
             "side_face_episode_extra_skip_count": getattr(
                 self, "_last_side_face_episode_extra_skip_count", 0
             ),
@@ -1475,6 +1540,8 @@ class LipsyncPipeline(DiffusionPipeline):
             "side_face_warn_min_run_frames": side_face_warn_min_run_frames,
             "mouth_occlusion_skip_threshold": mouth_occlusion_skip_threshold,
             "motion_blur_skip_threshold": motion_blur_skip_threshold,
+            "face_jump_center_threshold": face_jump_center_threshold,
+            "face_jump_scale_threshold": face_jump_scale_threshold,
             "temporal_smoothing_enabled": temporal_smoothing_enabled,
             "mouth_motion_preserve_strength": mouth_motion_preserve_strength,
             "mouth_temporal_stabilization_strength": mouth_temporal_stabilization_strength,

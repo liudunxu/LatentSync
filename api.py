@@ -160,7 +160,7 @@ class LipSyncRequest(BaseModel):
     side_face_episode_post_pad: int = Field(4, ge=0, le=30)
     # Warn-band ratio: yaws above `yaw_skip_threshold * ratio` but below
     # `yaw_skip_threshold` are treated as transition frames / near-profile
-    # runs. Default 0.75 = warn @ 25.5° for the default 34° threshold.
+    # runs. Default 0.75 = warn @ 16.5° for the default 22° threshold.
     yaw_warn_threshold_ratio: float = Field(0.75, ge=0.0, le=1.0)
     side_face_warn_min_run_frames: int = Field(
         0,
@@ -196,6 +196,18 @@ class LipSyncRequest(BaseModel):
     # Motion-blur input filter: skip frames whose aligned face is too
     # smeared to inpaint cleanly. Set to 0 to disable.
     motion_blur_skip_threshold: float = Field(0.35, ge=0.0, le=10.0)
+    face_jump_center_threshold: float = Field(
+        0.18,
+        ge=0.0,
+        le=2.0,
+        description="Skip frames whose landmark center jumps by more than this fraction of face size; 0 disables.",
+    )
+    face_jump_scale_threshold: float = Field(
+        0.25,
+        ge=0.0,
+        le=2.0,
+        description="Skip frames whose landmark face scale changes abruptly by more than this fraction; 0 disables.",
+    )
     left_cheek_width: int = Field(75, ge=1, le=240)
     right_cheek_width: int = Field(75, ge=1, le=240)
     batch_size: int = Field(8, ge=1, le=64)
@@ -973,6 +985,8 @@ class LatentSyncApiRuntime:
                 side_face_warn_min_run_frames=payload.side_face_warn_min_run_frames,
                 mouth_occlusion_skip_threshold=payload.mouth_occlusion_skip_threshold,
                 motion_blur_skip_threshold=getattr(payload, "motion_blur_skip_threshold", 0.35),
+                face_jump_center_threshold=payload.face_jump_center_threshold,
+                face_jump_scale_threshold=payload.face_jump_scale_threshold,
                 color_match_strength=payload.color_match_strength,
                 mouth_detail_strength=payload.mouth_detail_strength,
                 mouth_sharpen_strength=payload.mouth_sharpen_strength,
@@ -992,6 +1006,7 @@ class LatentSyncApiRuntime:
             yaw_rate_skip_count = int(run_stats.get("yaw_rate_skip_count", 0))
             mouth_occlusion_skip_count = int(run_stats.get("mouth_occlusion_skip_count", 0))
             motion_blur_skip_count = int(run_stats.get("motion_blur_skip_count", 0))
+            face_jump_skip_count = int(run_stats.get("face_jump_skip_count", 0))
             side_face_episode_extra_skip_count = int(
                 run_stats.get("side_face_episode_extra_skip_count", 0)
             )
@@ -1032,6 +1047,7 @@ class LatentSyncApiRuntime:
                 "yaw_rate_skip_count": yaw_rate_skip_count,
                 "mouth_occlusion_skip_count": mouth_occlusion_skip_count,
                 "motion_blur_skip_count": motion_blur_skip_count,
+                "face_jump_skip_count": face_jump_skip_count,
                 "side_face_episode_extra_skip_count": side_face_episode_extra_skip_count,
                 "side_face_warn_run_skip_count": side_face_warn_run_skip_count,
                 "effective_generated_output_frames": effective_generated_frames,
