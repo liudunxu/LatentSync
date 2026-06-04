@@ -662,8 +662,11 @@ class LipsyncPipeline(DiffusionPipeline):
                         f"max={mask_first.max().item():.3f} mean={mask_first.mean().item():.3f} "
                         f"frac_inpaint={float((mask_first < 0.5).float().mean().item()):.3f}"
                     )
-                    decoded_first = decoded_latents[0]
-                    ref_first = ref_pixel_values[0]
+                    # Use .cpu() to avoid cuda/cpu device mismatch: decoded_latents
+                    # lives on the pipeline device but ref_pixel_values comes from
+                    # image_processor on cpu.
+                    decoded_first = decoded_latents[0].detach().cpu()
+                    ref_first = ref_pixel_values[0].detach().cpu()
                     diff = (decoded_first - ref_first).abs().mean().item()
                     logger.info(
                         f"[Diag] batch0 frame0: decoded range [{decoded_first.min().item():.2f}, {decoded_first.max().item():.2f}] "
@@ -675,8 +678,8 @@ class LipsyncPipeline(DiffusionPipeline):
             )
             if i == 0:
                 with torch.no_grad():
-                    combined_first = decoded_latents[0]
-                    ref_first = ref_pixel_values[0]
+                    combined_first = decoded_latents[0].detach().cpu()
+                    ref_first = ref_pixel_values[0].detach().cpu()
                     diff = (combined_first - ref_first).abs().mean().item()
                     logger.info(
                         f"[Diag] batch0 frame0 after paste: mean|combined-ref|={diff:.4f} "
