@@ -1302,7 +1302,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # Postfilter: skip frames where the generated mouth ROI is clearly
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
-        quality_gate_enabled: bool = True,
+        quality_gate_enabled: bool = False,
         quality_min_laplacian: float = 0.04,
         quality_min_sharpness_ratio: float = 0.05,
         quality_ref_min_laplacian: float = 1.00,

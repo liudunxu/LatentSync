@@ -137,7 +137,7 @@ class LipSyncRequest(BaseModel):
     # blurry or much softer than the original mouth ROI. This is intentionally
     # conservative: difficult frames fall back to the source video instead of
     # showing smeared lips.
-    quality_gate_enabled: bool = True
+    quality_gate_enabled: bool = False
     quality_min_laplacian: float = Field(0.04, ge=0.0, le=2000.0)
     quality_min_sharpness_ratio: float = Field(0.05, ge=0.0, le=1.0)
     quality_ref_min_laplacian: float = Field(
