@@ -389,8 +389,8 @@ class LipsyncPipeline(DiffusionPipeline):
         logger.info(f"[LipSync] Main speaker from frame {best_frame_idx} with mouth_ratio={best_ratio:.4f}")
         return best_emb
 
-    def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None, yaw_skip_threshold: float = 30.0):
-        logger.info(f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}")
+    def affine_transform_video(self, video_frames: np.ndarray, reference_embedding=None, yaw_skip_threshold: float = 30.0, apply_identity_filter: bool = True):
+        logger.info(f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}, apply_identity_filter={apply_identity_filter}")
         faces = []
         boxes = []
         affine_matrices = []
@@ -409,7 +409,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 affine_matrices.append(np.eye(3))
             else:
                 should_skip = False
-                if reference_embedding is not None and face_emb is not None:
+                if apply_identity_filter and reference_embedding is not None and face_emb is not None:
                     similarity = float(np.dot(face_emb, reference_embedding))
                     if similarity < 0.7:
                         should_skip = True
@@ -447,13 +447,13 @@ class LipsyncPipeline(DiffusionPipeline):
                 out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 
-    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray, reference_embedding=None, face_embedder=None, skip_mask=None, yaw_skip_threshold: float = 30.0):
-        logger.info(f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}")
+    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray, reference_embedding=None, face_embedder=None, skip_mask=None, yaw_skip_threshold: float = 30.0, apply_identity_filter: bool = True):
+        logger.info(f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, frames={len(video_frames)}, yaw_skip_threshold={yaw_skip_threshold}, apply_identity_filter={apply_identity_filter}")
         if reference_embedding is None and face_embedder is not None:
             reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
             logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
         if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding, yaw_skip_threshold=yaw_skip_threshold)
+            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding, yaw_skip_threshold=yaw_skip_threshold, apply_identity_filter=apply_identity_filter)
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
             loop_video_frames = []
             loop_faces = []
@@ -481,7 +481,7 @@ class LipsyncPipeline(DiffusionPipeline):
             skip_mask = loop_skip_mask[: len(whisper_chunks)]
         else:
             video_frames = video_frames[: len(whisper_chunks)]
-            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding, yaw_skip_threshold=yaw_skip_threshold)
+            faces, boxes, affine_matrices, frame_skip_mask = self.affine_transform_video(video_frames, reference_embedding, yaw_skip_threshold=yaw_skip_threshold, apply_identity_filter=apply_identity_filter)
             skip_mask = frame_skip_mask
 
         return video_frames, faces, boxes, affine_matrices, skip_mask
@@ -557,8 +557,14 @@ class LipsyncPipeline(DiffusionPipeline):
         video_frames = read_video(video_path, use_decord=False)
         logger.info(f"[LipSync] video_frames shape={video_frames.shape}")
 
-        video_frames, faces, boxes, affine_matrices, skip_mask = self.loop_video(whisper_chunks, video_frames, reference_embedding=reference_embedding, face_embedder=face_embedder, yaw_skip_threshold=yaw_skip_threshold)
-        logger.info(f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, affine_matrices={len(affine_matrices)}, skip_mask={skip_mask}")
+        # Only apply identity filtering when the user explicitly provided an
+        # avatar (reference_embedding). When the user didn't supply one,
+        # loop_video will auto-detect a "main speaker" — that detection is
+        # not reliable enough to reject other frames (false positives on
+        # busy/occluded faces), so we keep all detected faces.
+        apply_identity_filter = reference_embedding is not None
+        video_frames, faces, boxes, affine_matrices, skip_mask = self.loop_video(whisper_chunks, video_frames, reference_embedding=reference_embedding, face_embedder=face_embedder, yaw_skip_threshold=yaw_skip_threshold, apply_identity_filter=apply_identity_filter)
+        logger.info(f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, affine_matrices={len(affine_matrices)}, apply_identity_filter={apply_identity_filter}, skip_true={sum(skip_mask)}/{len(skip_mask)}")
 
         # State carried across batches for temporal EMA smoothing
         prev_face: Optional[torch.Tensor] = None
