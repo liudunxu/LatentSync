@@ -727,7 +727,7 @@ class LipsyncPipeline(DiffusionPipeline):
         self,
         video_frames: np.ndarray,
         reference_embedding=None,
-        yaw_skip_threshold: float = 34.0,
+        yaw_skip_threshold: float = 22.0,
         yaw_rate_skip_threshold: float = 10.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.20,
@@ -950,7 +950,7 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         skip_mask=None,
-        yaw_skip_threshold: float = 34.0,
+        yaw_skip_threshold: float = 22.0,
         yaw_rate_skip_threshold: float = 10.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.20,
@@ -1067,7 +1067,7 @@ class LipsyncPipeline(DiffusionPipeline):
         quality_max_fallback_ratio: float = 0.45,
         # Yaw-based prefilters for side faces / fast head turns. Defaults now
         # prefer filtering side/profile cases over trying to synthesize them.
-        yaw_skip_threshold: float = 34.0,
+        yaw_skip_threshold: float = 22.0,
         yaw_rate_skip_threshold: float = 10.0,
         # Episode-level side-face filter: when contiguous frames exceed
         # yaw_skip_threshold, also skip pre_pad/post_pad transition frames
