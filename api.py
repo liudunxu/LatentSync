@@ -157,6 +157,26 @@ class LipSyncRequest(BaseModel):
     # `yaw_skip_threshold` are treated as transition frames. Default 0.5
     # = warn @ 10° for the default 20° yaw_skip_threshold.
     yaw_warn_threshold_ratio: float = Field(0.5, ge=0.0, le=1.0)
+    # Per-request inference overrides. None = use server-side setting
+    # (LATENTSYNC_GUIDANCE_SCALE / LATENTSYNC_INFERENCE_STEPS / LATENTSYNC_SEED
+    # env vars, or their CLI flags). Frontend (~/Downloads/dub) sends these
+    # via a 质量预设 group (fast/balanced/quality) + raw fields.
+    guidance_scale_override: Optional[float] = Field(
+        None, ge=0.0, le=10.0, description="Classifier-free guidance scale (mouth motion strength). None = use server default."
+    )
+    inference_steps_override: Optional[int] = Field(
+        None, ge=1, le=100, description="DDIM inference steps. None = use server default."
+    )
+    seed_override: Optional[int] = Field(
+        None, description="RNG seed (-1 for random). None = use server default."
+    )
+    # DeepCache is wired at pipeline load time (see settings.enable_deepcache);
+    # changing it per-request would require reloading the model. We log a
+    # warning when this differs from the server setting so the caller knows
+    # their hint was ignored without surprise.
+    enable_deepcache_override: Optional[bool] = Field(
+        None, description="Hint for DeepCache enable. None = use server default. Honored only at server startup."
+    )
     # Mouth-occlusion prefilter: skip frames where the mouth is covered by
     # a hand, microphone, phone, mask, etc. Score 0..1; threshold 0.7 = "at
     # least 70% likely occluded". Set to 1.0 to disable the check.
@@ -882,21 +902,45 @@ class LatentSyncApiRuntime:
             audio_path = paths["audio"]
             output_path = job_output_dir / "result.mp4"
 
-            if settings.seed != -1:
-                set_seed(settings.seed)
+            # Resolve per-request overrides for inference quality. None = use
+            # the server-side default loaded from env vars at startup.
+            effective_guidance_scale = (
+                payload.guidance_scale_override
+                if payload.guidance_scale_override is not None
+                else settings.guidance_scale
+            )
+            effective_inference_steps = (
+                payload.inference_steps_override
+                if payload.inference_steps_override is not None
+                else settings.inference_steps
+            )
+            effective_seed = (
+                payload.seed_override
+                if payload.seed_override is not None
+                else settings.seed
+            )
+            if payload.enable_deepcache_override is not None and payload.enable_deepcache_override != settings.enable_deepcache:
+                logger.warning(
+                    f"[LipSync] enable_deepcache_override={payload.enable_deepcache_override} "
+                    f"differs from server default settings.enable_deepcache={settings.enable_deepcache}; "
+                    "DeepCache is wired at pipeline load time -- restart the server with the new env var to apply."
+                )
+
+            if effective_seed != -1:
+                set_seed(effective_seed)
             else:
                 torch.seed()
 
             logger.info(f"[LipSync] Starting pipeline: video={video_path}, audio={audio_path}, "
-                         f"guidance_scale={settings.guidance_scale}, steps={settings.inference_steps}, "
-                         f"has_reference_embedding={reference_embedding is not None}")
+                         f"guidance_scale={effective_guidance_scale}, steps={effective_inference_steps}, "
+                         f"seed={effective_seed}, has_reference_embedding={reference_embedding is not None}")
             self.pipeline(
                 video_path=str(video_path),
                 audio_path=str(audio_path),
                 video_out_path=str(output_path),
                 num_frames=self.config.data.num_frames,
-                num_inference_steps=settings.inference_steps,
-                guidance_scale=settings.guidance_scale,
+                num_inference_steps=effective_inference_steps,
+                guidance_scale=effective_guidance_scale,
                 weight_dtype=self.dtype,
                 width=self.config.data.resolution,
                 height=self.config.data.resolution,
@@ -945,6 +989,9 @@ class LatentSyncApiRuntime:
                 "audio_sync_offset_frames": 0,
                 "audio_sync_offset_output_frames": 0,
                 "audio_sync_offset_seconds": payload.audio_sync_offset_seconds,
+                "effective_guidance_scale": effective_guidance_scale,
+                "effective_inference_steps": effective_inference_steps,
+                "effective_seed": effective_seed,
                 "matched_source_frames": source_frame_count,
                 "filled_source_frames": 0,
                 "filtered_motion_frames": 0,
