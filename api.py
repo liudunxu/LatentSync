@@ -61,7 +61,7 @@ class Settings:
     gpu_id: int = int(os.getenv("LATENTSYNC_GPU_ID", "0"))
     unet_config_path: str = os.getenv("LATENTSYNC_UNET_CONFIG", "configs/unet/stage2_512.yaml")
     inference_ckpt_path: str = os.getenv("LATENTSYNC_INFERENCE_CKPT", "checkpoints/latentsync_unet.pt")
-    guidance_scale: float = float(os.getenv("LATENTSYNC_GUIDANCE_SCALE", "2.0"))
+    guidance_scale: float = float(os.getenv("LATENTSYNC_GUIDANCE_SCALE", "2.4"))
     inference_steps: int = int(os.getenv("LATENTSYNC_INFERENCE_STEPS", "30"))
     seed: int = int(os.getenv("LATENTSYNC_SEED", "1247"))
     enable_deepcache: bool = os.getenv("LATENTSYNC_ENABLE_DEEPCACHE", "1").lower() in {"1", "true", "yes"}

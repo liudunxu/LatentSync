@@ -1052,6 +1052,9 @@ class LipsyncPipeline(DiffusionPipeline):
         face_embedder=None,
         # --- quality / temporal gating (added 2026-06) ---
         temporal_smoothing_enabled: bool = True,
+        # Preserve current-frame mouth-core motion after temporal smoothing.
+        # 0 = fully smoothed mouth, 1 = keep generated current-frame mouth.
+        mouth_motion_preserve_strength: float = 0.75,
         # Postfilter: skip frames where the generated mouth ROI is clearly
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
@@ -1311,12 +1314,25 @@ class LipsyncPipeline(DiffusionPipeline):
             # Temporal EMA across face crops (cross-batch state via prev_face)
             inference_skip_mask = skip_mask[i * num_frames : (i + 1) * num_frames]
             if temporal_smoothing_enabled:
+                current_mouth_motion = decoded_latents
                 decoded_latents, prev_face, prev_valid = self._smooth_face_sequence(
                     decoded_latents,
                     prev_face=prev_face,
                     prev_valid=prev_valid,
                     inference_skip_mask=inference_skip_mask,
                 )
+                if mouth_motion_preserve_strength > 0:
+                    mouth_motion_mask = self._mouth_core_mask(generated_region_mask).to(
+                        device=decoded_latents.device,
+                        dtype=decoded_latents.dtype,
+                    )
+                    if mouth_motion_mask.dim() == 4 and mouth_motion_mask.shape[1] == 1:
+                        mouth_motion_mask = mouth_motion_mask.expand(-1, 3, -1, -1)
+                    decoded_latents = decoded_latents + (
+                        mouth_motion_mask
+                        * mouth_motion_preserve_strength
+                        * (current_mouth_motion - decoded_latents)
+                    )
 
             # Quality postfilter: flag frames whose generated mouth ROI is too
             # blurry to be worth showing. Checked AFTER paste/detail recovery.
@@ -1407,6 +1423,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "mouth_occlusion_skip_threshold": mouth_occlusion_skip_threshold,
             "motion_blur_skip_threshold": motion_blur_skip_threshold,
             "temporal_smoothing_enabled": temporal_smoothing_enabled,
+            "mouth_motion_preserve_strength": mouth_motion_preserve_strength,
             "quality_gate_enabled": quality_gate_enabled,
             "color_match_strength": color_match_strength,
             "mouth_detail_strength": mouth_detail_strength,
