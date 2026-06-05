@@ -137,7 +137,7 @@ class LipSyncRequest(BaseModel):
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.0, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
-    mouth_temporal_stabilization_max_delta: float = Field(0.14, ge=0.0, le=2.0)
+    mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     mouth_audio_adaptive_motion_enabled: bool = True
     mouth_audio_motion_min_scale: float = Field(0.65, ge=0.0, le=2.0)
     mouth_audio_motion_max_scale: float = Field(1.15, ge=0.0, le=2.0)

@@ -1318,7 +1318,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # stabilized mouth, clear carry state instead of blending. This keeps
         # stabilization from borrowing lips across speaker/shot changes that
         # were not caught by geometry or identity continuity breaks.
-        mouth_temporal_stabilization_max_delta: float = 0.14,
+        mouth_temporal_stabilization_max_delta: float = 0.12,
         # Audio-adaptive mouth motion: preserve more current generated mouth
         # motion on high-energy speech frames and less on weak/silent frames.
         mouth_audio_adaptive_motion_enabled: bool = True,
@@ -1753,6 +1753,7 @@ class LipsyncPipeline(DiffusionPipeline):
                             continuity = 1.0 - (
                                 mouth_delta / mouth_temporal_stabilization_max_delta
                             ).clamp(0.0, 1.0)
+                            continuity = continuity * continuity
                             effective_stabilization_strength = (
                                 mouth_temporal_stabilization_strength * float(continuity.item())
                             )
