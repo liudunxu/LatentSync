@@ -814,6 +814,7 @@ class LipsyncPipeline(DiffusionPipeline):
         face_jump_scale_threshold: float = 0.0,
         lipsync_continuity_max_center_shift: float = 0.35,
         lipsync_continuity_max_scale_change: float = 0.35,
+        identity_similarity_threshold: float = 0.72,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 0,
         side_face_episode_post_pad: int = 0,
@@ -830,6 +831,7 @@ class LipsyncPipeline(DiffusionPipeline):
             f"face_jump_scale_threshold={face_jump_scale_threshold}, "
             f"lipsync_continuity_max_center_shift={lipsync_continuity_max_center_shift}, "
             f"lipsync_continuity_max_scale_change={lipsync_continuity_max_scale_change}, "
+            f"identity_similarity_threshold={identity_similarity_threshold}, "
             f"apply_identity_filter={apply_identity_filter}"
         )
         faces = []
@@ -882,7 +884,7 @@ class LipsyncPipeline(DiffusionPipeline):
             should_skip = False
             if apply_identity_filter and reference_embedding is not None and face_emb is not None:
                 similarity = float(np.dot(face_emb, reference_embedding))
-                if similarity < 0.8:
+                if similarity < identity_similarity_threshold:
                     should_skip = True
                     identity_skip_count += 1
             yaw_deg = 0.0
@@ -1186,6 +1188,7 @@ class LipsyncPipeline(DiffusionPipeline):
         face_jump_scale_threshold: float = 0.0,
         lipsync_continuity_max_center_shift: float = 0.35,
         lipsync_continuity_max_scale_change: float = 0.35,
+        identity_similarity_threshold: float = 0.72,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 0,
         side_face_episode_post_pad: int = 0,
@@ -1202,6 +1205,7 @@ class LipsyncPipeline(DiffusionPipeline):
             f"face_jump_scale_threshold={face_jump_scale_threshold}, "
             f"lipsync_continuity_max_center_shift={lipsync_continuity_max_center_shift}, "
             f"lipsync_continuity_max_scale_change={lipsync_continuity_max_scale_change}, "
+            f"identity_similarity_threshold={identity_similarity_threshold}, "
             f"apply_identity_filter={apply_identity_filter}"
         )
         if reference_embedding is None and face_embedder is not None:
@@ -1219,6 +1223,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 face_jump_scale_threshold=face_jump_scale_threshold,
                 lipsync_continuity_max_center_shift=lipsync_continuity_max_center_shift,
                 lipsync_continuity_max_scale_change=lipsync_continuity_max_scale_change,
+                identity_similarity_threshold=identity_similarity_threshold,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
@@ -1275,6 +1280,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 face_jump_scale_threshold=face_jump_scale_threshold,
                 lipsync_continuity_max_center_shift=lipsync_continuity_max_center_shift,
                 lipsync_continuity_max_scale_change=lipsync_continuity_max_scale_change,
+                identity_similarity_threshold=identity_similarity_threshold,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
@@ -1307,6 +1313,7 @@ class LipsyncPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         reference_embedding=None,
         face_embedder=None,
+        identity_similarity_threshold: float = 0.72,
         # --- quality / temporal gating (added 2026-06) ---
         temporal_smoothing_enabled: bool = True,
         # Preserve current-frame mouth-core motion after temporal smoothing.
@@ -1452,6 +1459,7 @@ class LipsyncPipeline(DiffusionPipeline):
             face_jump_scale_threshold=face_jump_scale_threshold,
             lipsync_continuity_max_center_shift=lipsync_continuity_max_center_shift,
             lipsync_continuity_max_scale_change=lipsync_continuity_max_scale_change,
+            identity_similarity_threshold=identity_similarity_threshold,
             apply_identity_filter=apply_identity_filter,
             side_face_episode_pre_pad=side_face_episode_pre_pad,
             side_face_episode_post_pad=side_face_episode_post_pad,
@@ -1932,6 +1940,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "face_jump_scale_threshold": face_jump_scale_threshold,
             "lipsync_continuity_max_center_shift": lipsync_continuity_max_center_shift,
             "lipsync_continuity_max_scale_change": lipsync_continuity_max_scale_change,
+            "identity_similarity_threshold": identity_similarity_threshold,
             "temporal_smoothing_enabled": temporal_smoothing_enabled,
             "mouth_motion_preserve_strength": mouth_motion_preserve_strength,
             "mouth_temporal_stabilization_strength": mouth_temporal_stabilization_strength,

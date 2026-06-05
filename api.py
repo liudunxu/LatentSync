@@ -95,7 +95,7 @@ class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     avatar_url: Optional[str] = Field(None, description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.55, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.72, ge=0.0, le=1.0)
     identity_margin: float = Field(0.05, ge=0.0, le=1.0)
     identity_cluster_threshold: float = Field(0.78, ge=0.0, le=1.0)
     default_identity_min_coverage: float = Field(0.5, ge=0.0, le=1.0)
@@ -1119,6 +1119,7 @@ class LatentSyncApiRuntime:
                 temp_dir=str(job_output_dir / "temp"),
                 reference_embedding=reference_embedding,
                 face_embedder=runtime.face_embedder,
+                identity_similarity_threshold=payload.similarity_threshold,
                 quality_gate_enabled=payload.quality_gate_enabled,
                 quality_min_laplacian=payload.quality_min_laplacian,
                 quality_min_sharpness_ratio=payload.quality_min_sharpness_ratio,
