@@ -270,25 +270,11 @@ class LipsyncPipeline(DiffusionPipeline):
 
     @staticmethod
     def _estimate_yaw_degrees(lmk: np.ndarray) -> float:
-        """Yaw estimation (degrees) from 106-point landmarks, multi-signal.
-
-        Combines three independent side-face signals and returns the most
-        conservative (largest) absolute yaw across them. Sign is inherited
-        from the nose-offset signal so downstream rate checks stay correct
-        when the face reverses direction mid-turn.
-
-        Why three signals: nose-offset alone misses strong foreshortening
-        and partial turns where the nose barely moves but the eye/mouth
-        cluster is already asymmetric. Adding eye-width and mouth-corner
-        asymmetry catches those cases without the false-positive risk of
-        a tighter nose-offset mapping alone.
-
-        Signal 1 - nose offset (signed). 0.4 → 30°, 0.6 → 45°, 0.8 → 60°.
-        Signal 2 - eye-width asymmetry (unsigned). Foreshortening compresses
-            the turned-away eye's X-spread; ratio=2.0 → 30°, 3.0 → 60°.
-        Signal 3 - mouth-corner asymmetry (unsigned). Outer corners 48/54
-            are at asymmetric distance from the nose tip when turned;
-            diff ratio 0.3 → 30°, 0.5 → 50°.
+        """Rough yaw estimation in degrees from 106-point landmarks.
+        0 ≈ frontal; positive means the face is turned so the nose appears
+        shifted to the subject's right in the image. Used as a coarse
+        prefilter to skip lip-sync on heavily side-on faces where the
+        affine alignment becomes unreliable.
         """
         if lmk is None or len(lmk) < 106:
             return 0.0
@@ -301,31 +287,12 @@ class LipsyncPipeline(DiffusionPipeline):
         inter_ocular = float(pt_right_eye[0] - pt_left_eye[0])
         if abs(inter_ocular) < 1e-3:
             return 0.0
-        half_eye = inter_ocular / 2.0
-
-        # Signal 1: nose offset (signed; positive = subject's right turn)
-        eye_mid_x = (pt_left_eye[0] + pt_right_eye[0]) / 2.0
-        nose_offset_frac = (pt_nose[0] - eye_mid_x) / half_eye
-        nose_yaw = nose_offset_frac * 75.0
-
-        # Signal 2: eye-width asymmetry (unsigned)
-        left_eye_x_range = float(np.ptp(lmk[[43, 48, 49, 51, 50], 0]))
-        right_eye_x_range = float(np.ptp(lmk[101:106, 0]))
-        eye_yaw = 0.0
-        if min(left_eye_x_range, right_eye_x_range) > 1e-3:
-            eye_asym = max(left_eye_x_range, right_eye_x_range) / min(left_eye_x_range, right_eye_x_range)
-            eye_yaw = max(0.0, (eye_asym - 1.0) * 30.0)
-
-        # Signal 3: mouth-corner asymmetry (unsigned)
-        d_left = float(np.linalg.norm(lmk[48] - pt_nose))
-        d_right = float(np.linalg.norm(lmk[54] - pt_nose))
-        mouth_yaw = 0.0
-        if min(d_left, d_right) > 1e-3:
-            mouth_asym = abs(d_left - d_right) / max(d_left, d_right)
-            mouth_yaw = mouth_asym * 100.0
-
-        sign = 1.0 if nose_yaw >= 0 else -1.0
-        return float(sign * max(abs(nose_yaw), eye_yaw, mouth_yaw))
+        expected = inter_ocular / 2.0
+        nose_to_left = float(abs(pt_nose[0] - pt_left_eye[0]))
+        # Positive when the nose is left of the eye midpoint (subject's right turn)
+        delta = (expected - nose_to_left) / expected
+        # Empirically: delta=0.5 ≈ 30°, delta=1.0 ≈ 60°. Keep linear, conservative.
+        return float(delta * 60.0)
 
     @staticmethod
     def _select_yaw_degrees(landmark_yaw: float, pose_yaw: Optional[float]) -> float:
