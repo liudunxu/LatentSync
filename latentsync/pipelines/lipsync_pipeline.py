@@ -663,6 +663,42 @@ class LipsyncPipeline(DiffusionPipeline):
         return LipsyncPipeline._face_sharpness(roi)
 
     @staticmethod
+    def _mouth_region_diff(prev_face: torch.Tensor, curr_face: torch.Tensor) -> float:
+        """Mean absolute diff in the mouth band of two aligned face crops.
+
+        Both inputs are (3, H, W) tensors in the same dtype/range. Returns
+        the diff normalized to [0, 1] (caller is responsible for the range
+        the input lives in -- the affine-transformed crops are uint8 in
+        [0, 255], so we divide by 255; if the caller passes already
+        normalized [-1, 1] tensors, divide by 2 instead).
+
+        This complements the embedding-similarity continuity break:
+        embedding answers "is this the same person", pixel diff answers
+        "has the content changed". Two people with similar embeddings
+        (cosine >= 0.70) still usually have 0.10-0.30 mouth-region diff,
+        so this catches face switches the embedding check misses -- and
+        it's robust to side faces where embedding models are unreliable.
+
+        Returns 0.0 on None / shape mismatch (defensive: never raises, so
+        a corrupt prior frame can't kill the whole affine pass).
+        """
+        if prev_face is None or curr_face is None:
+            return 0.0
+        if prev_face.shape != curr_face.shape:
+            return 0.0
+        if prev_face.dim() != 3:
+            return 0.0
+        try:
+            H, W = curr_face.shape[-2:]
+            y0, y1 = int(H * 0.55), int(H * 0.74)
+            x0, x1 = int(W * 0.30), int(W * 0.70)
+            prev = prev_face[..., y0:y1, x0:x1].to(torch.float32)
+            curr = curr_face[..., y0:y1, x0:x1].to(torch.float32)
+            return float((curr - prev).abs().mean().item()) / 255.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
     def _smooth_face_sequence(
         face_crops: torch.Tensor,
         prev_face: Optional[torch.Tensor],
@@ -814,6 +850,7 @@ class LipsyncPipeline(DiffusionPipeline):
         face_jump_scale_threshold: float = 0.0,
         lipsync_continuity_max_center_shift: float = 0.35,
         lipsync_continuity_max_scale_change: float = 0.35,
+        lipsync_mouth_diff_break_threshold: float = 0.10,
         identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 0,
@@ -831,6 +868,7 @@ class LipsyncPipeline(DiffusionPipeline):
             f"face_jump_scale_threshold={face_jump_scale_threshold}, "
             f"lipsync_continuity_max_center_shift={lipsync_continuity_max_center_shift}, "
             f"lipsync_continuity_max_scale_change={lipsync_continuity_max_scale_change}, "
+            f"lipsync_mouth_diff_break_threshold={lipsync_mouth_diff_break_threshold}, "
             f"identity_similarity_threshold={identity_similarity_threshold}, "
             f"apply_identity_filter={apply_identity_filter}"
         )
@@ -852,6 +890,7 @@ class LipsyncPipeline(DiffusionPipeline):
         face_jump_skip_count = 0
         temporal_identity_break_count = 0
         temporal_geometry_break_count = 0
+        temporal_diff_break_count = 0
         identity_skip_count = 0
         detect_fail_count = 0
         identity_similarities: List[float] = []
@@ -859,6 +898,7 @@ class LipsyncPipeline(DiffusionPipeline):
         prev_motion_state = None
         prev_temporal_motion_state = None
         prev_temporal_embedding = None
+        prev_temporal_face: Optional[torch.Tensor] = None
         continuity_break_mask = []
         print(f"Affine transforming {len(video_frames)} faces...")
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
@@ -880,6 +920,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 prev_motion_state = None
                 prev_temporal_motion_state = None
                 prev_temporal_embedding = None
+                prev_temporal_face = None
                 continuity_break_mask.append(True)
                 continue
             should_skip = False
@@ -965,6 +1006,21 @@ class LipsyncPipeline(DiffusionPipeline):
                     if geometry_break:
                         continuity_break = True
                         temporal_geometry_break_count += 1
+                # Mouth-region pixel diff: catches face switches the embedding
+                # check misses (similar-looking people, side faces). Strictly
+                # complementary to the embedding break: embedding asks "same
+                # person?", pixel diff asks "same content?". Cheap (one crop
+                # + abs + mean) so it doesn't gate the loop.
+                if (
+                    not continuity_break
+                    and lipsync_mouth_diff_break_threshold > 0
+                    and prev_temporal_face is not None
+                    and face is not None
+                ):
+                    mouth_diff = self._mouth_region_diff(prev_temporal_face, face)
+                    if mouth_diff > lipsync_mouth_diff_break_threshold:
+                        continuity_break = True
+                        temporal_diff_break_count += 1
             # Mouth occlusion: skip frames where the mouth is covered by a
             # hand, microphone, phone, mask, etc. Cheap pixel-ratio check on
             # the aligned face -- no model load.
@@ -1000,9 +1056,12 @@ class LipsyncPipeline(DiffusionPipeline):
                 prev_temporal_motion_state = motion_state
             if not should_skip and face_emb is not None:
                 prev_temporal_embedding = face_emb
+            if not should_skip and face is not None:
+                prev_temporal_face = face
             if should_skip:
                 prev_temporal_motion_state = None
                 prev_temporal_embedding = None
+                prev_temporal_face = None
         logger.info(
             f"[FaceMatch] detect_fail={detect_fail_count}, identity_skip={identity_skip_count}, "
             f"yaw_skip={yaw_skip_count}, yaw_rate_skip={yaw_rate_skip_count}, "
@@ -1010,7 +1069,8 @@ class LipsyncPipeline(DiffusionPipeline):
             f"motion_blur_skip={motion_blur_skip_count}, "
             f"face_jump_skip={face_jump_skip_count}, "
             f"temporal_identity_break={temporal_identity_break_count}, "
-            f"temporal_geometry_break={temporal_geometry_break_count}"
+            f"temporal_geometry_break={temporal_geometry_break_count}, "
+            f"temporal_diff_break={temporal_diff_break_count}"
         )
         if identity_similarities:
             logger.info(
@@ -1026,6 +1086,7 @@ class LipsyncPipeline(DiffusionPipeline):
         self._last_motion_blur_skip_count = motion_blur_skip_count
         self._last_face_jump_skip_count = face_jump_skip_count
         self._last_identity_skip_count = identity_skip_count
+        self._last_temporal_diff_break_count = temporal_diff_break_count
         self._last_identity_similarity_stats = {
             "min": float(min(identity_similarities)) if identity_similarities else 0.0,
             "median": float(statistics.median(identity_similarities)) if identity_similarities else 0.0,
@@ -1204,6 +1265,7 @@ class LipsyncPipeline(DiffusionPipeline):
         face_jump_scale_threshold: float = 0.0,
         lipsync_continuity_max_center_shift: float = 0.35,
         lipsync_continuity_max_scale_change: float = 0.35,
+        lipsync_mouth_diff_break_threshold: float = 0.10,
         identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 0,
@@ -1221,6 +1283,7 @@ class LipsyncPipeline(DiffusionPipeline):
             f"face_jump_scale_threshold={face_jump_scale_threshold}, "
             f"lipsync_continuity_max_center_shift={lipsync_continuity_max_center_shift}, "
             f"lipsync_continuity_max_scale_change={lipsync_continuity_max_scale_change}, "
+            f"lipsync_mouth_diff_break_threshold={lipsync_mouth_diff_break_threshold}, "
             f"identity_similarity_threshold={identity_similarity_threshold}, "
             f"apply_identity_filter={apply_identity_filter}"
         )
@@ -1239,6 +1302,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 face_jump_scale_threshold=face_jump_scale_threshold,
                 lipsync_continuity_max_center_shift=lipsync_continuity_max_center_shift,
                 lipsync_continuity_max_scale_change=lipsync_continuity_max_scale_change,
+                lipsync_mouth_diff_break_threshold=lipsync_mouth_diff_break_threshold,
                 identity_similarity_threshold=identity_similarity_threshold,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
@@ -1296,6 +1360,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 face_jump_scale_threshold=face_jump_scale_threshold,
                 lipsync_continuity_max_center_shift=lipsync_continuity_max_center_shift,
                 lipsync_continuity_max_scale_change=lipsync_continuity_max_scale_change,
+                lipsync_mouth_diff_break_threshold=lipsync_mouth_diff_break_threshold,
                 identity_similarity_threshold=identity_similarity_threshold,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
@@ -1388,6 +1453,15 @@ class LipsyncPipeline(DiffusionPipeline):
         # across large landmark jumps without necessarily skipping the frame.
         lipsync_continuity_max_center_shift: float = 0.35,
         lipsync_continuity_max_scale_change: float = 0.35,
+        # Mouth-region pixel diff break: complementary to the embedding
+        # similarity check above. When the mouth region mean abs diff
+        # between consecutive aligned face crops exceeds this fraction,
+        # treat the next frame as a continuity break -- this catches
+        # face switches the embedding check misses (similar-looking
+        # people, side faces). 0 disables. Default 0.10 is well above
+        # same-person expression/pose diff (~0.02-0.05) and well below
+        # cross-person diff (~0.10-0.30).
+        lipsync_mouth_diff_break_threshold: float = 0.10,
         # Audio-energy prefilter: skip sustained silent runs before diffusion.
         silent_skip_enabled: bool = False,
         silent_rms_threshold: float = 0.003,
@@ -1475,6 +1549,7 @@ class LipsyncPipeline(DiffusionPipeline):
             face_jump_scale_threshold=face_jump_scale_threshold,
             lipsync_continuity_max_center_shift=lipsync_continuity_max_center_shift,
             lipsync_continuity_max_scale_change=lipsync_continuity_max_scale_change,
+            lipsync_mouth_diff_break_threshold=lipsync_mouth_diff_break_threshold,
             identity_similarity_threshold=identity_similarity_threshold,
             apply_identity_filter=apply_identity_filter,
             side_face_episode_pre_pad=side_face_episode_pre_pad,
@@ -1957,6 +2032,8 @@ class LipsyncPipeline(DiffusionPipeline):
             "face_jump_scale_threshold": face_jump_scale_threshold,
             "lipsync_continuity_max_center_shift": lipsync_continuity_max_center_shift,
             "lipsync_continuity_max_scale_change": lipsync_continuity_max_scale_change,
+            "lipsync_mouth_diff_break_threshold": lipsync_mouth_diff_break_threshold,
+            "temporal_diff_break_count": getattr(self, "_last_temporal_diff_break_count", 0),
             "identity_similarity_threshold": identity_similarity_threshold,
             "identity_similarity": getattr(
                 self,

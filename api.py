@@ -117,6 +117,17 @@ class LipSyncRequest(BaseModel):
     lipsync_continuity_max_gap_seconds: float = Field(0.35, ge=0.0, le=2.0)
     lipsync_continuity_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
     lipsync_continuity_max_scale_change: float = Field(0.35, ge=0.0, le=2.0)
+    # Mouth-region pixel diff break: complementary to the embedding
+    # similarity check. When the mouth region mean abs diff between
+    # consecutive aligned face crops exceeds this fraction, treat the
+    # next frame as a continuity break -- catches face switches the
+    # embedding check misses (similar-looking people, side faces).
+    # 0 disables. Default 0.10 is above same-person expression/pose
+    # diff (~0.02-0.05) and below cross-person diff (~0.10-0.30).
+    lipsync_mouth_diff_break_threshold: float = Field(
+        0.10, ge=0.0, le=1.0,
+        description="Mouth-region mean abs diff break threshold; 0 disables.",
+    )
     target_bbox_smoothing_window: int = Field(3, ge=1, le=15)
     target_bbox_smoothing_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
@@ -1137,6 +1148,7 @@ class LatentSyncApiRuntime:
                 face_jump_scale_threshold=payload.face_jump_scale_threshold,
                 lipsync_continuity_max_center_shift=payload.lipsync_continuity_max_center_shift,
                 lipsync_continuity_max_scale_change=payload.lipsync_continuity_max_scale_change,
+                lipsync_mouth_diff_break_threshold=payload.lipsync_mouth_diff_break_threshold,
                 silent_skip_enabled=payload.speech_gate_enabled,
                 silent_rms_threshold=payload.speech_gate_min_rms,
                 silent_min_run_frames=max(
