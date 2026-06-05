@@ -1046,6 +1046,19 @@ class LipsyncPipeline(DiffusionPipeline):
         #     represent a "side face" and shouldn't trigger the episode pad).
         yaws: List[Optional[float]] = []
         yaw_skip_reasons: List[bool] = []
+        if video_frames is None or len(video_frames) == 0:
+            # Empty input: don't crash with `stack expects a non-empty TensorList`.
+            # `restore_video` already returns the empty array as a no-op downstream.
+            logger.error("[FaceMatch] empty video_frames (len=0 or None); skipping affine transform")
+            empty_zeros = torch.zeros(0, 3, self.image_processor.resolution, self.image_processor.resolution)
+            return (
+                empty_zeros,
+                [],
+                [],
+                [],
+                [],
+                [],
+            )
         yaw_skip_count = 0
         yaw_rate_skip_count = 0
         mouth_occlusion_skip_count = 0
