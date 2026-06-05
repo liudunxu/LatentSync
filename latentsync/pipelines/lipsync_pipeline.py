@@ -1025,6 +1025,7 @@ class LipsyncPipeline(DiffusionPipeline):
         self._last_mouth_occlusion_skip_count = mouth_occlusion_skip_count
         self._last_motion_blur_skip_count = motion_blur_skip_count
         self._last_face_jump_skip_count = face_jump_skip_count
+        self._last_identity_skip_count = identity_skip_count
         self._last_identity_similarity_stats = {
             "min": float(min(identity_similarities)) if identity_similarities else 0.0,
             "median": float(statistics.median(identity_similarities)) if identity_similarities else 0.0,
@@ -1934,6 +1935,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "silent_pad_frames": silent_pad_frames,
             "skipped_inference_batches": skipped_inference_batches,
             "skipped_inference_frames": skipped_inference_frames,
+            "identity_skip_count": getattr(self, "_last_identity_skip_count", 0),
             "yaw_skip_count": getattr(self, "_last_yaw_skip_count", 0),
             "yaw_rate_skip_count": getattr(self, "_last_yaw_rate_skip_count", 0),
             "mouth_occlusion_skip_count": getattr(self, "_last_mouth_occlusion_skip_count", 0),

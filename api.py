@@ -1193,6 +1193,7 @@ class LatentSyncApiRuntime:
             skipped_inference_batches = int(run_stats.get("skipped_inference_batches", 0))
             skipped_inference_frames = int(run_stats.get("skipped_inference_frames", 0))
             identity_similarity_stats = run_stats.get("identity_similarity") or {}
+            identity_skip_count = int(run_stats.get("identity_skip_count", 0))
             codeformer_stats = run_stats.get("codeformer") or {}
             mouth_temporal_stats = run_stats.get("mouth_temporal") or {}
 
@@ -1236,6 +1237,7 @@ class LatentSyncApiRuntime:
                 "effective_generated_output_frames": effective_generated_frames,
                 "skipped_output_frames": effective_skip_frames,
                 "best_similarity": 0.0,
+                "identity_skip_count": identity_skip_count,
                 "identity_similarity_min": float(identity_similarity_stats.get("min", 0.0)),
                 "identity_similarity_median": float(identity_similarity_stats.get("median", 0.0)),
                 "identity_similarity_max": float(identity_similarity_stats.get("max", 0.0)),
@@ -1370,10 +1372,6 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
 
     video_path = _download_to_file(payload.video_url, job_input_dir, "video", VIDEO_SUFFIXES, ".mp4")
     audio_path = _download_to_file(payload.audio_url, job_input_dir, "audio", AUDIO_SUFFIXES, ".wav")
-    # avatar_url is accepted for compatibility but ignored by LatentSync
-    if payload.avatar_url:
-        _download_to_file(payload.avatar_url, job_input_dir, "avatar", IMAGE_SUFFIXES, ".jpg")
-
     try:
         input_paths = {"video": video_path, "audio": audio_path}
         reference_embedding = None
@@ -1386,11 +1384,28 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
                 if avatar_frame is not None:
                     faces = runtime.face_embedder.get(avatar_frame)
                     if faces:
-                        emb = getattr(faces[0], "normed_embedding", None)
+                        def _avatar_face_score(face) -> float:
+                            bbox = getattr(face, "bbox", None)
+                            area = 0.0
+                            if bbox is not None:
+                                x1, y1, x2, y2 = [float(v) for v in bbox]
+                                area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+                            return area * max(0.0, float(getattr(face, "det_score", 1.0)))
+
+                        selected_face = max(faces, key=_avatar_face_score)
+                        emb = getattr(selected_face, "normed_embedding", None)
                         if emb is not None:
                             import numpy as np
                             reference_embedding = np.asarray(emb, dtype=np.float32)
-                            logger.info(f"[LipSync] Loaded reference face embedding, shape={reference_embedding.shape}")
+                            selected_bbox = getattr(selected_face, "bbox", None)
+                            selected_score = float(getattr(selected_face, "det_score", 0.0))
+                            logger.info(
+                                "[LipSync] Loaded reference face embedding, faces=%d, selected_score=%.3f, selected_bbox=%s, shape=%s",
+                                len(faces),
+                                selected_score,
+                                selected_bbox,
+                                reference_embedding.shape,
+                            )
                         else:
                             logger.warning(f"[LipSync] No embedding found in avatar face")
                     else:
