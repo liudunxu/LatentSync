@@ -814,7 +814,7 @@ class LipsyncPipeline(DiffusionPipeline):
         face_jump_scale_threshold: float = 0.0,
         lipsync_continuity_max_center_shift: float = 0.35,
         lipsync_continuity_max_scale_change: float = 0.35,
-        identity_similarity_threshold: float = 0.72,
+        identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 0,
         side_face_episode_post_pad: int = 0,
@@ -854,6 +854,7 @@ class LipsyncPipeline(DiffusionPipeline):
         temporal_geometry_break_count = 0
         identity_skip_count = 0
         detect_fail_count = 0
+        identity_similarities: List[float] = []
         prev_yaw: Optional[float] = None
         prev_motion_state = None
         prev_temporal_motion_state = None
@@ -884,6 +885,7 @@ class LipsyncPipeline(DiffusionPipeline):
             should_skip = False
             if apply_identity_filter and reference_embedding is not None and face_emb is not None:
                 similarity = float(np.dot(face_emb, reference_embedding))
+                identity_similarities.append(similarity)
                 if similarity < identity_similarity_threshold:
                     should_skip = True
                     identity_skip_count += 1
@@ -1010,11 +1012,24 @@ class LipsyncPipeline(DiffusionPipeline):
             f"temporal_identity_break={temporal_identity_break_count}, "
             f"temporal_geometry_break={temporal_geometry_break_count}"
         )
+        if identity_similarities:
+            logger.info(
+                "[FaceMatch] identity similarity: min=%.3f median=%.3f max=%.3f threshold=%.3f",
+                min(identity_similarities),
+                statistics.median(identity_similarities),
+                max(identity_similarities),
+                identity_similarity_threshold,
+            )
         self._last_yaw_skip_count = yaw_skip_count
         self._last_yaw_rate_skip_count = yaw_rate_skip_count
         self._last_mouth_occlusion_skip_count = mouth_occlusion_skip_count
         self._last_motion_blur_skip_count = motion_blur_skip_count
         self._last_face_jump_skip_count = face_jump_skip_count
+        self._last_identity_similarity_stats = {
+            "min": float(min(identity_similarities)) if identity_similarities else 0.0,
+            "median": float(statistics.median(identity_similarities)) if identity_similarities else 0.0,
+            "max": float(max(identity_similarities)) if identity_similarities else 0.0,
+        }
 
         # Episode-level side-face filter: a contiguous run of yaw-skipped
         # frames represents a single turning motion. The frames immediately
@@ -1188,7 +1203,7 @@ class LipsyncPipeline(DiffusionPipeline):
         face_jump_scale_threshold: float = 0.0,
         lipsync_continuity_max_center_shift: float = 0.35,
         lipsync_continuity_max_scale_change: float = 0.35,
-        identity_similarity_threshold: float = 0.72,
+        identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 0,
         side_face_episode_post_pad: int = 0,
@@ -1313,7 +1328,7 @@ class LipsyncPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         reference_embedding=None,
         face_embedder=None,
-        identity_similarity_threshold: float = 0.72,
+        identity_similarity_threshold: float = 0.5,
         # --- quality / temporal gating (added 2026-06) ---
         temporal_smoothing_enabled: bool = True,
         # Preserve current-frame mouth-core motion after temporal smoothing.
@@ -1941,6 +1956,11 @@ class LipsyncPipeline(DiffusionPipeline):
             "lipsync_continuity_max_center_shift": lipsync_continuity_max_center_shift,
             "lipsync_continuity_max_scale_change": lipsync_continuity_max_scale_change,
             "identity_similarity_threshold": identity_similarity_threshold,
+            "identity_similarity": getattr(
+                self,
+                "_last_identity_similarity_stats",
+                {"min": 0.0, "median": 0.0, "max": 0.0},
+            ),
             "temporal_smoothing_enabled": temporal_smoothing_enabled,
             "mouth_motion_preserve_strength": mouth_motion_preserve_strength,
             "mouth_temporal_stabilization_strength": mouth_temporal_stabilization_strength,

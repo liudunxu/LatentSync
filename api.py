@@ -95,7 +95,7 @@ class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     avatar_url: Optional[str] = Field(None, description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.72, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.5, ge=0.0, le=1.0)
     identity_margin: float = Field(0.05, ge=0.0, le=1.0)
     identity_cluster_threshold: float = Field(0.78, ge=0.0, le=1.0)
     default_identity_min_coverage: float = Field(0.5, ge=0.0, le=1.0)
@@ -1192,6 +1192,7 @@ class LatentSyncApiRuntime:
             silent_skip_frames = int(run_stats.get("silent_skip_frames", 0))
             skipped_inference_batches = int(run_stats.get("skipped_inference_batches", 0))
             skipped_inference_frames = int(run_stats.get("skipped_inference_frames", 0))
+            identity_similarity_stats = run_stats.get("identity_similarity") or {}
             codeformer_stats = run_stats.get("codeformer") or {}
             mouth_temporal_stats = run_stats.get("mouth_temporal") or {}
 
@@ -1235,6 +1236,10 @@ class LatentSyncApiRuntime:
                 "effective_generated_output_frames": effective_generated_frames,
                 "skipped_output_frames": effective_skip_frames,
                 "best_similarity": 0.0,
+                "identity_similarity_min": float(identity_similarity_stats.get("min", 0.0)),
+                "identity_similarity_median": float(identity_similarity_stats.get("median", 0.0)),
+                "identity_similarity_max": float(identity_similarity_stats.get("max", 0.0)),
+                "identity_similarity_threshold": float(run_stats.get("identity_similarity_threshold", payload.similarity_threshold)),
                 "target_identity_similarity": 0.0,
                 "target_identity_count": 0,
                 "target_identity_coverage": 0.0,
