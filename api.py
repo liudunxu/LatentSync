@@ -288,12 +288,12 @@ class LipSyncRequest(BaseModel):
 class FaceListRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     similarity_threshold: float = Field(0.78, ge=0.0, le=1.0)
-    frame_sample_interval: int = Field(0, ge=0, le=300, description="0 means sample about 2 frames per second")
+    frame_sample_interval: int = Field(1, ge=0, le=300, description="0 means sample about 2 frames per second; 1 scans every frame")
     max_frames: int = Field(0, ge=0, description="0 means scan all sampled frames")
-    min_face_area: int = Field(400, ge=1)
-    min_detection_score: float = Field(0.8, ge=0.0, le=1.0)
-    require_face_embedding: bool = True
-    require_landmark_match: bool = True
+    min_face_area: int = Field(100, ge=1)
+    min_detection_score: float = Field(0.35, ge=0.0, le=1.0)
+    require_face_embedding: bool = False
+    require_landmark_match: bool = False
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
     crop_padding: float = Field(0.8, ge=0.0, le=1.5)
@@ -857,11 +857,11 @@ class LatentSyncApiRuntime:
             det_score = float(getattr(face, "det_score", 0.5))
             raw_bbox = np.array(bbox).astype(np.int_)
             w, h = raw_bbox[2] - raw_bbox[0], raw_bbox[3] - raw_bbox[1]
-            if w < 50 or h < 80:
+            if w < 16 or h < 16:
                 continue
-            if w / h > 1.5 or w / h < 0.2:
+            if w / h > 4.0 or w / h < 0.1:
                 continue
-            if det_score < 0.5:
+            if det_score < 0.25:
                 continue
             lmk = getattr(face, "landmark_2d_106", None)
             if lmk is None:
