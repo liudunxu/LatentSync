@@ -39,6 +39,11 @@ from ..utils.image_processor import ImageProcessor, load_fixed_mask
 from ..whisper.audio2feature import Audio2Feature
 import tqdm
 import soundfile as sf
+from typing import Dict, List, Optional, Tuple
+
+MOUTH_OUTER_LANDMARKS = [48, 54, 51, 57]
+MOUTH_INNER_LANDMARKS = [52, 58, 67, 61]
+MOUTH_ALL_LANDMARKS = sorted(set(MOUTH_OUTER_LANDMARKS + MOUTH_INNER_LANDMARKS))
 
 logger = logging.getLogger(__name__)
 
@@ -462,17 +467,22 @@ class LipsyncPipeline(DiffusionPipeline):
             return face
 
     @staticmethod
-    def _mouth_core_mask(mask: torch.Tensor, mouth_keep: float = 0.78) -> torch.Tensor:
+    def _mouth_core_mask(mask: torch.Tensor, mouth_keep: float = 0.78, mouth_center_norm: Optional[Tuple[float, float]] = None) -> torch.Tensor:
         """Return the central mouth-motion area inside an inpaint mask.
 
         `mask` is 1 where the model-generated lower face is visible. The
         returned mask keeps the lip aperture and lip contour protected from
         detail restoration, while allowing cheeks/chin around it to recover
         reference texture.
+
+        `mouth_center_norm` is an optional (cx, cy) tuple in [0,1]
+        normalized coordinates specifying the actual mouth center in the
+        aligned face. When None, falls back to the default (0.50, 0.66).
         """
         if mask is None:
             return mask
         try:
+            cx_norm, cy_norm = mouth_center_norm if mouth_center_norm is not None else (0.50, 0.66)
             m = mask.detach().to(torch.float32)
             squeeze = False
             if m.dim() == 2:
@@ -487,9 +497,7 @@ class LipsyncPipeline(DiffusionPipeline):
             B, _, H, W = base.shape
             yy = torch.linspace(0.0, 1.0, H, dtype=torch.float32, device=base.device).view(1, 1, H, 1)
             xx = torch.linspace(0.0, 1.0, W, dtype=torch.float32, device=base.device).view(1, 1, 1, W)
-            # Aligned-face mouth center: roughly x=0.5, y=0.66. Ellipse is
-            # intentionally wider than the aperture so lip motion survives.
-            ell = ((xx - 0.50) / 0.22) ** 2 + ((yy - 0.66) / 0.12) ** 2
+            ell = ((xx - cx_norm) / 0.22) ** 2 + ((yy - cy_norm) / 0.12) ** 2
             core = (1.0 - (ell - mouth_keep) / max(1e-6, 1.0 - mouth_keep)).clamp(0.0, 1.0)
             core = base * core.expand(B, 1, H, W)
             if mask.dim() == 4 and mask.shape[1] == 3:
@@ -565,6 +573,130 @@ class LipsyncPipeline(DiffusionPipeline):
             return out.clamp(-1.0, 1.0).to(face.dtype)
         except Exception:
             return face
+
+    @staticmethod
+    def compute_aligned_mouth_info(
+        lmk: Optional[np.ndarray],
+        affine_matrix,  # np.ndarray (2,3) or torch.Tensor (1,2,3) or (2,3)
+        resolution: int,
+    ) -> Optional[Dict[str, float]]:
+        """Compute mouth center, width, and height in aligned face space.
+
+        Returns dict with keys: center_x, center_y, half_width, half_height,
+        or None if landmarks are unavailable.
+        """
+        if lmk is None or len(lmk) < max(MOUTH_OUTER_LANDMARKS) + 1:
+            return None
+        try:
+            M = np.array(affine_matrix, dtype=np.float64)
+            if M.ndim == 3:
+                M = M.squeeze(0)
+            if M.shape != (2, 3):
+                return None
+            outer_pts = lmk[MOUTH_OUTER_LANDMARKS].astype(np.float64)  # (4, 2)
+            ones = np.ones((outer_pts.shape[0], 1), dtype=np.float64)
+            pts_h = np.concatenate([outer_pts, ones], axis=1)  # (4, 3)
+            aligned_pts = (M @ pts_h.T).T  # (4, 2)
+            left_corner = aligned_pts[0]   # landmark 48
+            right_corner = aligned_pts[1]  # landmark 54
+            top_center = aligned_pts[2]    # landmark 51
+            bottom_center = aligned_pts[3] # landmark 57
+
+            center_x = float(np.mean(aligned_pts[:, 0]))
+            center_y = float(np.mean(aligned_pts[:, 1]))
+            half_width = float(np.linalg.norm(right_corner - left_corner) / 2.0)
+            half_height = float(
+                max(np.linalg.norm(bottom_center - top_center) / 2.0, 2.0)
+            )
+            if half_width < 1.0 or half_height < 1.0:
+                return None
+            center_x = max(0.0, min(float(resolution), center_x))
+            center_y = max(0.0, min(float(resolution), center_y))
+            return {
+                "center_x": center_x,
+                "center_y": center_y,
+                "half_width": half_width,
+                "half_height": half_height,
+            }
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def generate_dynamic_mouth_mask(
+        mouth_info: Optional[Dict[str, float]],
+        resolution: int,
+        fallback_center_x_norm: float = 0.50,
+        fallback_center_y_norm: float = 0.66,
+        fallback_rx_norm: float = 0.225,
+        fallback_ry_norm: float = 0.155,
+        pad_width_ratio: float = 1.5,
+        pad_height_top_ratio: float = 1.3,
+        pad_height_bottom_ratio: float = 2.2,
+        chin_extend_norm: float = 0.04,
+        feather_sigma_px: float = 7.0,
+        min_ry_norm: float = 0.10,
+        min_rx_norm: float = 0.12,
+        max_ry_norm: float = 0.30,
+        max_rx_norm: float = 0.40,
+    ) -> torch.Tensor:
+        """Generate a per-frame mouth inpainting mask from landmark info.
+
+        Returns a (1, H, W) tensor in [0, 1] where 1 = keep (preserve) and
+        0 = inpaint (regenerate). This uses the same convention as the fixed
+        mask -- 1 outside the mouth (preserved original) and 0 inside the mouth
+        (to be regenerated by the inpainter).
+
+        When ``mouth_info`` is None (face not detected or landmarks unavailable),
+        falls back to a default elliptical mask matching the old hard-coded
+        ``_mouth_core_mask`` geometry.
+        """
+        H = W = resolution
+        if mouth_info is not None:
+            cx = mouth_info["center_x"] / resolution
+            cy = mouth_info["center_y"] / resolution
+            hw = mouth_info["half_width"] / resolution
+            hh = mouth_info["half_height"] / resolution
+            rx = hw * pad_width_ratio
+            ry_top = hh * pad_height_top_ratio
+            ry_bottom = hh * pad_height_bottom_ratio + chin_extend_norm
+            ry = (ry_top + ry_bottom) / 2.0
+            cy = cy + (ry_bottom - ry_top) / 2.0
+            rx = max(min_rx_norm, min(max_rx_norm, rx))
+            ry = max(min_ry_norm, min(max_ry_norm, ry))
+        else:
+            cx = fallback_center_x_norm
+            cy = fallback_center_y_norm
+            rx = fallback_rx_norm
+            ry = fallback_ry_norm
+
+        yy = torch.linspace(0.0, 1.0, H, dtype=torch.float32).view(H, 1)
+        xx = torch.linspace(0.0, 1.0, W, dtype=torch.float32).view(1, W)
+        ellipse = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2
+        inpaint_region = (ellipse <= 1.0).float()
+
+        if feather_sigma_px > 0:
+            k = int(2 * round(3 * feather_sigma_px) + 1)
+            sigma = feather_sigma_px
+            kernel_1d = torch.exp(
+                -0.5 * (torch.arange(k, dtype=torch.float32) - k // 2).pow(2) / sigma ** 2
+            )
+            kernel_1d = kernel_1d / kernel_1d.sum()
+            kernel_2d = kernel_1d.view(1, 1, 1, k) * kernel_1d.view(1, 1, k, 1)
+            kx = kernel_1d.view(1, 1, 1, k).expand(1, 1, 1, k)
+            ky = kernel_1d.view(1, 1, k, 1).expand(1, 1, k, 1)
+            inpaint_4d = inpaint_region.unsqueeze(0).unsqueeze(0)
+            pad_size = k // 2
+            padded = torch.nn.functional.pad(inpaint_4d, (pad_size, pad_size, 0, 0), mode="reflect")
+            padded = torch.nn.functional.pad(padded, (0, 0, pad_size, pad_size), mode="reflect")
+            smoothed = torch.nn.functional.conv2d(padded, kx, groups=1)
+            smoothed = torch.nn.functional.conv2d(smoothed, ky, groups=1)
+            inpaint_region = smoothed.squeeze(0).squeeze(0)
+            inner_ellipse = ((xx - cx) / (rx * 0.75)) ** 2 + ((yy - cy) / (ry * 0.75)) ** 2
+            inpaint_region = torch.where(inner_ellipse <= 1.0, torch.ones_like(inpaint_region), inpaint_region)
+            inpaint_region = torch.where(ellipse > 1.0, torch.zeros_like(inpaint_region), inpaint_region)
+
+        keep_mask = 1.0 - inpaint_region
+        return keep_mask.unsqueeze(0)
 
     @staticmethod
     def _mouth_occlusion_score(face: torch.Tensor) -> float:
@@ -876,6 +1008,7 @@ class LipsyncPipeline(DiffusionPipeline):
         boxes = []
         affine_matrices = []
         skip_mask = []
+        aligned_mouth_info: List[Optional[Dict[str, float]]] = []
         # Parallel arrays used by the episode-level side-face filter below:
         #   yaws[k] is the per-frame yaw in degrees (None for detect-fail frames)
         #   yaw_skip_reasons[k] is True iff THIS frame was skipped for yaw alone
@@ -914,6 +1047,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 faces.append(torch.zeros(3, self.image_processor.resolution, self.image_processor.resolution))
                 boxes.append([0, 0, 0, 0])
                 affine_matrices.append(np.eye(3))
+                aligned_mouth_info.append(None)
                 yaws.append(None)
                 yaw_skip_reasons.append(False)
                 prev_yaw = None  # reset so we don't carry a stale yaw across a detect-fail gap
@@ -1050,6 +1184,10 @@ class LipsyncPipeline(DiffusionPipeline):
             faces.append(face)
             boxes.append(box)
             affine_matrices.append(affine_matrix)
+            mouth_info = self.compute_aligned_mouth_info(
+                lmk, affine_matrix, self.image_processor.resolution
+            )
+            aligned_mouth_info.append(mouth_info)
             prev_yaw = yaw_deg if (yaw_skip_threshold > 0 and yaw_available) else None
             if not should_skip and motion_state is not None:
                 prev_motion_state = motion_state
@@ -1174,7 +1312,7 @@ class LipsyncPipeline(DiffusionPipeline):
             )
 
         faces_tensor = torch.stack(faces)
-        return faces_tensor, boxes, affine_matrices, skip_mask, continuity_break_mask
+        return faces_tensor, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info
 
     def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, skip_mask=None):
         video_frames = video_frames[: len(faces)]
@@ -1291,7 +1429,7 @@ class LipsyncPipeline(DiffusionPipeline):
             reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
             logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
         if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices, frame_skip_mask, frame_continuity_break_mask = self.affine_transform_video(
+            faces, boxes, affine_matrices, frame_skip_mask, frame_continuity_break_mask, frame_aligned_mouth_info = self.affine_transform_video(
                 video_frames,
                 reference_embedding,
                 yaw_skip_threshold=yaw_skip_threshold,
@@ -1317,6 +1455,7 @@ class LipsyncPipeline(DiffusionPipeline):
             loop_affine_matrices = []
             loop_skip_mask = []
             loop_continuity_break_mask = []
+            loop_aligned_mouth_info = []
             for i in range(num_loops):
                 if i % 2 == 0:
                     loop_video_frames.append(video_frames)
@@ -1324,6 +1463,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     loop_boxes += boxes
                     loop_affine_matrices += affine_matrices
                     loop_skip_mask += frame_skip_mask
+                    loop_aligned_mouth_info += frame_aligned_mouth_info
                     loop_continuity_break_mask += [
                         (True if i > 0 and k == 0 else value)
                         for k, value in enumerate(frame_continuity_break_mask)
@@ -1334,6 +1474,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     loop_boxes += boxes[::-1]
                     loop_affine_matrices += affine_matrices[::-1]
                     loop_skip_mask += frame_skip_mask[::-1]
+                    loop_aligned_mouth_info += frame_aligned_mouth_info[::-1]
                     n_breaks = len(frame_continuity_break_mask)
                     reversed_breaks = [
                         True if k == 0 else frame_continuity_break_mask[n_breaks - k]
@@ -1347,9 +1488,10 @@ class LipsyncPipeline(DiffusionPipeline):
             affine_matrices = loop_affine_matrices[: len(whisper_chunks)]
             skip_mask = loop_skip_mask[: len(whisper_chunks)]
             continuity_break_mask = loop_continuity_break_mask[: len(whisper_chunks)]
+            aligned_mouth_info = loop_aligned_mouth_info[: len(whisper_chunks)]
         else:
             video_frames = video_frames[: len(whisper_chunks)]
-            faces, boxes, affine_matrices, frame_skip_mask, continuity_break_mask = self.affine_transform_video(
+            faces, boxes, affine_matrices, frame_skip_mask, continuity_break_mask, frame_aligned_mouth_info = self.affine_transform_video(
                 video_frames,
                 reference_embedding,
                 yaw_skip_threshold=yaw_skip_threshold,
@@ -1369,8 +1511,9 @@ class LipsyncPipeline(DiffusionPipeline):
                 side_face_warn_min_run_frames=side_face_warn_min_run_frames,
             )
             skip_mask = frame_skip_mask
+            aligned_mouth_info = frame_aligned_mouth_info
 
-        return video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask
+        return video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info
 
     @torch.no_grad()
     def __call__(
@@ -1542,7 +1685,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # not reliable enough to reject other frames (false positives on
         # busy/occluded faces), so we keep all detected faces.
         apply_identity_filter = reference_embedding is not None
-        video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask = self.loop_video(
+        video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info = self.loop_video(
             whisper_chunks,
             video_frames,
             reference_embedding=reference_embedding,
@@ -1676,8 +1819,18 @@ class LipsyncPipeline(DiffusionPipeline):
             else:
                 audio_embeds = None
             latents = all_latents[:, :, batch_start:batch_end]
+            # Generate per-frame dynamic masks from aligned mouth landmarks
+            batch_mouth_info = aligned_mouth_info[batch_start:batch_end]
+            per_frame_masks = []
+            for k in range(len(batch_mouth_info)):
+                mi = batch_mouth_info[k]
+                dynamic_mask = self.generate_dynamic_mouth_mask(
+                    mi, height
+                )  # (1, H, W), 1=keep, 0=inpaint
+                per_frame_masks.append(dynamic_mask)
+            dynamic_mask_batch = torch.stack(per_frame_masks)  # (B, 1, H, W)
             ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
-                inference_faces, affine_transform=False
+                inference_faces, affine_transform=False, per_frame_masks=dynamic_mask_batch
             )
 
             # 7. Prepare mask latent variables
@@ -1793,6 +1946,14 @@ class LipsyncPipeline(DiffusionPipeline):
                         f"(~0 means model output was overwritten by ref)"
                     )
 
+            # Compute per-frame mouth center norm from aligned landmarks for
+            # dynamic mask positioning in _mouth_core_mask calls below.
+            first_center = None
+            for mi in batch_mouth_info:
+                if mi is not None:
+                    first_center = (mi["center_x"] / height, mi["center_y"] / height)
+                    break
+
             # Temporal EMA across face crops (cross-batch state via prev_face).
             # region_mask restricts the EMA to the inpaint area: outside the
             # mask the face stays as the raw inpainter+paste-back output, so
@@ -1810,7 +1971,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     region_mask=generated_region_mask,
                 )
                 if mouth_motion_preserve_strength > 0:
-                    mouth_motion_mask = self._mouth_core_mask(generated_region_mask).to(
+                    mouth_motion_mask = self._mouth_core_mask(generated_region_mask, mouth_center_norm=first_center).to(
                         device=decoded_latents.device,
                         dtype=decoded_latents.dtype,
                     )
@@ -1828,7 +1989,7 @@ class LipsyncPipeline(DiffusionPipeline):
                         * (current_mouth_motion - decoded_latents)
                     )
             if mouth_temporal_stabilization_strength > 0:
-                mouth_stabilize_mask = self._mouth_core_mask(generated_region_mask).to(
+                mouth_stabilize_mask = self._mouth_core_mask(generated_region_mask, mouth_center_norm=first_center).to(
                     device=decoded_latents.device,
                     dtype=decoded_latents.dtype,
                 )

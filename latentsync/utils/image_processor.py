@@ -136,23 +136,30 @@ class ImageProcessor:
 
         return face, box, affine_matrix, embedding, landmark_2d_106
 
-    def preprocess_fixed_mask_image(self, image: torch.Tensor, affine_transform=False):
+    def preprocess_fixed_mask_image(self, image: torch.Tensor, affine_transform=False, mask_override=None):
         if affine_transform:
             image, _, _ = self.affine_transform(image)
         else:
             image = self.resize(image)
         pixel_values = self.normalize(image / 255.0)
-        masked_pixel_values = pixel_values * self.mask_image
-        return pixel_values, masked_pixel_values, self.mask_image[0:1]
+        if mask_override is not None:
+            mask_to_use = mask_override  # (1, H, W), 1=keep, 0=inpaint
+        else:
+            mask_to_use = self.mask_image[0:1]
+        masked_pixel_values = pixel_values * mask_to_use
+        return pixel_values, masked_pixel_values, mask_to_use
 
-    def prepare_masks_and_masked_images(self, images: Union[torch.Tensor, np.ndarray], affine_transform=False):
+    def prepare_masks_and_masked_images(self, images: Union[torch.Tensor, np.ndarray], affine_transform=False, per_frame_masks=None):
         if isinstance(images, np.ndarray):
             images = torch.from_numpy(images)
         if images.shape[3] == 3:
             images = rearrange(images, "f h w c -> f c h w")
-        logger.info(f"[ImageProcessor] prepare_masks_and_masked_images: input shape={images.shape}, affine_transform={affine_transform}")
+        logger.info(f"[ImageProcessor] prepare_masks_and_masked_images: input shape={images.shape}, affine_transform={affine_transform}, per_frame_masks={'provided' if per_frame_masks is not None else 'none'}")
 
-        results = [self.preprocess_fixed_mask_image(image, affine_transform=affine_transform) for image in images]
+        results = []
+        for i, image in enumerate(images):
+            mask_override = per_frame_masks[i] if per_frame_masks is not None else None
+            results.append(self.preprocess_fixed_mask_image(image, affine_transform=affine_transform, mask_override=mask_override))
 
         pixel_values_list, masked_pixel_values_list, masks_list = list(zip(*results))
         return torch.stack(pixel_values_list), torch.stack(masked_pixel_values_list), torch.stack(masks_list)
