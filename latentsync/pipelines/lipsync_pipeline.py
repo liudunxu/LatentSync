@@ -1319,6 +1319,11 @@ class LipsyncPipeline(DiffusionPipeline):
         # stabilization from borrowing lips across speaker/shot changes that
         # were not caught by geometry or identity continuity breaks.
         mouth_temporal_stabilization_max_delta: float = 0.14,
+        # Audio-adaptive mouth motion: preserve more current generated mouth
+        # motion on high-energy speech frames and less on weak/silent frames.
+        mouth_audio_adaptive_motion_enabled: bool = True,
+        mouth_audio_motion_min_scale: float = 0.65,
+        mouth_audio_motion_max_scale: float = 1.15,
         # Postfilter: skip frames where the generated mouth ROI is clearly
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
@@ -1471,6 +1476,38 @@ class LipsyncPipeline(DiffusionPipeline):
                 f"[LipSync] silent_skip={silent_skip_count}/{len(silent_skip_mask)} "
                 f"(threshold={silent_rms_threshold}, min_run={silent_min_run_frames}, pad={silent_pad_frames})"
             )
+        audio_motion_scales = [1.0] * len(skip_mask)
+        if mouth_audio_adaptive_motion_enabled and len(skip_mask) > 0:
+            frame_rms = []
+            samples_per_frame = max(1, int(round(float(audio_sample_rate) / max(float(video_fps), 1e-6))))
+            audio_float = audio_samples.detach().to(torch.float32)
+            for frame_index in range(len(skip_mask)):
+                start = frame_index * samples_per_frame
+                end = min(int(audio_float.shape[0]), start + samples_per_frame)
+                if start >= end:
+                    frame_rms.append(0.0)
+                else:
+                    frame_rms.append(float(audio_float[start:end].pow(2).mean().sqrt().item()))
+            rms_tensor = torch.tensor(frame_rms, dtype=torch.float32)
+            if rms_tensor.numel() > 0 and float(rms_tensor.max().item()) > 0:
+                lo = torch.quantile(rms_tensor, 0.20)
+                hi = torch.quantile(rms_tensor, 0.90)
+                denom = (hi - lo).clamp_min(1e-6)
+                norm = ((rms_tensor - lo) / denom).clamp(0.0, 1.0)
+                min_scale = min(float(mouth_audio_motion_min_scale), float(mouth_audio_motion_max_scale))
+                max_scale = max(float(mouth_audio_motion_min_scale), float(mouth_audio_motion_max_scale))
+                scales = min_scale + norm * (max_scale - min_scale)
+                for frame_index, is_silent in enumerate(silent_skip_mask[: len(scales)]):
+                    if is_silent:
+                        scales[frame_index] = min_scale
+                audio_motion_scales = [float(v) for v in scales.tolist()]
+            logger.info(
+                "[LipSync] audio_adaptive_motion=%s scale min=%.3f median=%.3f max=%.3f",
+                mouth_audio_adaptive_motion_enabled,
+                min(audio_motion_scales) if audio_motion_scales else 1.0,
+                statistics.median(audio_motion_scales) if audio_motion_scales else 1.0,
+                max(audio_motion_scales) if audio_motion_scales else 1.0,
+            )
         logger.info(
             f"[LipSync] after loop_video: faces={faces.shape}, boxes={len(boxes)}, "
             f"affine_matrices={len(affine_matrices)}, apply_identity_filter={apply_identity_filter}, "
@@ -1485,6 +1522,9 @@ class LipsyncPipeline(DiffusionPipeline):
         prev_mouth_stabilized_valid: bool = False
         quality_fallback_count: int = 0
         quality_skip_mask: List[bool] = [False] * len(skip_mask)
+        mouth_delta_values: List[float] = []
+        mouth_stabilization_delta_skip_count = 0
+        mouth_stabilization_applied_count = 0
 
         synced_video_frames = []
 
@@ -1510,6 +1550,7 @@ class LipsyncPipeline(DiffusionPipeline):
             batch_end = min((i + 1) * num_frames, len(whisper_chunks))
             inference_skip_mask = skip_mask[batch_start:batch_end]
             inference_continuity_break_mask = continuity_break_mask[batch_start:batch_end]
+            batch_audio_motion_scales = audio_motion_scales[batch_start:batch_end]
             inference_faces = faces[batch_start:batch_end]
             if inference_skip_mask and all(inference_skip_mask):
                 skipped_inference_batches += 1
@@ -1669,9 +1710,15 @@ class LipsyncPipeline(DiffusionPipeline):
                     )
                     if mouth_motion_mask.dim() == 4 and mouth_motion_mask.shape[1] == 1:
                         mouth_motion_mask = mouth_motion_mask.expand(-1, 3, -1, -1)
+                    audio_motion_scale_tensor = torch.tensor(
+                        batch_audio_motion_scales,
+                        device=decoded_latents.device,
+                        dtype=decoded_latents.dtype,
+                    ).view(-1, 1, 1, 1)
                     decoded_latents = decoded_latents + (
                         mouth_motion_mask
                         * mouth_motion_preserve_strength
+                        * audio_motion_scale_tensor
                         * (current_mouth_motion - decoded_latents)
                     )
             if mouth_temporal_stabilization_strength > 0:
@@ -1697,7 +1744,9 @@ class LipsyncPipeline(DiffusionPipeline):
                             mouth_delta = (
                                 (current_frame - prev_frame).abs() * mask_k
                             ).sum() / mask_sum
+                            mouth_delta_values.append(float(mouth_delta.item()))
                             if mouth_delta.item() > mouth_temporal_stabilization_max_delta:
+                                mouth_stabilization_delta_skip_count += 1
                                 prev_mouth_stabilized = current_frame.detach()
                                 prev_mouth_stabilized_valid = True
                                 continue
@@ -1715,6 +1764,8 @@ class LipsyncPipeline(DiffusionPipeline):
                         )
                         decoded_latents[k] = stabilized
                         prev_mouth_stabilized = stabilized.detach()
+                        if effective_stabilization_strength > 0:
+                            mouth_stabilization_applied_count += 1
                     else:
                         prev_mouth_stabilized = current_frame.detach()
                     prev_mouth_stabilized_valid = True
@@ -1884,6 +1935,16 @@ class LipsyncPipeline(DiffusionPipeline):
             "mouth_motion_preserve_strength": mouth_motion_preserve_strength,
             "mouth_temporal_stabilization_strength": mouth_temporal_stabilization_strength,
             "mouth_temporal_stabilization_max_delta": mouth_temporal_stabilization_max_delta,
+            "mouth_temporal": {
+                "delta_min": float(min(mouth_delta_values)) if mouth_delta_values else 0.0,
+                "delta_median": float(statistics.median(mouth_delta_values)) if mouth_delta_values else 0.0,
+                "delta_max": float(max(mouth_delta_values)) if mouth_delta_values else 0.0,
+                "delta_skip_frames": int(mouth_stabilization_delta_skip_count),
+                "stabilized_frames": int(mouth_stabilization_applied_count),
+                "audio_motion_min_scale": float(min(audio_motion_scales)) if audio_motion_scales else 1.0,
+                "audio_motion_median_scale": float(statistics.median(audio_motion_scales)) if audio_motion_scales else 1.0,
+                "audio_motion_max_scale": float(max(audio_motion_scales)) if audio_motion_scales else 1.0,
+            },
             "quality_gate_enabled": quality_gate_enabled,
             "quality_ref_min_laplacian": quality_ref_min_laplacian,
             "quality_max_fallback_ratio": quality_max_fallback_ratio,

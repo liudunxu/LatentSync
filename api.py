@@ -138,6 +138,9 @@ class LipSyncRequest(BaseModel):
     mouth_sharpen_strength: float = Field(0.0, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.14, ge=0.0, le=2.0)
+    mouth_audio_adaptive_motion_enabled: bool = True
+    mouth_audio_motion_min_scale: float = Field(0.65, ge=0.0, le=2.0)
+    mouth_audio_motion_max_scale: float = Field(1.15, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default
     # (self.config.data.mask_image_path, usually latentsync/utils/mask.png).
     # Set to "latentsync/utils/mask5.png" to use the tight mouth-only mask,
@@ -1145,6 +1148,9 @@ class LatentSyncApiRuntime:
                 mouth_sharpen_strength=payload.mouth_sharpen_strength,
                 mouth_temporal_stabilization_strength=payload.mouth_temporal_stabilization_strength,
                 mouth_temporal_stabilization_max_delta=payload.mouth_temporal_stabilization_max_delta,
+                mouth_audio_adaptive_motion_enabled=payload.mouth_audio_adaptive_motion_enabled,
+                mouth_audio_motion_min_scale=payload.mouth_audio_motion_min_scale,
+                mouth_audio_motion_max_scale=payload.mouth_audio_motion_max_scale,
                 # CodeFormer postprocess. ``codeformer_enabled`` is honoured
                 # only when ``codeformer_restorer`` actually loaded; when
                 # it didn't (e.g. checkpoint missing and not required) the
@@ -1186,6 +1192,7 @@ class LatentSyncApiRuntime:
             skipped_inference_batches = int(run_stats.get("skipped_inference_batches", 0))
             skipped_inference_frames = int(run_stats.get("skipped_inference_frames", 0))
             codeformer_stats = run_stats.get("codeformer") or {}
+            mouth_temporal_stats = run_stats.get("mouth_temporal") or {}
 
             return {
                 "output_path": output_path,
@@ -1236,6 +1243,19 @@ class LatentSyncApiRuntime:
                     "enabled": payload.speech_gate_enabled,
                     "active_frames": max(0, source_frame_count - silent_skip_frames),
                     "silent_frames": silent_skip_frames,
+                },
+                "mouth_temporal": {
+                    "stabilization_strength": float(payload.mouth_temporal_stabilization_strength),
+                    "stabilization_max_delta": float(payload.mouth_temporal_stabilization_max_delta),
+                    "delta_min": float(mouth_temporal_stats.get("delta_min", 0.0)),
+                    "delta_median": float(mouth_temporal_stats.get("delta_median", 0.0)),
+                    "delta_max": float(mouth_temporal_stats.get("delta_max", 0.0)),
+                    "delta_skip_frames": int(mouth_temporal_stats.get("delta_skip_frames", 0)),
+                    "stabilized_frames": int(mouth_temporal_stats.get("stabilized_frames", 0)),
+                    "audio_adaptive_motion_enabled": bool(payload.mouth_audio_adaptive_motion_enabled),
+                    "audio_motion_min_scale": float(mouth_temporal_stats.get("audio_motion_min_scale", 1.0)),
+                    "audio_motion_median_scale": float(mouth_temporal_stats.get("audio_motion_median_scale", 1.0)),
+                    "audio_motion_max_scale": float(mouth_temporal_stats.get("audio_motion_max_scale", 1.0)),
                 },
                 "codeformer": {
                     "requested": bool(payload.codeformer_enabled),
