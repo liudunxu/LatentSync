@@ -1313,7 +1313,7 @@ class LipsyncPipeline(DiffusionPipeline):
         mouth_motion_preserve_strength: float = 0.45,
         # Lightly stabilize mouth-core color/detail between consecutive valid
         # generated frames to reduce flicker without freezing lip motion.
-        mouth_temporal_stabilization_strength: float = 0.0,
+        mouth_temporal_stabilization_strength: float = 0.08,
         # Postfilter: skip frames where the generated mouth ROI is clearly
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
