@@ -564,17 +564,25 @@ def _download_to_file(url: str, dest_dir: Path, prefix: str, allowed: set, fallb
         if attempt_index >= attempts - 1:
             break
         logger.warning(
-            "Failed to download %s on attempt %s/%s: %s; retrying",
+            "Failed to download %s url=%s on attempt %s/%s: %s; retrying",
             prefix,
+            url,
             attempt_index + 1,
             attempts,
             last_error,
         )
         time.sleep(_download_retry_delay(attempt_index))
 
+    logger.error(
+        "Giving up on %s download after %s attempts: url=%s err=%s",
+        prefix,
+        attempts_made,
+        url,
+        last_error,
+    )
     raise HTTPException(
         status_code=400,
-        detail=f"Failed to download {prefix} after {attempts_made} attempts: {last_error}",
+        detail=f"Failed to download {prefix} after {attempts_made} attempts: {last_error} (url={url})",
     )
 
 
