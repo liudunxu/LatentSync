@@ -1819,19 +1819,21 @@ class LipsyncPipeline(DiffusionPipeline):
             else:
                 audio_embeds = None
             latents = all_latents[:, :, batch_start:batch_end]
-            # Generate per-frame dynamic masks from aligned mouth landmarks
             batch_mouth_info = aligned_mouth_info[batch_start:batch_end]
-            per_frame_masks = []
-            for k in range(len(batch_mouth_info)):
-                mi = batch_mouth_info[k]
-                dynamic_mask = self.generate_dynamic_mouth_mask(
-                    mi, height
-                )  # (1, H, W), 1=keep, 0=inpaint
-                per_frame_masks.append(dynamic_mask)
-            dynamic_mask_batch = torch.stack(per_frame_masks)  # (B, 1, H, W)
+            # Fixed U-shaped mask for the UNet (model was trained on this).
             ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
-                inference_faces, affine_transform=False, per_frame_masks=dynamic_mask_batch
+                inference_faces, affine_transform=False
             )
+            # Dynamic mouth-centered mask for post-processing paste-back.
+            # This uses per-frame mouth landmarks to create a tight mask
+            # that only covers the mouth area, avoiding identity drift and
+            # cheek ghosting while the model still sees the full U-shaped
+            # inpainting region during inference.
+            dynamic_region_masks = []
+            for k_mi, mi in enumerate(batch_mouth_info):
+                dm = self.generate_dynamic_mouth_mask(mi, height)
+                dynamic_region_masks.append(dm)
+            dynamic_region_mask_batch = torch.stack(dynamic_region_masks)  # (B, 1, H, W)
 
             # 7. Prepare mask latent variables
             mask_latents, masked_image_latents = self.prepare_mask_latents(
@@ -1908,10 +1910,18 @@ class LipsyncPipeline(DiffusionPipeline):
                         f"ref range [{ref_first.min().item():.2f}, {ref_first.max().item():.2f}] "
                         f"mean|decoded-ref|={diff:.4f}"
                     )
+            # Use dynamic mouth-centered mask for paste-back so only the mouth
+            # region takes generated content; cheeks/chin/forehead stay as
+            # the original reference pixels. The model still saw the full
+            # U-shaped inpainting region, so its output is coherent, but we
+            # only preserve the mouth portion.
+            # dynamic_region_mask_batch: 1=keep (reference), 0=inpaint (generated)
+            # paste_surrounding_pixels_back expects: 1=generated, 0=reference
+            # generated_region_mask: 1=generated region, 0=reference
+            generated_region_mask = (1.0 - dynamic_region_mask_batch).to(device=device, dtype=decoded_latents.dtype)
             decoded_latents = self.paste_surrounding_pixels_back(
-                decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
+                decoded_latents, ref_pixel_values, generated_region_mask, device, weight_dtype
             )
-            generated_region_mask = (1 - masks).to(device=device, dtype=decoded_latents.dtype)
             # Per-frame color match: align generated face stats to original
             # so the soft-mask boundary in restore_img doesn't reveal a
             # tone drift. Applied inside the mask region only.
