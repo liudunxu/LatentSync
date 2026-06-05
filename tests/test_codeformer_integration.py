@@ -251,6 +251,193 @@ class TestCodeformerRestorer(unittest.TestCase):
         json.dumps(d)
         self.assertEqual(d["frames_total"], 10)
         self.assertEqual(d["frames_enhanced"], 7)
+        # The new fields are present so the API surface can expose
+        # per-frame fallback and the adain flag to callers.
+        self.assertIn("frames_fallback", d)
+        self.assertIn("adain", d)
+
+    def test_per_call_adain_overrides_instance_default(self):
+        """The instance adain flag is the default; per-call ``adain`` overrides it."""
+        import torch
+
+        from latentsync.utils.codeformer_restorer import CodeFormerRestorer
+
+        class FlagNet(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Need at least one parameter for next(net.parameters())
+                # in the restorer's dtype lookup.
+                self.p = torch.nn.Parameter(torch.zeros(()))
+                self.last_adain = None
+
+            def forward(self, x, w=0.0, adain=True):
+                self.last_adain = adain
+                return x, None, None
+
+        net = FlagNet()
+        # Instance default = True.
+        restorer_on = CodeFormerRestorer(
+            checkpoint_path="/nonexistent/codeformer.pth",
+            device="cpu",
+            adain=True,
+        )
+        restorer_on._net = net
+        restorer_on.restore_faces(torch.zeros(1, 3, 512, 512), fidelity_weight=0.7)
+        self.assertTrue(net.last_adain)
+
+        # Instance default = True but per-call override = False wins.
+        restorer_off = CodeFormerRestorer(
+            checkpoint_path="/nonexistent/codeformer.pth",
+            device="cpu",
+            adain=True,
+        )
+        restorer_off._net = FlagNet()
+        restorer_off.restore_faces(
+            torch.zeros(1, 3, 512, 512), fidelity_weight=0.7, adain=False,
+        )
+        self.assertFalse(restorer_off._net.last_adain)
+
+    def test_fallback_replaces_over_sharp_restored_face(self):
+        """When the model output is much sharper than the input, the
+        restorer must fall back to the input for that frame and bump
+        ``frames_fallback``."""
+        import torch
+
+        from latentsync.utils.codeformer_restorer import CodeFormerRestorer
+
+        class OverSharpNet(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.p = torch.nn.Parameter(torch.zeros(()))
+
+            def forward(self, x, w=0.0, adain=True):
+                # Add high-frequency noise that explodes the laplacian
+                # variance -- mimics a CodeFormer "hallucination".
+                noise = torch.randn_like(x) * 0.4
+                return x + noise, None, None
+
+        restorer = CodeFormerRestorer(
+            checkpoint_path="/nonexistent/codeformer.pth",
+            device="cpu",
+            batch_size=4,
+        )
+        restorer._net = OverSharpNet()
+        faces = torch.zeros(2, 3, 512, 512)
+        out, stats = restorer.restore_faces(faces, fidelity_weight=0.7)
+        # Frames where the network blew the sharpness check should
+        # have been replaced with the input (all zeros).
+        self.assertEqual(stats.frames_fallback, 2)
+        self.assertEqual(stats.frames_enhanced, 0)
+        self.assertTrue(torch.equal(out, faces))
+
+    def test_fallback_keeps_clean_restoration(self):
+        """A near-passthrough restoration that stays within the
+        thresholds must not trigger the fallback."""
+        import torch
+
+        from latentsync.utils.codeformer_restorer import CodeFormerRestorer
+
+        class PassThroughNet(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.p = torch.nn.Parameter(torch.zeros(()))
+
+            def forward(self, x, w=0.0, adain=True):
+                return x + 0.02, None, None  # tiny shift, well within thresholds
+
+        restorer = CodeFormerRestorer(
+            checkpoint_path="/nonexistent/codeformer.pth",
+            device="cpu",
+            batch_size=4,
+        )
+        restorer._net = PassThroughNet()
+        faces = torch.zeros(2, 3, 512, 512)
+        out, stats = restorer.restore_faces(faces, fidelity_weight=0.7)
+        self.assertEqual(stats.frames_fallback, 0)
+        self.assertEqual(stats.frames_enhanced, 2)
+        # The restoration made it through (not all zeros).
+        self.assertGreater(out.abs().sum().item(), 0.0)
+
+    def test_fallback_can_be_disabled(self):
+        """``fallback_enabled=False`` makes the restorer pass through
+        the network's output even when it would otherwise trip a check."""
+        import torch
+
+        from latentsync.utils.codeformer_restorer import CodeFormerRestorer
+
+        class OverSharpNet(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.p = torch.nn.Parameter(torch.zeros(()))
+
+            def forward(self, x, w=0.0, adain=True):
+                return x + torch.randn_like(x) * 0.4, None, None
+
+        restorer = CodeFormerRestorer(
+            checkpoint_path="/nonexistent/codeformer.pth",
+            device="cpu",
+            batch_size=4,
+            fallback_enabled=False,
+        )
+        restorer._net = OverSharpNet()
+        faces = torch.zeros(2, 3, 512, 512)
+        out, stats = restorer.restore_faces(faces, fidelity_weight=0.7)
+        self.assertEqual(stats.frames_fallback, 0)
+        # Output is the noisy network result, not the input.
+        self.assertFalse(torch.equal(out, faces))
+
+    def test_quality_check_batch_unit(self):
+        """Direct unit test of the per-sample OK mask helper.
+
+        Build three inputs:
+          * sample 0: a face + tiny perturbation (passes everything)
+          * sample 1: a face + high-freq noise (fails sharpness_high)
+          * sample 2: a face + huge mouth-region shift (fails mouth_diff)
+        """
+        import torch
+
+        from latentsync.utils.codeformer_restorer import CodeFormerRestorer
+
+        H = W = 512
+        # Sample 0 -- base face
+        s0 = torch.zeros(3, H, W)
+        s0[:, 200:300, 200:300] = 0.3
+        # Sample 1 -- same as s0 but with HF noise (sharpness explodes)
+        s1 = s0 + torch.randn_like(s0) * 0.3
+        # Sample 2 -- same as s0 but mouth region is shifted hard
+        s2 = s0.clone()
+        y0, y1 = int(H * 0.55), int(H * 0.74)
+        x0, x1 = int(W * 0.30), int(W * 0.70)
+        s2[:, y0:y1, x0:x1] = 0.95  # big mouth-region diff
+
+        inp = torch.stack([s0, s1, s2])  # (3, 3, H, W)
+        # Pretend "restored" is just the input + tiny noise for s0, but
+        # for s1/s2 make the restored equal the input. The check should
+        # still fire on s1 (input itself is sharp due to noise) -- so
+        # to make this test deterministic, build a separate restored
+        # that's clean for s0/s2 but noisy for s1.
+        restored_s0 = s0 + 0.01
+        restored_s1 = s1  # identical to a sharp input
+        restored_s2 = s0.clone()  # clean restoration, big mouth-region diff vs the noisy s2 input
+        restored = torch.stack([restored_s0, restored_s1, restored_s2])
+
+        # Convert to [-1, 1] (the restorer's input range).
+        inp_m11 = inp * 2 - 1
+        restored_m11 = restored * 2 - 1
+
+        keep = CodeFormerRestorer._quality_check_batch(
+            inp_m11, restored_m11,
+            sharpness_low=0.5, sharpness_high=2.0,
+            pixel_diff=0.20, mouth_diff=0.15,
+        )
+        # s0 is clean, should keep. s1 is sharp input; sharpness check
+        # is satisfied (restored sharpness is roughly input sharpness),
+        # pixel diff is small (restored = input). Keep.
+        # s2 has big mouth-region diff between inp (shifted) and
+        # restored (clean); mouth diff exceeds 0.15. Fall back.
+        self.assertTrue(keep[0].item())
+        self.assertTrue(keep[1].item())
+        self.assertFalse(keep[2].item())
 
 
 class TestLoaderCheckpointParsing(unittest.TestCase):

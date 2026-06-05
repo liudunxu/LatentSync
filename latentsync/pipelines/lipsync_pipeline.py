@@ -1484,8 +1484,14 @@ class LipsyncPipeline(DiffusionPipeline):
         # identity/edge detail that the diffusion inpainter tends to soften.
         # Set ``codeformer_enabled=False`` to skip entirely; pass a
         # :class:`CodeFormerRestorer` instance to actually invoke the model.
+        # Default fidelity_weight 0.7 (was 0.5): the README's 0.5 is
+        # balanced for real-degraded faces, but the inpainter's output
+        # is *generated* content -- at w=0.5 the codebook path tends
+        # to overwrite the lipsync result with a "more typical" face.
+        # 0.7 keeps more of the input, at a small cost in sharpness.
         codeformer_enabled: bool = False,
-        codeformer_fidelity_weight: float = 0.5,
+        codeformer_fidelity_weight: float = 0.7,
+        codeformer_adain: bool = True,
         codeformer_restorer=None,
         **kwargs,
     ):
@@ -1979,6 +1985,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     all_faces,
                     skip_mask=effective_skip_mask,
                     fidelity_weight=codeformer_fidelity_weight,
+                    adain=codeformer_adain,
                 )
                 self._last_codeformer_stats = cf_stats.as_dict()
         synced_video_frames = self.restore_video(all_faces, video_frames, boxes, affine_matrices, effective_skip_mask)

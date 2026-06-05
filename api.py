@@ -285,10 +285,18 @@ class LipSyncRequest(BaseModel):
         description="Run CodeFormer face restoration on the aligned 512x512 face crops before paste-back.",
     )
     codeformer_fidelity_weight: float = Field(
-        0.5,
+        0.7,
         ge=0.0,
         le=1.0,
-        description="CodeFormer fidelity weight. 0 = sharpest, 1 = closest to input. 0.5 is the upstream default.",
+        description="CodeFormer fidelity weight. 0 = sharpest (most codebook-driven, identity drift), "
+                    "1 = closest to input. Default 0.7 is tuned for lip-sync output: the upstream "
+                    "0.5 over-reconstructs the inpainter's output and tends to overwrite the "
+                    "lipsync with a 'more typical' face. 0.85+ is safest for identity preservation.",
+    )
+    codeformer_adain: bool = Field(
+        True,
+        description="Apply CodeFormer's adaptive instance norm so the restored face's color matches the input. "
+                    "Turning it off can yield a more 'CodeFormer-style' face at the cost of color drift.",
     )
     codeformer_required: bool = Field(
         settings.codeformer_required,
@@ -1115,7 +1123,8 @@ class LatentSyncApiRuntime:
                          f"seed={effective_seed}, has_reference_embedding={reference_embedding is not None}, "
                          f"codeformer_enabled={payload.codeformer_enabled}, "
                          f"codeformer_loaded={codeformer_restorer is not None and codeformer_restorer.is_loaded}, "
-                         f"codeformer_fidelity_weight={payload.codeformer_fidelity_weight}")
+                         f"codeformer_fidelity_weight={payload.codeformer_fidelity_weight}, "
+                         f"codeformer_adain={payload.codeformer_adain}")
             self.pipeline(
                 video_path=str(video_path),
                 audio_path=str(audio_path),
@@ -1172,6 +1181,7 @@ class LatentSyncApiRuntime:
                 # postprocess", not "broken output".
                 codeformer_enabled=payload.codeformer_enabled,
                 codeformer_fidelity_weight=payload.codeformer_fidelity_weight,
+                codeformer_adain=payload.codeformer_adain,
                 codeformer_restorer=codeformer_restorer,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")
@@ -1289,9 +1299,12 @@ class LatentSyncApiRuntime:
                     # Per-run stats from the pipeline layer.
                     "frames_total": int(codeformer_stats.get("frames_total", 0)),
                     "frames_enhanced": int(codeformer_stats.get("frames_enhanced", 0)),
+                    "frames_fallback": int(codeformer_stats.get("frames_fallback", 0)),
                     "frames_skipped_by_pipeline": int(
                         codeformer_stats.get("frames_skipped_by_pipeline", 0)
                     ),
+                    "fidelity_weight": float(codeformer_stats.get("fidelity_weight", 0.0)),
+                    "adain": bool(codeformer_stats.get("adain", True)),
                     "elapsed_seconds": float(codeformer_stats.get("elapsed_seconds", 0.0)),
                     "error": codeformer_stats.get("error", ""),
                 },
