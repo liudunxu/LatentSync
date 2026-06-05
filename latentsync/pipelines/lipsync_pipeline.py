@@ -4,6 +4,7 @@ import inspect
 import math
 import os
 import shutil
+import statistics
 from typing import Callable, List, Optional, Union
 import subprocess
 
@@ -1800,7 +1801,6 @@ class LipsyncPipeline(DiffusionPipeline):
                             f"[Diag] mouth postfilter fallback batch{i} k{k}: gen_lap={gen_lap:.2f} / ref_lap={ref_lap:.2f} = {ratio:.3f} < {quality_min_sharpness_ratio} (ref_lap >= {quality_ref_min_laplacian})"
                         )
                 if i == 0 and gen_laps:
-                    import statistics
                     logger.info(
                         f"[Diag] batch0 mouth laplacian: gen min={min(gen_laps):.2f} max={max(gen_laps):.2f} median={statistics.median(gen_laps):.2f} "
                         f"ref min={min(ref_laps):.2f} max={max(ref_laps):.2f} median={statistics.median(ref_laps):.2f}"
