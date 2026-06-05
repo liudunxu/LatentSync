@@ -1032,6 +1032,7 @@ class LipsyncPipeline(DiffusionPipeline):
         prev_temporal_motion_state = None
         prev_temporal_embedding = None
         prev_temporal_face: Optional[torch.Tensor] = None
+        prev_mouth_info: Optional[Dict[str, float]] = None
         continuity_break_mask = []
         print(f"Affine transforming {len(video_frames)} faces...")
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
@@ -1055,6 +1056,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 prev_temporal_motion_state = None
                 prev_temporal_embedding = None
                 prev_temporal_face = None
+                prev_mouth_info = None
                 continuity_break_mask.append(True)
                 continue
             should_skip = False
@@ -1187,6 +1189,18 @@ class LipsyncPipeline(DiffusionPipeline):
             mouth_info = self.compute_aligned_mouth_info(
                 lmk, affine_matrix, self.image_processor.resolution
             )
+            # EMA smoothing on mouth_info to reduce mask-boundary jitter
+            # from noisy landmark detection across consecutive frames.
+            if mouth_info is not None and prev_mouth_info is not None:
+                alpha = 0.7
+                mouth_info = {
+                    "center_x": alpha * mouth_info["center_x"] + (1 - alpha) * prev_mouth_info["center_x"],
+                    "center_y": alpha * mouth_info["center_y"] + (1 - alpha) * prev_mouth_info["center_y"],
+                    "half_width": alpha * mouth_info["half_width"] + (1 - alpha) * prev_mouth_info["half_width"],
+                    "half_height": alpha * mouth_info["half_height"] + (1 - alpha) * prev_mouth_info["half_height"],
+                }
+            if mouth_info is not None:
+                prev_mouth_info = mouth_info
             aligned_mouth_info.append(mouth_info)
             prev_yaw = yaw_deg if (yaw_skip_threshold > 0 and yaw_available) else None
             if not should_skip and motion_state is not None:
@@ -1200,6 +1214,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 prev_temporal_motion_state = None
                 prev_temporal_embedding = None
                 prev_temporal_face = None
+                prev_mouth_info = None
         logger.info(
             f"[FaceMatch] detect_fail={detect_fail_count}, identity_skip={identity_skip_count}, "
             f"yaw_skip={yaw_skip_count}, yaw_rate_skip={yaw_rate_skip_count}, "
