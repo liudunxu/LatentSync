@@ -1690,6 +1690,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     current_frame = decoded_latents[k]
                     if prev_mouth_stabilized_valid and prev_mouth_stabilized is not None:
                         prev_frame = prev_mouth_stabilized.to(current_frame.device)
+                        effective_stabilization_strength = mouth_temporal_stabilization_strength
                         if mouth_temporal_stabilization_max_delta > 0:
                             mask_k = mouth_stabilize_mask[k]
                             mask_sum = mask_k.sum().clamp_min(1e-6)
@@ -1700,10 +1701,16 @@ class LipsyncPipeline(DiffusionPipeline):
                                 prev_mouth_stabilized = current_frame.detach()
                                 prev_mouth_stabilized_valid = True
                                 continue
+                            continuity = 1.0 - (
+                                mouth_delta / mouth_temporal_stabilization_max_delta
+                            ).clamp(0.0, 1.0)
+                            effective_stabilization_strength = (
+                                mouth_temporal_stabilization_strength * float(continuity.item())
+                            )
                         stabilized = (
                             current_frame
                             + mouth_stabilize_mask[k]
-                            * mouth_temporal_stabilization_strength
+                            * effective_stabilization_strength
                             * (prev_frame - current_frame)
                         )
                         decoded_latents[k] = stabilized
