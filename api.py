@@ -136,7 +136,7 @@ class LipSyncRequest(BaseModel):
     color_match_strength: float = Field(0.60, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.0, ge=0.0, le=1.0)
-    mouth_temporal_stabilization_strength: float = Field(0.18, ge=0.0, le=0.6)
+    mouth_temporal_stabilization_strength: float = Field(0.0, ge=0.0, le=0.6)
     # Inpaint mask override. None = use the server-side default
     # (self.config.data.mask_image_path, usually latentsync/utils/mask.png).
     # Set to "latentsync/utils/mask5.png" to use the tight mouth-only mask,
