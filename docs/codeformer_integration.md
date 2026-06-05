@@ -39,7 +39,7 @@ in `latentsync/utils/codeformer/loader.py`).
 | ------------------------------------ | ----------------------------------------------- | ------- |
 | `LATENTSYNC_CODEFORMER_CKPT`         | `checkpoints/codeformer/codeformer.pth`         | Path to the `.pth` file. |
 | `LATENTSYNC_CODEFORMER_PRELOAD`      | `0`                                             | Load the model at server startup. `1` = eager. |
-| `LATENTSYNC_CODEFORMER_BATCH_SIZE`   | `16`                                            | Faces per forward pass. 16 is safe on 24 GB GPUs. |
+| `LATENTSYNC_CODEFORMER_BATCH_SIZE`   | `8`                                             | Faces per forward pass. 8 is conservative while LatentSync also occupies GPU memory. |
 | `LATENTSYNC_CODEFORMER_REQUIRED`     | `0`                                             | If `1`, requests with `codeformer_enabled=True` fail loudly when the checkpoint is missing. |
 
 CLI flags `--codeformer_checkpoint_path`, `--codeformer_preload`
@@ -55,7 +55,7 @@ installations pay no GPU memory.
 | ------------------------------ | ------ | ------- | ------- |
 | `codeformer_enabled`           | bool   | `false` | Run CodeFormer on the aligned face crops before paste-back. |
 | `codeformer_fidelity_weight`   | float  | `0.5`   | `w` parameter. `0.0` = sharpest, `1.0` = closest to input. `0.5` is the upstream balanced default. |
-| `codeformer_required`          | bool   | `false` | If `true`, fail with HTTP 503 when the model is unavailable. |
+| `codeformer_required`          | bool   | `LATENTSYNC_CODEFORMER_REQUIRED` (`false`) | If `true`, fail with HTTP 503 when the model is unavailable. |
 
 Example:
 

@@ -31,8 +31,9 @@ between the restored face and the unchanged frame is invisible.
   checkpoint is missing instead of skipping silently).
 * **Per-frame passthrough.** Frames that the pipeline already
   decided to fall back to the source video for (side profile,
-  motion blur, occluded mouth, etc.) are not re-sharpened, so
-  the source face is never enhanced on top of itself.
+  motion blur, occluded mouth, etc.) are not sent through CodeFormer,
+  so the source face is never enhanced on top of itself and skipped
+  frames do not spend GPU time.
 * **Telemetry.** Every response now carries a `codeformer` block
   with `frames_total`, `frames_enhanced`, `frames_skipped_by_pipeline`,
   `elapsed_seconds`, and `error` if any. `GET /health` reports

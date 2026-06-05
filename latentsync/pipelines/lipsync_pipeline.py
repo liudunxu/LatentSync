@@ -811,6 +811,8 @@ class LipsyncPipeline(DiffusionPipeline):
         motion_blur_skip_threshold: float = 0.08,
         face_jump_center_threshold: float = 0.0,
         face_jump_scale_threshold: float = 0.0,
+        lipsync_continuity_max_center_shift: float = 0.35,
+        lipsync_continuity_max_scale_change: float = 0.35,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 0,
         side_face_episode_post_pad: int = 0,
@@ -825,6 +827,8 @@ class LipsyncPipeline(DiffusionPipeline):
             f"motion_blur_skip_threshold={motion_blur_skip_threshold}, "
             f"face_jump_center_threshold={face_jump_center_threshold}, "
             f"face_jump_scale_threshold={face_jump_scale_threshold}, "
+            f"lipsync_continuity_max_center_shift={lipsync_continuity_max_center_shift}, "
+            f"lipsync_continuity_max_scale_change={lipsync_continuity_max_scale_change}, "
             f"apply_identity_filter={apply_identity_filter}"
         )
         faces = []
@@ -937,18 +941,21 @@ class LipsyncPipeline(DiffusionPipeline):
                 if (
                     motion_state is not None
                     and prev_temporal_motion_state is not None
-                    and (face_jump_center_threshold > 0 or face_jump_scale_threshold > 0)
+                    and (
+                        lipsync_continuity_max_center_shift > 0
+                        or lipsync_continuity_max_scale_change > 0
+                    )
                 ):
                     center, size = motion_state
                     prev_center, prev_size = prev_temporal_motion_state
                     center_shift = float(np.linalg.norm(center - prev_center) / max(prev_size, 1.0))
                     scale_shift = float(abs(size - prev_size) / max(prev_size, 1.0))
                     geometry_break = (
-                        face_jump_center_threshold > 0
-                        and center_shift > face_jump_center_threshold * 0.65
+                        lipsync_continuity_max_center_shift > 0
+                        and center_shift > lipsync_continuity_max_center_shift
                     ) or (
-                        face_jump_scale_threshold > 0
-                        and scale_shift > face_jump_scale_threshold * 0.65
+                        lipsync_continuity_max_scale_change > 0
+                        and scale_shift > lipsync_continuity_max_scale_change
                     )
                     if geometry_break:
                         continuity_break = True
@@ -1176,6 +1183,8 @@ class LipsyncPipeline(DiffusionPipeline):
         motion_blur_skip_threshold: float = 0.08,
         face_jump_center_threshold: float = 0.0,
         face_jump_scale_threshold: float = 0.0,
+        lipsync_continuity_max_center_shift: float = 0.35,
+        lipsync_continuity_max_scale_change: float = 0.35,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 0,
         side_face_episode_post_pad: int = 0,
@@ -1190,6 +1199,8 @@ class LipsyncPipeline(DiffusionPipeline):
             f"motion_blur_skip_threshold={motion_blur_skip_threshold}, "
             f"face_jump_center_threshold={face_jump_center_threshold}, "
             f"face_jump_scale_threshold={face_jump_scale_threshold}, "
+            f"lipsync_continuity_max_center_shift={lipsync_continuity_max_center_shift}, "
+            f"lipsync_continuity_max_scale_change={lipsync_continuity_max_scale_change}, "
             f"apply_identity_filter={apply_identity_filter}"
         )
         if reference_embedding is None and face_embedder is not None:
@@ -1205,6 +1216,8 @@ class LipsyncPipeline(DiffusionPipeline):
                 motion_blur_skip_threshold=motion_blur_skip_threshold,
                 face_jump_center_threshold=face_jump_center_threshold,
                 face_jump_scale_threshold=face_jump_scale_threshold,
+                lipsync_continuity_max_center_shift=lipsync_continuity_max_center_shift,
+                lipsync_continuity_max_scale_change=lipsync_continuity_max_scale_change,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
@@ -1259,6 +1272,8 @@ class LipsyncPipeline(DiffusionPipeline):
                 motion_blur_skip_threshold=motion_blur_skip_threshold,
                 face_jump_center_threshold=face_jump_center_threshold,
                 face_jump_scale_threshold=face_jump_scale_threshold,
+                lipsync_continuity_max_center_shift=lipsync_continuity_max_center_shift,
+                lipsync_continuity_max_scale_change=lipsync_continuity_max_scale_change,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
@@ -1335,6 +1350,10 @@ class LipsyncPipeline(DiffusionPipeline):
         # changes abruptly, which usually means detection/alignment jumped.
         face_jump_center_threshold: float = 0.0,
         face_jump_scale_threshold: float = 0.0,
+        # Temporal continuity break: clear EMA/mouth stabilization state
+        # across large landmark jumps without necessarily skipping the frame.
+        lipsync_continuity_max_center_shift: float = 0.35,
+        lipsync_continuity_max_scale_change: float = 0.35,
         # Audio-energy prefilter: skip sustained silent runs before diffusion.
         silent_skip_enabled: bool = False,
         silent_rms_threshold: float = 0.003,
@@ -1344,8 +1363,8 @@ class LipsyncPipeline(DiffusionPipeline):
         # mask). 0 = off, 1 = full mean+std match. Default 0.60.
         color_match_strength: float = 0.60,
         # Unsharp-mask amount applied to the generated mouth region.
-        # 0 = off, 1 = strong sharpen. Default 0.35.
-        mouth_sharpen_strength: float = 0.35,
+        # 0 = off, 1 = strong sharpen. Default 0.0.
+        mouth_sharpen_strength: float = 0.0,
         # Original-detail restoration outside the central mouth-motion core.
         # 0 = off, 1 = strong reference detail. Default 0.65.
         mouth_detail_strength: float = 0.65,
@@ -1420,6 +1439,8 @@ class LipsyncPipeline(DiffusionPipeline):
             motion_blur_skip_threshold=motion_blur_skip_threshold,
             face_jump_center_threshold=face_jump_center_threshold,
             face_jump_scale_threshold=face_jump_scale_threshold,
+            lipsync_continuity_max_center_shift=lipsync_continuity_max_center_shift,
+            lipsync_continuity_max_scale_change=lipsync_continuity_max_scale_change,
             apply_identity_filter=apply_identity_filter,
             side_face_episode_pre_pad=side_face_episode_pre_pad,
             side_face_episode_post_pad=side_face_episode_post_pad,
@@ -1834,6 +1855,8 @@ class LipsyncPipeline(DiffusionPipeline):
             "motion_blur_skip_threshold": motion_blur_skip_threshold,
             "face_jump_center_threshold": face_jump_center_threshold,
             "face_jump_scale_threshold": face_jump_scale_threshold,
+            "lipsync_continuity_max_center_shift": lipsync_continuity_max_center_shift,
+            "lipsync_continuity_max_scale_change": lipsync_continuity_max_scale_change,
             "temporal_smoothing_enabled": temporal_smoothing_enabled,
             "mouth_motion_preserve_strength": mouth_motion_preserve_strength,
             "mouth_temporal_stabilization_strength": mouth_temporal_stabilization_strength,

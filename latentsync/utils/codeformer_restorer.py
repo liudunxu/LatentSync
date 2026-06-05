@@ -45,7 +45,7 @@ class CodeformerStats:
     loaded: bool = False
     checkpoint_path: str = ""
     fidelity_weight: float = 0.5
-    batch_size: int = 16
+    batch_size: int = 8
     frames_total: int = 0
     frames_enhanced: int = 0
     frames_skipped_by_pipeline: int = 0
@@ -86,7 +86,7 @@ class CodeFormerRestorer:
         self,
         checkpoint_path: str,
         device: Union[str, torch.device] = "cuda",
-        batch_size: int = 16,
+        batch_size: int = 8,
         adain: bool = True,
     ) -> None:
         self.checkpoint_path = checkpoint_path
@@ -197,27 +197,34 @@ class CodeFormerRestorer:
             skip_list = [False] * T
         stats.frames_skipped_by_pipeline = int(sum(skip_list))
 
+        out = faces.clone()
+        eligible_indices = [i for i, skip in enumerate(skip_list) if not skip]
+        if not eligible_indices:
+            stats.loaded = self.is_loaded
+            return out, stats
+
         net = self._ensure_loaded()
         if net is None:
             stats.error = self._load_error or "CodeFormer model not loaded"
             stats.loaded = False
-            return faces.clone(), stats
+            return out, stats
         stats.loaded = True
 
         # Don't move the whole (T, 3, H, W) tensor to the model device;
         # move per-batch to keep peak memory low.
         w = float(max(0.0, min(1.0, fidelity_weight)))
-        out = faces.clone()
         device = self.device
         bs = self.batch_size
+        param_dtype = next(net.parameters()).dtype
         t0 = time.time()
         enhanced = 0
         try:
-            for start in range(0, T, bs):
-                end = min(T, start + bs)
-                batch = faces[start:end]
+            for start in range(0, len(eligible_indices), bs):
+                chunk_indices = eligible_indices[start : start + bs]
+                idx = torch.as_tensor(chunk_indices, device=faces.device, dtype=torch.long)
+                batch = faces.index_select(0, idx)
                 # Move to model device (only the slice, not the whole T).
-                batch_dev = batch.to(device=device, dtype=next(net.parameters()).dtype)
+                batch_dev = batch.to(device=device, dtype=param_dtype)
                 restored, _logits, _lq = net(batch_dev, w=w, adain=self.adain)
                 restored = restored.to(device=faces.device, dtype=faces.dtype)
                 # Clamp because the generator occasionally steps outside
@@ -225,13 +232,9 @@ class CodeFormerRestorer:
                 # very out-of-distribution faces) and downstream
                 # paste-back does not clamp.
                 restored = restored.clamp(-1.0, 1.0)
-                # Per-frame passthrough: do not overwrite a frame that
-                # the pipeline already replaced with the source video.
-                for k in range(end - start):
-                    if skip_list[start + k]:
-                        continue
-                    out[start + k] = restored[k]
-                    enhanced += 1
+                for k, face_index in enumerate(chunk_indices):
+                    out[face_index] = restored[k]
+                enhanced += len(chunk_indices)
         except Exception as exc:  # noqa: BLE001
             stats.error = f"{type(exc).__name__}: {exc}"
             logger.exception("[CodeFormer] Inference failed: %s", exc)

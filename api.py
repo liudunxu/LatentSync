@@ -79,7 +79,7 @@ class Settings:
         "LATENTSYNC_CODEFORMER_CKPT", "checkpoints/codeformer/codeformer.pth"
     )
     codeformer_preload: bool = os.getenv("LATENTSYNC_CODEFORMER_PRELOAD", "0").lower() in {"1", "true", "yes"}
-    codeformer_batch_size: int = int(os.getenv("LATENTSYNC_CODEFORMER_BATCH_SIZE", "16"))
+    codeformer_batch_size: int = int(os.getenv("LATENTSYNC_CODEFORMER_BATCH_SIZE", "8"))
     codeformer_required: bool = os.getenv("LATENTSYNC_CODEFORMER_REQUIRED", "0").lower() in {"1", "true", "yes"}
 
 
@@ -115,7 +115,8 @@ class LipSyncRequest(BaseModel):
     target_fast_motion_max_scale_change_per_frame: float = Field(0.08, ge=0.0, le=2.0)
     target_fast_motion_min_run_frames: int = Field(5, ge=1, le=120)
     lipsync_continuity_max_gap_seconds: float = Field(0.35, ge=0.0, le=2.0)
-    lipsync_continuity_max_center_shift: float = Field(1.2, ge=0.0, le=5.0)
+    lipsync_continuity_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
+    lipsync_continuity_max_scale_change: float = Field(0.35, ge=0.0, le=2.0)
     target_bbox_smoothing_window: int = Field(3, ge=1, le=15)
     target_bbox_smoothing_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
@@ -134,7 +135,7 @@ class LipSyncRequest(BaseModel):
     blend_mask_blur_ratio: float = Field(0.01, ge=0.0, le=0.2)
     color_match_strength: float = Field(0.60, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
-    mouth_sharpen_strength: float = Field(0.35, ge=0.0, le=1.0)
+    mouth_sharpen_strength: float = Field(0.0, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.18, ge=0.0, le=0.6)
     # Inpaint mask override. None = use the server-side default
     # (self.config.data.mask_image_path, usually latentsync/utils/mask.png).
@@ -275,7 +276,7 @@ class LipSyncRequest(BaseModel):
         description="CodeFormer fidelity weight. 0 = sharpest, 1 = closest to input. 0.5 is the upstream default.",
     )
     codeformer_required: bool = Field(
-        False,
+        settings.codeformer_required,
         description="If True and codeformer_enabled=True, fail the request when the CodeFormer checkpoint is missing.",
     )
 
@@ -786,7 +787,18 @@ class LatentSyncApiRuntime:
         if self.codeformer_restorer is not None:
             return self.codeformer_restorer, ""
         if self.codeformer_load_attempted and self.codeformer_load_error:
-            return None, self.codeformer_load_error
+            if (
+                self.codeformer_load_error.startswith("CodeFormer checkpoint not found")
+                and settings.codeformer_checkpoint_path
+                and os.path.isfile(settings.codeformer_checkpoint_path)
+            ):
+                logger.info(
+                    "[LipSync] CodeFormer checkpoint is now present; retrying load from %s",
+                    settings.codeformer_checkpoint_path,
+                )
+                self.codeformer_load_error = ""
+            else:
+                return None, self.codeformer_load_error
         self.codeformer_load_attempted = True
         try:
             from latentsync.utils.codeformer_restorer import CodeFormerRestorer
@@ -1074,7 +1086,7 @@ class LatentSyncApiRuntime:
                         "codeformer_enabled=True but the CodeFormer model is not available: "
                         f"{codeformer_unavailable_reason}"
                     )
-                    if payload.codeformer_required:
+                    if payload.codeformer_required or settings.codeformer_required:
                         raise HTTPException(status_code=503, detail=msg)
                     logger.warning(f"[LipSync] {msg}; continuing without CodeFormer postprocess")
 
@@ -1118,6 +1130,8 @@ class LatentSyncApiRuntime:
                 motion_blur_skip_threshold=getattr(payload, "motion_blur_skip_threshold", 0.08),
                 face_jump_center_threshold=payload.face_jump_center_threshold,
                 face_jump_scale_threshold=payload.face_jump_scale_threshold,
+                lipsync_continuity_max_center_shift=payload.lipsync_continuity_max_center_shift,
+                lipsync_continuity_max_scale_change=payload.lipsync_continuity_max_scale_change,
                 silent_skip_enabled=payload.speech_gate_enabled,
                 silent_rms_threshold=payload.speech_gate_min_rms,
                 silent_min_run_frames=max(
@@ -1224,7 +1238,7 @@ class LatentSyncApiRuntime:
                 "codeformer": {
                     "requested": bool(payload.codeformer_enabled),
                     "fidelity_weight": float(payload.codeformer_fidelity_weight),
-                    "required": bool(payload.codeformer_required),
+                    "required": bool(payload.codeformer_required or settings.codeformer_required),
                     # Whether the runtime actually has a loadable model.
                     "runtime_available": self.codeformer_restorer is not None
                     and self.codeformer_restorer.is_loaded,
@@ -1458,7 +1472,7 @@ def parse_args() -> argparse.Namespace:
         "--codeformer_batch_size",
         type=int,
         default=settings.codeformer_batch_size,
-        help="Faces per CodeFormer forward pass. 16 is a safe default on 24GB GPUs.",
+        help="Faces per CodeFormer forward pass. 8 is a conservative default while LatentSync also occupies GPU memory.",
     )
     return parser.parse_args()
 

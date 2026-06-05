@@ -163,6 +163,57 @@ class TestCodeformerRestorer(unittest.TestCase):
         self.assertEqual(stats.frames_skipped_by_pipeline, 1)
         self.assertEqual(stats.frames_total, 3)
 
+    def test_skip_mask_avoids_inference_for_skipped_faces(self):
+        import torch
+
+        from latentsync.utils.codeformer_restorer import CodeFormerRestorer
+
+        class FakeNet(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.p = torch.nn.Parameter(torch.zeros(()))
+                self.seen_batch_sizes = []
+
+            def forward(self, x, w=0.0, adain=True):
+                self.seen_batch_sizes.append(x.shape[0])
+                return x + 0.25, None, None
+
+        fake_net = FakeNet()
+        restorer = CodeFormerRestorer(
+            checkpoint_path="/nonexistent/codeformer.pth",
+            device="cpu",
+            batch_size=2,
+        )
+        restorer._net = fake_net
+        faces = torch.zeros(4, 3, 512, 512)
+        out, stats = restorer.restore_faces(
+            faces,
+            skip_mask=[True, False, True, False],
+        )
+        self.assertEqual(fake_net.seen_batch_sizes, [2])
+        self.assertTrue(torch.equal(out[0], faces[0]))
+        self.assertTrue(torch.equal(out[2], faces[2]))
+        self.assertGreater(out[1].sum().item(), 0.0)
+        self.assertGreater(out[3].sum().item(), 0.0)
+        self.assertEqual(stats.frames_enhanced, 2)
+        self.assertEqual(stats.frames_skipped_by_pipeline, 2)
+
+    def test_all_skipped_faces_do_not_load_model(self):
+        import torch
+
+        from latentsync.utils.codeformer_restorer import CodeFormerRestorer
+
+        restorer = CodeFormerRestorer(
+            checkpoint_path="/nonexistent/codeformer.pth", device="cpu"
+        )
+        faces = torch.randn(2, 3, 512, 512)
+        out, stats = restorer.restore_faces(faces, skip_mask=[True, True])
+        self.assertTrue(torch.equal(out, faces))
+        self.assertFalse(stats.loaded)
+        self.assertEqual(stats.error, "")
+        self.assertEqual(stats.frames_enhanced, 0)
+        self.assertEqual(stats.frames_skipped_by_pipeline, 2)
+
     def test_rejects_non_4d_input(self):
         import torch
 
