@@ -1314,6 +1314,11 @@ class LipsyncPipeline(DiffusionPipeline):
         # Lightly stabilize mouth-core color/detail between consecutive valid
         # generated frames to reduce flicker without freezing lip motion.
         mouth_temporal_stabilization_strength: float = 0.08,
+        # If the current mouth core differs too much from the previous
+        # stabilized mouth, clear carry state instead of blending. This keeps
+        # stabilization from borrowing lips across speaker/shot changes that
+        # were not caught by geometry or identity continuity breaks.
+        mouth_temporal_stabilization_max_delta: float = 0.14,
         # Postfilter: skip frames where the generated mouth ROI is clearly
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
@@ -1684,11 +1689,22 @@ class LipsyncPipeline(DiffusionPipeline):
                             continue
                     current_frame = decoded_latents[k]
                     if prev_mouth_stabilized_valid and prev_mouth_stabilized is not None:
+                        prev_frame = prev_mouth_stabilized.to(current_frame.device)
+                        if mouth_temporal_stabilization_max_delta > 0:
+                            mask_k = mouth_stabilize_mask[k]
+                            mask_sum = mask_k.sum().clamp_min(1e-6)
+                            mouth_delta = (
+                                (current_frame - prev_frame).abs() * mask_k
+                            ).sum() / mask_sum
+                            if mouth_delta.item() > mouth_temporal_stabilization_max_delta:
+                                prev_mouth_stabilized = current_frame.detach()
+                                prev_mouth_stabilized_valid = True
+                                continue
                         stabilized = (
                             current_frame
                             + mouth_stabilize_mask[k]
                             * mouth_temporal_stabilization_strength
-                            * (prev_mouth_stabilized.to(current_frame.device) - current_frame)
+                            * (prev_frame - current_frame)
                         )
                         decoded_latents[k] = stabilized
                         prev_mouth_stabilized = stabilized.detach()
@@ -1860,6 +1876,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "temporal_smoothing_enabled": temporal_smoothing_enabled,
             "mouth_motion_preserve_strength": mouth_motion_preserve_strength,
             "mouth_temporal_stabilization_strength": mouth_temporal_stabilization_strength,
+            "mouth_temporal_stabilization_max_delta": mouth_temporal_stabilization_max_delta,
             "quality_gate_enabled": quality_gate_enabled,
             "quality_ref_min_laplacian": quality_ref_min_laplacian,
             "quality_max_fallback_ratio": quality_max_fallback_ratio,

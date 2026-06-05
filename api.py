@@ -137,6 +137,7 @@ class LipSyncRequest(BaseModel):
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.0, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
+    mouth_temporal_stabilization_max_delta: float = Field(0.14, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default
     # (self.config.data.mask_image_path, usually latentsync/utils/mask.png).
     # Set to "latentsync/utils/mask5.png" to use the tight mouth-only mask,
@@ -1143,6 +1144,7 @@ class LatentSyncApiRuntime:
                 mouth_detail_strength=payload.mouth_detail_strength,
                 mouth_sharpen_strength=payload.mouth_sharpen_strength,
                 mouth_temporal_stabilization_strength=payload.mouth_temporal_stabilization_strength,
+                mouth_temporal_stabilization_max_delta=payload.mouth_temporal_stabilization_max_delta,
                 # CodeFormer postprocess. ``codeformer_enabled`` is honoured
                 # only when ``codeformer_restorer`` actually loaded; when
                 # it didn't (e.g. checkpoint missing and not required) the
