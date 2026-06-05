@@ -42,8 +42,6 @@ import soundfile as sf
 from typing import Dict, List, Optional, Tuple
 
 MOUTH_OUTER_LANDMARKS = [48, 54, 51, 57]
-MOUTH_INNER_LANDMARKS = [52, 58, 67, 61]
-MOUTH_ALL_LANDMARKS = sorted(set(MOUTH_OUTER_LANDMARKS + MOUTH_INNER_LANDMARKS))
 
 logger = logging.getLogger(__name__)
 
@@ -681,7 +679,6 @@ class LipsyncPipeline(DiffusionPipeline):
                 -0.5 * (torch.arange(k, dtype=torch.float32) - k // 2).pow(2) / sigma ** 2
             )
             kernel_1d = kernel_1d / kernel_1d.sum()
-            kernel_2d = kernel_1d.view(1, 1, 1, k) * kernel_1d.view(1, 1, k, 1)
             kx = kernel_1d.view(1, 1, 1, k).expand(1, 1, 1, k)
             ky = kernel_1d.view(1, 1, k, 1).expand(1, 1, k, 1)
             inpaint_4d = inpaint_region.unsqueeze(0).unsqueeze(0)
@@ -974,7 +971,7 @@ class LipsyncPipeline(DiffusionPipeline):
         self,
         video_frames: np.ndarray,
         reference_embedding=None,
-        yaw_skip_threshold: float = 45.0,
+        yaw_skip_threshold: float = 30.0,
         yaw_rate_skip_threshold: float = 28.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.08,
@@ -1410,7 +1407,7 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         skip_mask=None,
-        yaw_skip_threshold: float = 45.0,
+        yaw_skip_threshold: float = 30.0,
         yaw_rate_skip_threshold: float = 28.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.08,
@@ -1581,7 +1578,7 @@ class LipsyncPipeline(DiffusionPipeline):
         quality_max_fallback_ratio: float = 0.80,
         # Yaw-based prefilters for side faces / fast head turns. Defaults are
         # intentionally permissive so clear frontal faces are not filtered out.
-        yaw_skip_threshold: float = 45.0,
+        yaw_skip_threshold: float = 30.0,
         yaw_rate_skip_threshold: float = 28.0,
         # Episode-level side-face filter: when contiguous frames exceed
         # yaw_skip_threshold, also skip pre_pad/post_pad transition frames

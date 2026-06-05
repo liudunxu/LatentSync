@@ -184,7 +184,7 @@ class LipSyncRequest(BaseModel):
     # back to the original (no inpainting), which is the right call for blurry
     # side profiles and motion-blur turns. yaw_rate is in degrees/frame, not
     # per second (28°/frame at 25fps ≈ 700°/sec).
-    yaw_skip_threshold: float = Field(45.0, ge=0.0, le=90.0)
+    yaw_skip_threshold: float = Field(30.0, ge=0.0, le=90.0)
     yaw_rate_skip_threshold: float = Field(28.0, ge=0.0, le=45.0)
     # Episode-level side-face filter: when N consecutive frames exceed
     # yaw_skip_threshold, also skip `pre_pad`/`post_pad` frames of
