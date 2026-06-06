@@ -62,13 +62,14 @@ class Settings:
     unet_config_path: str = os.getenv("LATENTSYNC_UNET_CONFIG", "configs/unet/stage2_512.yaml")
     inference_ckpt_path: str = os.getenv("LATENTSYNC_INFERENCE_CKPT", "checkpoints/latentsync_unet.pt")
     # Inference defaults tuned for natural-looking output (less "AI mouth"
-    # crispness / over-coercion). Lower guidance + more steps + no DeepCache
-    # trades 2x speed for visibly smoother lip motion. Frontend can still
-    # override per request via the *_override fields.
+    # crispness / over-coercion). Lower guidance + more steps + DeepCache
+    # give ~2x speedup over the no-cache setting with a small quality cost
+    # (slightly softer detail on edges; mouth motion stays correct). Frontend
+    # can still override per request via the *_override fields.
     guidance_scale: float = float(os.getenv("LATENTSYNC_GUIDANCE_SCALE", "1.5"))
     inference_steps: int = int(os.getenv("LATENTSYNC_INFERENCE_STEPS", "40"))
     seed: int = int(os.getenv("LATENTSYNC_SEED", "1247"))
-    enable_deepcache: bool = os.getenv("LATENTSYNC_ENABLE_DEEPCACHE", "0").lower() in {"1", "true", "yes"}
+    enable_deepcache: bool = os.getenv("LATENTSYNC_ENABLE_DEEPCACHE", "1").lower() in {"1", "true", "yes"}
     max_download_bytes: int = int(os.getenv("API_MAX_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
     download_retries: int = int(os.getenv("API_DOWNLOAD_RETRIES", "2"))
     download_retry_backoff_seconds: float = float(os.getenv("API_DOWNLOAD_RETRY_BACKOFF_SECONDS", "1.0"))
