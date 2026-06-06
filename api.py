@@ -61,10 +61,14 @@ class Settings:
     gpu_id: int = int(os.getenv("LATENTSYNC_GPU_ID", "0"))
     unet_config_path: str = os.getenv("LATENTSYNC_UNET_CONFIG", "configs/unet/stage2_512.yaml")
     inference_ckpt_path: str = os.getenv("LATENTSYNC_INFERENCE_CKPT", "checkpoints/latentsync_unet.pt")
-    guidance_scale: float = float(os.getenv("LATENTSYNC_GUIDANCE_SCALE", "2.1"))
-    inference_steps: int = int(os.getenv("LATENTSYNC_INFERENCE_STEPS", "30"))
+    # Inference defaults tuned for natural-looking output (less "AI mouth"
+    # crispness / over-coercion). Lower guidance + more steps + no DeepCache
+    # trades 2x speed for visibly smoother lip motion. Frontend can still
+    # override per request via the *_override fields.
+    guidance_scale: float = float(os.getenv("LATENTSYNC_GUIDANCE_SCALE", "1.5"))
+    inference_steps: int = int(os.getenv("LATENTSYNC_INFERENCE_STEPS", "40"))
     seed: int = int(os.getenv("LATENTSYNC_SEED", "1247"))
-    enable_deepcache: bool = os.getenv("LATENTSYNC_ENABLE_DEEPCACHE", "1").lower() in {"1", "true", "yes"}
+    enable_deepcache: bool = os.getenv("LATENTSYNC_ENABLE_DEEPCACHE", "0").lower() in {"1", "true", "yes"}
     max_download_bytes: int = int(os.getenv("API_MAX_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
     download_retries: int = int(os.getenv("API_DOWNLOAD_RETRIES", "2"))
     download_retry_backoff_seconds: float = float(os.getenv("API_DOWNLOAD_RETRY_BACKOFF_SECONDS", "1.0"))
@@ -147,11 +151,17 @@ class LipSyncRequest(BaseModel):
     color_match_strength: float = Field(0.60, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.0, ge=0.0, le=1.0)
-    mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
+    # Frame-to-frame mouth stabilization: was 0.08, raised to 0.15 so the
+    # EMA carryover actually damps the high-frequency jitter the diffusion
+    # output tends to have. 0 disables entirely.
+    mouth_temporal_stabilization_strength: float = Field(0.15, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     mouth_audio_adaptive_motion_enabled: bool = True
-    mouth_audio_motion_min_scale: float = Field(0.65, ge=0.0, le=2.0)
-    mouth_audio_motion_max_scale: float = Field(1.15, ge=0.0, le=2.0)
+    # Adaptive motion: 0.75 floor means even on weak/silent audio we keep
+    # 75% of the generated current-frame motion (was 0.65, which over-
+    # smoothed soft speech and made lips look "frozen" between syllables).
+    mouth_audio_motion_min_scale: float = Field(0.75, ge=0.0, le=2.0)
+    mouth_audio_motion_max_scale: float = Field(1.20, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default
     # (self.config.data.mask_image_path, usually latentsync/utils/mask.png).
     # Set to "latentsync/utils/mask5.png" to use the tight mouth-only mask,
