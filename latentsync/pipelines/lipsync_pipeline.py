@@ -1981,9 +1981,31 @@ class LipsyncPipeline(DiffusionPipeline):
             # Per-frame color match: align generated face stats to original
             # so the soft-mask boundary in restore_img doesn't reveal a
             # tone drift. Applied inside the mask region only.
+            #
+            # The mask passed here is dilated by ~10px (max-pool on GPU)
+            # so the color transfer also covers the visible feather band
+            # that restore_img's gaussian blur (~sigma 7px on the
+            # dynamic region mask, then a wider erosion/blur inside
+            # restore_img) draws around the inpaint/keep seam. Inside the
+            # dilated ring, ``face`` is mostly the original ref pixel
+            # (paste-back mixed it in), so the transfer is approximately
+            # identity and the ring is left unchanged; at the seam the
+            # blend now has matching mean/std on both sides.
             if color_match_strength > 0:
+                if decoded_latents.is_cuda:
+                    color_match_mask = torch.nn.functional.max_pool2d(
+                        generated_region_mask.float(),
+                        kernel_size=21,
+                        stride=1,
+                        padding=10,
+                    ).clamp(0.0, 1.0)
+                else:
+                    color_match_mask = generated_region_mask
+                color_match_mask = color_match_mask.to(
+                    device=decoded_latents.device, dtype=decoded_latents.dtype
+                )
                 decoded_latents = self._match_color_to_reference(
-                    decoded_latents, ref_pixel_values, generated_region_mask, strength=color_match_strength
+                    decoded_latents, ref_pixel_values, color_match_mask, strength=color_match_strength
                 )
             # Restore original high-frequency skin/detail around the lips
             # while protecting the central mouth aperture/contour where the
