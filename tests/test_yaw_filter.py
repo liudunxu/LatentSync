@@ -417,5 +417,188 @@ class TestRateSkipIntegration(_FilterHelperBase):
         self.assertEqual(stabilized, 1.0)
 
 
+class TestComputeBlendZone(_FilterHelperBase):
+    """``_compute_blend_zone`` returns a per-frame blend coefficient for
+    cross-fading the inpaint output with the source frame at side-face
+    boundaries.
+    """
+
+    def test_empty_input(self):
+        LipsyncPipeline = self._import()
+        out = LipsyncPipeline._compute_blend_zone([], fade_frames=3)
+        self.assertEqual(out, [])
+
+    def test_fade_frames_zero_disables(self):
+        LipsyncPipeline = self._import()
+        skip_mask = [False, True, True, False, False]
+        out = LipsyncPipeline._compute_blend_zone(skip_mask, fade_frames=0)
+        self.assertEqual(out, [0.0] * 5)
+
+    def test_blend_at_boundary_zero_disables(self):
+        LipsyncPipeline = self._import()
+        skip_mask = [False, True, True, False, False]
+        out = LipsyncPipeline._compute_blend_zone(
+            skip_mask, fade_frames=3, blend_at_boundary=0.0,
+        )
+        self.assertEqual(out, [0.0] * 5)
+
+    def test_no_skips_anywhere(self):
+        LipsyncPipeline = self._import()
+        skip_mask = [False] * 10
+        out = LipsyncPipeline._compute_blend_zone(skip_mask, fade_frames=3)
+        self.assertEqual(out, [0.0] * 10)
+
+    def test_all_skips(self):
+        LipsyncPipeline = self._import()
+        skip_mask = [True] * 10
+        out = LipsyncPipeline._compute_blend_zone(skip_mask, fade_frames=3)
+        # All frames are skip frames themselves -> blend is 0 (the
+        # skip branch in restore_video handles them with pure source).
+        self.assertEqual(out, [0.0] * 10)
+
+    def test_single_skip_frame_ramps_symmetrically(self):
+        LipsyncPipeline = self._import()
+        # Skip at index 5; ramp on each side.
+        skip_mask = [False] * 11
+        skip_mask[5] = True
+        out = LipsyncPipeline._compute_blend_zone(skip_mask, fade_frames=3)
+        # Skip frame itself: 0.0
+        self.assertEqual(out[5], 0.0)
+        # Frames at distance 1, 2, 3 from the skip.
+        # 0.5 * (1 - d/3) with d=1: 0.333, d=2: 0.167, d=3: 0.0
+        # Left side
+        self.assertAlmostEqual(out[4], 0.5 * (1 - 1/3), places=6)
+        self.assertAlmostEqual(out[3], 0.5 * (1 - 2/3), places=6)
+        self.assertAlmostEqual(out[2], 0.5 * (1 - 3/3), places=6)  # = 0
+        # Right side (symmetric)
+        self.assertAlmostEqual(out[6], 0.5 * (1 - 1/3), places=6)
+        self.assertAlmostEqual(out[7], 0.5 * (1 - 2/3), places=6)
+        self.assertAlmostEqual(out[8], 0.5 * (1 - 3/3), places=6)  # = 0
+        # Far from any skip: still 0
+        self.assertEqual(out[0], 0.0)
+        self.assertEqual(out[1], 0.0)
+        self.assertEqual(out[9], 0.0)
+        self.assertEqual(out[10], 0.0)
+
+    def test_skip_block_at_start(self):
+        LipsyncPipeline = self._import()
+        # Skip frames at idx 0,1,2 -- ramp only to the right.
+        skip_mask = [True, True, True, False, False, False, False, False]
+        out = LipsyncPipeline._compute_blend_zone(skip_mask, fade_frames=3)
+        # Skip frames: 0
+        self.assertEqual(out[0], 0.0)
+        self.assertEqual(out[1], 0.0)
+        self.assertEqual(out[2], 0.0)
+        # Right ramp
+        self.assertAlmostEqual(out[3], 0.5 * (1 - 1/3), places=6)
+        self.assertAlmostEqual(out[4], 0.5 * (1 - 2/3), places=6)
+        self.assertEqual(out[5], 0.0)
+        self.assertEqual(out[6], 0.0)
+        self.assertEqual(out[7], 0.0)
+
+    def test_skip_block_at_end(self):
+        LipsyncPipeline = self._import()
+        # Skip frames at idx 5,6,7 -- ramp only to the left.
+        skip_mask = [False, False, False, False, False, True, True, True]
+        out = LipsyncPipeline._compute_blend_zone(skip_mask, fade_frames=3)
+        # Skip frames: 0
+        self.assertEqual(out[5], 0.0)
+        self.assertEqual(out[6], 0.0)
+        self.assertEqual(out[7], 0.0)
+        # Left ramp
+        self.assertAlmostEqual(out[4], 0.5 * (1 - 1/3), places=6)
+        self.assertAlmostEqual(out[3], 0.5 * (1 - 2/3), places=6)
+        self.assertEqual(out[2], 0.0)
+        self.assertEqual(out[1], 0.0)
+        self.assertEqual(out[0], 0.0)
+
+    def test_two_separate_skip_blocks(self):
+        LipsyncPipeline = self._import()
+        # Two skip blocks; each gets its own ramp. The blend for an
+        # inpaint frame is determined by its min distance to ANY skip,
+        # not to a specific block -- a frame between two blocks picks
+        # up the closer block's ramp.
+        skip_mask = [False, False, True, True, False, False, False, True, True, False, False]
+        out = LipsyncPipeline._compute_blend_zone(skip_mask, fade_frames=3)
+        # Block 1: skip at 2,3. Block 2: skip at 7,8.
+        self.assertEqual(out[2], 0.0)
+        self.assertEqual(out[3], 0.0)
+        self.assertEqual(out[7], 0.0)
+        self.assertEqual(out[8], 0.0)
+        # Idx 1: dist=1 to block 1 -> peak
+        self.assertAlmostEqual(out[1], 0.5 * (1 - 1/3), places=6)
+        # Idx 4: dist=1 to block 1 -> peak (right side)
+        self.assertAlmostEqual(out[4], 0.5 * (1 - 1/3), places=6)
+        # Idx 5: dist=2 to block 1 AND dist=2 to block 2 -> 0.167
+        self.assertAlmostEqual(out[5], 0.5 * (1 - 2/3), places=6)
+        # Idx 6: dist=3 to block 1, dist=1 to block 2 -> min=1 -> 0.333.
+        # This is the subtle case the test catches: a frame BETWEEN two
+        # skip blocks can still be in the fade zone of the closer one.
+        self.assertAlmostEqual(out[6], 0.5 * (1 - 1/3), places=6)
+        # Idx 9: dist=1 to block 2 -> peak
+        self.assertAlmostEqual(out[9], 0.5 * (1 - 1/3), places=6)
+        # Idx 0: dist=2 to block 1 (idx 0 -> 2). Inside fade window -> small blend.
+        self.assertAlmostEqual(out[0], 0.5 * (1 - 2/3), places=6)
+        # Idx 10: dist=2 to block 2 (idx 10 -> 8). Inside fade window -> small blend.
+        self.assertAlmostEqual(out[10], 0.5 * (1 - 2/3), places=6)
+
+    def test_far_inpaint_block_in_middle_stays_zero(self):
+        LipsyncPipeline = self._import()
+        # Long inpaint block in the middle far from any skip. With
+        # fade_frames=3, only the 3 frames closest to each skip block
+        # have non-zero blend; frames 5, 6, 7 are far enough from BOTH
+        # blocks that the ramp has decayed to 0.
+        skip_mask = [True, True, True, False, False, False, False, False, False, False, True, True, True]
+        out = LipsyncPipeline._compute_blend_zone(skip_mask, fade_frames=3)
+        # Left skip block at 0-2.
+        self.assertAlmostEqual(out[3], 0.5 * (1 - 1/3), places=6)  # d=1
+        self.assertAlmostEqual(out[4], 0.5 * (1 - 2/3), places=6)  # d=2
+        self.assertEqual(out[5], 0.0)  # d=3 from left -> formula gives 0
+        # Middle: far from both blocks.
+        self.assertEqual(out[6], 0.0)  # d=4 from left, d=4 from right
+        self.assertEqual(out[7], 0.0)  # d=5 from left, d=3 from right -> formula gives 0
+        # Right skip block at 10-12. Idx 8 is d=2 from right, inside the
+        # fade window -- small but non-zero blend. The test catches
+        # "stay zero" only on the dead-zone in the middle.
+        self.assertAlmostEqual(out[8], 0.5 * (1 - 2/3), places=6)  # d=2 from right
+        self.assertAlmostEqual(out[9], 0.5 * (1 - 1/3), places=6)  # d=1 from right
+        self.assertEqual(out[10], 0.0)
+        self.assertEqual(out[11], 0.0)
+        self.assertEqual(out[12], 0.0)
+
+    def test_custom_blend_at_boundary(self):
+        LipsyncPipeline = self._import()
+        # Symmetric [F, T, F]: both inpaint frames are dist=1 from the
+        # skip, so both get the same peak blend coefficient.
+        # With blend_at_boundary=0.3, fade_frames=3: peak = 0.3 * (1-1/3) = 0.2
+        skip_mask = [False, True, False]
+        out = LipsyncPipeline._compute_blend_zone(
+            skip_mask, fade_frames=3, blend_at_boundary=0.3,
+        )
+        self.assertEqual(out[1], 0.0)  # skip frame itself
+        self.assertAlmostEqual(out[0], 0.3 * (1 - 1/3), places=6)
+        self.assertAlmostEqual(out[2], 0.3 * (1 - 1/3), places=6)
+
+    def test_peak_is_capped_below_blend_at_boundary(self):
+        LipsyncPipeline = self._import()
+        # For fade_frames=N, the peak (at d=1) is blend_at_boundary
+        # * (N-1)/N, never reaching blend_at_boundary itself.
+        skip_mask = [False, True]
+        out = LipsyncPipeline._compute_blend_zone(
+            skip_mask, fade_frames=3, blend_at_boundary=0.5,
+        )
+        # Closest inpaint frame at d=1 -> 0.5 * 2/3 = 0.333
+        self.assertAlmostEqual(out[0], 0.5 * (1 - 1/3), places=6)
+        self.assertLess(out[0], 0.5)  # peak is strictly less than the cap
+        # For larger fade_frames the peak approaches the cap but never
+        # reaches it.
+        out2 = LipsyncPipeline._compute_blend_zone(
+            skip_mask, fade_frames=10, blend_at_boundary=0.5,
+        )
+        self.assertAlmostEqual(out2[0], 0.5 * 9/10, places=6)
+        self.assertLess(out2[0], 0.5)
+
+
+
 if __name__ == "__main__":
     unittest.main()

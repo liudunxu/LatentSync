@@ -214,6 +214,16 @@ class LipSyncRequest(BaseModel):
     # per-frame yaw skip.
     side_face_episode_pre_pad: int = Field(3, ge=0, le=30)
     side_face_episode_post_pad: int = Field(3, ge=0, le=30)
+    # Cross-fade between inpaint and source at side-face boundaries. The
+    # episode pad above creates a hard binary inpaint->source cut at the
+    # warn-band edge. The blend zone softens that cut: the N inpaint
+    # frames just before/after each skip block are mixed with the
+    # source frame by a coefficient that ramps from 0.5 at the boundary
+    # to 0 at fade_frames away. Set to 0 to disable (pure binary cut).
+    # Independent of side_face_episode_pre_pad / post_pad; the blend
+    # only acts on inpaint frames, never on the skip block itself, so
+    # disabled pad + blend=3 still works (no boundaries to blend at).
+    side_face_blend_fade_frames: int = Field(3, ge=0, le=30)
     # Warn-band ratio: yaws above `yaw_skip_threshold * ratio` but below
     # `yaw_skip_threshold` are treated as transition frames / near-profile
     # runs. Default 0.75 = warn @ 22.5° for the default 30° threshold.
@@ -1176,6 +1186,7 @@ class LatentSyncApiRuntime:
                 yaw_rate_skip_threshold=payload.yaw_rate_skip_threshold,
                 side_face_episode_pre_pad=payload.side_face_episode_pre_pad,
                 side_face_episode_post_pad=payload.side_face_episode_post_pad,
+                side_face_blend_fade_frames=payload.side_face_blend_fade_frames,
                 yaw_warn_threshold_ratio=payload.yaw_warn_threshold_ratio,
                 side_face_warn_min_run_frames=payload.side_face_warn_min_run_frames,
                 mouth_occlusion_skip_threshold=payload.mouth_occlusion_skip_threshold,

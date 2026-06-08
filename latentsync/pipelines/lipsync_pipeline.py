@@ -496,6 +496,82 @@ class LipsyncPipeline(DiffusionPipeline):
         return yaw_deg
 
     @staticmethod
+    def _compute_blend_zone(
+        skip_mask: List[bool],
+        fade_frames: int,
+        blend_at_boundary: float = 0.5,
+    ) -> List[float]:
+        """Compute a per-frame blend coefficient for cross-fading the
+        inpaint output with the source frame at side-face boundaries.
+
+        Background: ``_apply_episode_pad`` and the per-frame yaw filter
+        produce a binary ``skip_mask`` (skip = show original frame, no
+        inpaint). The hard cut from "inpainted face" to "source face" is
+        visible as a one-frame jump in the output video, even when the
+        underlying skip decision is correct. This helper softens the cut
+        by assigning a blend coefficient in [0, ``blend_at_boundary *``
+        ``(fade_frames - 1) / fade_frames``] to the inpaint frames just
+        outside each skip block:
+
+        - A frame at distance ``d`` from the nearest skip frame (``d``
+          in 1..fade_frames) gets coefficient
+          ``blend_at_boundary * (1 - d / fade_frames)``; ramps linearly
+          to 0 at ``d == fade_frames``.
+        - Frames inside a skip block get 0 (they're pure source, no
+          inpainter output exists for them, and the ``skip_mask`` path
+          in ``restore_video`` already serves them with pure source).
+        - The closest inpaint frame to a skip (``d == 1``) gets
+          ``blend_at_boundary * (fade_frames - 1) / fade_frames`` --
+          with defaults (0.5, 3) that is 0.333, never higher. The cap
+          keeps a meaningful inpaint contribution at the boundary so
+          we never fully replace the inpaint output with the source.
+
+        Returned list has the same length as ``skip_mask`` and is read
+        by ``restore_video`` to weight the source-frame contribution
+        into the final output. The function is O(n) using two
+        nearest-skip sweeps (forward + backward) per side.
+        """
+        n = len(skip_mask)
+        if fade_frames <= 0 or blend_at_boundary <= 0 or n == 0:
+            return [0.0] * n
+
+        # Forward pass: distance to nearest skip on the left.
+        prev_dist = [None] * n
+        last = None
+        for i in range(n):
+            if skip_mask[i]:
+                last = i
+                prev_dist[i] = 0
+            elif last is not None:
+                prev_dist[i] = i - last
+
+        # Backward pass: distance to nearest skip on the right.
+        next_dist = [None] * n
+        last = None
+        for i in range(n - 1, -1, -1):
+            if skip_mask[i]:
+                last = i
+                next_dist[i] = 0
+            elif last is not None:
+                next_dist[i] = last - i
+
+        # Per-frame blend coefficient. Skip frames themselves get 0
+        # because the previous ``skip_mask`` branch in restore_video
+        # handles them with pure source; the blend only modifies the
+        # inpaint output for non-skip frames near a boundary.
+        blend: List[float] = [0.0] * n
+        for k in range(n):
+            if skip_mask[k]:
+                continue
+            cands = [d for d in (prev_dist[k], next_dist[k]) if d is not None]
+            if not cands:
+                continue
+            min_dist = min(cands)
+            if min_dist <= fade_frames:
+                blend[k] = blend_at_boundary * (1.0 - min_dist / fade_frames)
+        return blend
+
+    @staticmethod
     def _match_color_to_reference(
         face: torch.Tensor,
         ref_face: torch.Tensor,
@@ -1149,6 +1225,7 @@ class LipsyncPipeline(DiffusionPipeline):
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 3,
         side_face_episode_post_pad: int = 3,
+        side_face_blend_fade_frames: int = 3,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
     ):
@@ -1164,7 +1241,10 @@ class LipsyncPipeline(DiffusionPipeline):
             f"lipsync_continuity_max_scale_change={lipsync_continuity_max_scale_change}, "
             f"lipsync_mouth_diff_break_threshold={lipsync_mouth_diff_break_threshold}, "
             f"identity_similarity_threshold={identity_similarity_threshold}, "
-            f"apply_identity_filter={apply_identity_filter}"
+            f"apply_identity_filter={apply_identity_filter}, "
+            f"side_face_episode_pre_pad={side_face_episode_pre_pad}, "
+            f"side_face_episode_post_pad={side_face_episode_post_pad}, "
+            f"side_face_blend_fade_frames={side_face_blend_fade_frames}"
         )
         faces = []
         boxes = []
@@ -1185,6 +1265,7 @@ class LipsyncPipeline(DiffusionPipeline):
             empty_zeros = torch.zeros(0, 3, self.image_processor.resolution, self.image_processor.resolution)
             return (
                 empty_zeros,
+                [],
                 [],
                 [],
                 [],
@@ -1465,10 +1546,22 @@ class LipsyncPipeline(DiffusionPipeline):
                 f"(min_run={side_face_warn_min_run_frames}, warn_threshold={yaw_warn_threshold:.1f}°)"
             )
 
-        faces_tensor = torch.stack(faces)
-        return faces_tensor, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info
+        # Cross-fade blend zone at every inpaint<->source boundary. See
+        # ``_compute_blend_zone`` for the coefficient curve; the
+        # returned ``blend_mask`` is consumed by ``restore_video`` to
+        # weight the source contribution into the final output.
+        blend_mask = self._compute_blend_zone(skip_mask, side_face_blend_fade_frames)
+        self._last_side_face_blend_fade_frames = side_face_blend_fade_frames
+        if any(b > 0.0 for b in blend_mask):
+            logger.info(
+                f"[FaceMatch] side_face_blend_zone={sum(1 for b in blend_mask if b > 0.0)} "
+                f"frames (fade={side_face_blend_fade_frames}, peak={max(blend_mask):.2f})"
+            )
 
-    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, skip_mask=None):
+        faces_tensor = torch.stack(faces)
+        return faces_tensor, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask
+
+    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, skip_mask=None, blend_mask=None):
         video_frames = video_frames[: len(faces)]
         out_frames = []
         print(f"Restoring {len(faces)} faces...")
@@ -1477,6 +1570,7 @@ class LipsyncPipeline(DiffusionPipeline):
             height = int(y2 - y1)
             width = int(x2 - x1)
             should_skip = skip_mask[index] if skip_mask and index < len(skip_mask) else False
+            blend_coeff = (blend_mask[index] if blend_mask and index < len(blend_mask) else 0.0)
             if should_skip or height <= 0 or width <= 0:
                 out_frames.append(video_frames[index])
             else:
@@ -1484,6 +1578,17 @@ class LipsyncPipeline(DiffusionPipeline):
                     face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
                 )
                 out_frame = self.image_processor.restorer.restore_img(video_frames[index], face_resized, affine_matrices[index])
+                if blend_coeff > 0.0:
+                    # Cross-fade the inpaint output with the source frame
+                    # at side-face boundaries. blend_coeff is 0.5 at the
+                    # immediate boundary and ramps to 0 at fade_frames
+                    # away (see _compute_blend_zone). Capped below 0.5
+                    # so we never fully replace the inpaint output with
+                    # the source -- a small inpaint contribution keeps
+                    # the look stable while smoothing the transition.
+                    src = video_frames[index].astype(np.float32)
+                    gen = out_frame.astype(np.float32)
+                    out_frame = ((1.0 - blend_coeff) * gen + blend_coeff * src).astype(out_frame.dtype)
                 out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 
@@ -1562,6 +1667,7 @@ class LipsyncPipeline(DiffusionPipeline):
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 3,
         side_face_episode_post_pad: int = 3,
+        side_face_blend_fade_frames: int = 3,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
     ):
@@ -1577,13 +1683,16 @@ class LipsyncPipeline(DiffusionPipeline):
             f"lipsync_continuity_max_scale_change={lipsync_continuity_max_scale_change}, "
             f"lipsync_mouth_diff_break_threshold={lipsync_mouth_diff_break_threshold}, "
             f"identity_similarity_threshold={identity_similarity_threshold}, "
-            f"apply_identity_filter={apply_identity_filter}"
+            f"apply_identity_filter={apply_identity_filter}, "
+            f"side_face_episode_pre_pad={side_face_episode_pre_pad}, "
+            f"side_face_episode_post_pad={side_face_episode_post_pad}, "
+            f"side_face_blend_fade_frames={side_face_blend_fade_frames}"
         )
         if reference_embedding is None and face_embedder is not None:
             reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
             logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
         if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices, frame_skip_mask, frame_continuity_break_mask, frame_aligned_mouth_info = self.affine_transform_video(
+            faces, boxes, affine_matrices, frame_skip_mask, frame_continuity_break_mask, frame_aligned_mouth_info, frame_blend_mask = self.affine_transform_video(
                 video_frames,
                 reference_embedding,
                 yaw_skip_threshold=yaw_skip_threshold,
@@ -1599,6 +1708,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
+                side_face_blend_fade_frames=side_face_blend_fade_frames,
                 yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
                 side_face_warn_min_run_frames=side_face_warn_min_run_frames,
             )
@@ -1610,6 +1720,7 @@ class LipsyncPipeline(DiffusionPipeline):
             loop_skip_mask = []
             loop_continuity_break_mask = []
             loop_aligned_mouth_info = []
+            loop_blend_mask = []
             for i in range(num_loops):
                 if i % 2 == 0:
                     loop_video_frames.append(video_frames)
@@ -1622,6 +1733,7 @@ class LipsyncPipeline(DiffusionPipeline):
                         (True if i > 0 and k == 0 else value)
                         for k, value in enumerate(frame_continuity_break_mask)
                     ]
+                    loop_blend_mask += frame_blend_mask
                 else:
                     loop_video_frames.append(video_frames[::-1])
                     loop_faces.append(faces.flip(0))
@@ -1635,6 +1747,7 @@ class LipsyncPipeline(DiffusionPipeline):
                         for k in range(n_breaks)
                     ]
                     loop_continuity_break_mask += reversed_breaks
+                    loop_blend_mask += frame_blend_mask[::-1]
 
             video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
             faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
@@ -1643,9 +1756,10 @@ class LipsyncPipeline(DiffusionPipeline):
             skip_mask = loop_skip_mask[: len(whisper_chunks)]
             continuity_break_mask = loop_continuity_break_mask[: len(whisper_chunks)]
             aligned_mouth_info = loop_aligned_mouth_info[: len(whisper_chunks)]
+            blend_mask = loop_blend_mask[: len(whisper_chunks)]
         else:
             video_frames = video_frames[: len(whisper_chunks)]
-            faces, boxes, affine_matrices, frame_skip_mask, continuity_break_mask, frame_aligned_mouth_info = self.affine_transform_video(
+            faces, boxes, affine_matrices, frame_skip_mask, continuity_break_mask, frame_aligned_mouth_info, frame_blend_mask = self.affine_transform_video(
                 video_frames,
                 reference_embedding,
                 yaw_skip_threshold=yaw_skip_threshold,
@@ -1661,13 +1775,15 @@ class LipsyncPipeline(DiffusionPipeline):
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
+                side_face_blend_fade_frames=side_face_blend_fade_frames,
                 yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
                 side_face_warn_min_run_frames=side_face_warn_min_run_frames,
             )
             skip_mask = frame_skip_mask
             aligned_mouth_info = frame_aligned_mouth_info
+            blend_mask = frame_blend_mask
 
-        return video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info
+        return video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask
 
     @torch.no_grad()
     def __call__(
@@ -1729,6 +1845,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # Set pre_pad/post_pad to 0 to disable the padding.
         side_face_episode_pre_pad: int = 3,
         side_face_episode_post_pad: int = 3,
+        side_face_blend_fade_frames: int = 3,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
         # Mouth-occlusion prefilter: skip frames where the mouth is covered
@@ -1839,7 +1956,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # not reliable enough to reject other frames (false positives on
         # busy/occluded faces), so we keep all detected faces.
         apply_identity_filter = reference_embedding is not None
-        video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info = self.loop_video(
+        video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask = self.loop_video(
             whisper_chunks,
             video_frames,
             reference_embedding=reference_embedding,
@@ -1857,6 +1974,7 @@ class LipsyncPipeline(DiffusionPipeline):
             apply_identity_filter=apply_identity_filter,
             side_face_episode_pre_pad=side_face_episode_pre_pad,
             side_face_episode_post_pad=side_face_episode_post_pad,
+            side_face_blend_fade_frames=side_face_blend_fade_frames,
             yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
             side_face_warn_min_run_frames=side_face_warn_min_run_frames,
         )
@@ -2277,6 +2395,13 @@ class LipsyncPipeline(DiffusionPipeline):
             quality_fallback_count = 0
         # OR-merge the quality postfilter with the original skip_mask
         effective_skip_mask = [a or b for a, b in zip(skip_mask, quality_skip_mask)]
+        # Recompute the blend zone against the *effective* skip mask so
+        # any new boundaries the quality postfilter introduced (e.g. a
+        # blurry generated mouth) also get a cross-fade. The blend_mask
+        # from loop_video was computed only against the yaw-skip set.
+        effective_blend_mask = self._compute_blend_zone(
+            effective_skip_mask, side_face_blend_fade_frames,
+        )
         quality_skip = sum(quality_skip_mask)
         effective_skip = sum(effective_skip_mask)
         effective_generated = len(effective_skip_mask) - effective_skip
@@ -2335,7 +2460,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     adain=codeformer_adain,
                 )
                 self._last_codeformer_stats = cf_stats.as_dict()
-        synced_video_frames = self.restore_video(all_faces, video_frames, boxes, affine_matrices, effective_skip_mask)
+        synced_video_frames = self.restore_video(all_faces, video_frames, boxes, affine_matrices, effective_skip_mask, blend_mask=effective_blend_mask)
         logger.info(f"[LipSync] restored video frames shape={synced_video_frames.shape}")
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
