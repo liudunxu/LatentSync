@@ -212,11 +212,11 @@ class LipSyncRequest(BaseModel):
     # turning and the affine alignment is unreliable there). Set
     # pre_pad/post_pad to 0 to disable the padding and only do the
     # per-frame yaw skip.
-    side_face_episode_pre_pad: int = Field(0, ge=0, le=30)
-    side_face_episode_post_pad: int = Field(0, ge=0, le=30)
+    side_face_episode_pre_pad: int = Field(3, ge=0, le=30)
+    side_face_episode_post_pad: int = Field(3, ge=0, le=30)
     # Warn-band ratio: yaws above `yaw_skip_threshold * ratio` but below
     # `yaw_skip_threshold` are treated as transition frames / near-profile
-    # runs. Default 0.75 = warn @ 33.75° for the default 45° threshold.
+    # runs. Default 0.75 = warn @ 22.5° for the default 30° threshold.
     yaw_warn_threshold_ratio: float = Field(0.75, ge=0.0, le=1.0)
     side_face_warn_min_run_frames: int = Field(
         0,

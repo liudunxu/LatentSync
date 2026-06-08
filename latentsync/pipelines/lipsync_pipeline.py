@@ -362,6 +362,140 @@ class LipsyncPipeline(DiffusionPipeline):
             return None
 
     @staticmethod
+    def _apply_episode_pad(
+        skip_mask: List[bool],
+        continuity_break_mask: List[bool],
+        yaws: List[Optional[float]],
+        yaw_skip_reasons: List[bool],
+        pre_pad: int,
+        post_pad: int,
+        warn_threshold: float,
+    ) -> int:
+        """Extend ``skip_mask`` into the warn-band transition zone around
+        each yaw-skip episode.
+
+        A contiguous run of yaw-skipped frames represents a single turning
+        motion. The frames immediately before/after the run typically have
+        yaw in the warn band (e.g. 22.5°-30° for the default thresholds)
+        where affine alignment is still unreliable; extending the skip
+        there turns the whole turn into a single side-face episode instead
+        of a fragmentary skip that lets blur sneak in at the boundaries.
+
+        Mutates ``skip_mask`` and ``continuity_break_mask`` in place.
+        Returns the number of newly-skipped frames.
+        """
+        if warn_threshold <= 0 or (pre_pad <= 0 and post_pad <= 0):
+            return 0
+        extra = 0
+        n = len(skip_mask)
+        i = 0
+        while i < n:
+            if not yaw_skip_reasons[i]:
+                i += 1
+                continue
+            # find run end (contiguous yaw-skipped frames)
+            j = i
+            while j < n and yaw_skip_reasons[j]:
+                j += 1
+            # expand left into pre_pad window
+            for k in range(max(0, i - pre_pad), i):
+                if (
+                    not skip_mask[k]
+                    and yaws[k] is not None
+                    and abs(yaws[k]) > warn_threshold
+                ):
+                    skip_mask[k] = True
+                    continuity_break_mask[k] = True
+                    extra += 1
+            # expand right into post_pad window
+            for k in range(j, min(n, j + post_pad)):
+                if (
+                    not skip_mask[k]
+                    and yaws[k] is not None
+                    and abs(yaws[k]) > warn_threshold
+                ):
+                    skip_mask[k] = True
+                    continuity_break_mask[k] = True
+                    extra += 1
+            i = j
+        return extra
+
+    @staticmethod
+    def _apply_warn_run_skip(
+        skip_mask: List[bool],
+        continuity_break_mask: List[bool],
+        yaws: List[Optional[float]],
+        warn_threshold: float,
+        min_run_frames: int,
+    ) -> int:
+        """Skip a contiguous run of warn-band frames when it lasts long enough.
+
+        Independent of ``_apply_episode_pad``: this fires on a sequence of
+        non-skipped warn-band frames that crosses ``min_run_frames`` and
+        marks the whole run as skipped. Useful for the case where yaw
+        hovers just below the absolute threshold for half a second but
+        never crosses it. Mutates in place. Returns the number of newly-
+        skipped frames.
+        """
+        if warn_threshold <= 0 or min_run_frames <= 0:
+            return 0
+        extra = 0
+        n = len(skip_mask)
+        i = 0
+        while i < n:
+            if skip_mask[i] or yaws[i] is None or abs(yaws[i]) <= warn_threshold:
+                i += 1
+                continue
+            j = i
+            while (
+                j < n
+                and not skip_mask[j]
+                and yaws[j] is not None
+                and abs(yaws[j]) > warn_threshold
+            ):
+                j += 1
+            if j - i >= min_run_frames:
+                for k in range(i, j):
+                    skip_mask[k] = True
+                    continuity_break_mask[k] = True
+                    extra += 1
+            i = j
+        return extra
+
+    @staticmethod
+    def _stabilize_yaw_for_rate(
+        yaw_deg: float,
+        prev_yaw: Optional[float],
+        sign_floor: float = 3.0,
+    ) -> float:
+        """Dampen landmark sign-flip jitter on near-frontal faces before
+        yaw-rate calculation.
+
+        When both the current and previous frame have ``|yaw| < sign_floor``
+        (the landmark multi-signal's noise band on a frontal face), the
+        sign of ``yaw_deg`` is unreliable -- the nose-offset signal can
+        flicker between +2° and -2° from frame to frame without any real
+        motion. Using that value directly in
+        ``rate = abs(yaw_deg - prev_yaw)`` produces 4-6° of false
+        per-frame change, which can fire ``yaw_rate_skip`` on a still
+        subject.
+
+        When BOTH samples are below the floor we collapse the current
+        sample to 0 for the rate calculation; the sign of real motion is
+        preserved as soon as one of the samples exits the floor.
+
+        Note: this value is only used for the rate computation. The
+        absolute yaw check (``|yaw| > yaw_skip_threshold``) still uses
+        the raw ``yaw_deg`` -- the floor (3°) is far below the absolute
+        threshold (30°), so the absolute check is unaffected.
+        """
+        if prev_yaw is None:
+            return yaw_deg
+        if abs(yaw_deg) < sign_floor and abs(prev_yaw) < sign_floor:
+            return 0.0
+        return yaw_deg
+
+    @staticmethod
     def _match_color_to_reference(
         face: torch.Tensor,
         ref_face: torch.Tensor,
@@ -1013,8 +1147,8 @@ class LipsyncPipeline(DiffusionPipeline):
         lipsync_mouth_diff_break_threshold: float = 0.10,
         identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = True,
-        side_face_episode_pre_pad: int = 0,
-        side_face_episode_post_pad: int = 0,
+        side_face_episode_pre_pad: int = 3,
+        side_face_episode_post_pad: int = 3,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
     ):
@@ -1123,6 +1257,9 @@ class LipsyncPipeline(DiffusionPipeline):
             # hasn't crossed the absolute threshold yet but is rotating fast
             # enough that affine alignment is unreliable. Threshold is per
             # frame, not per second, so 8°/frame ≈ 200°/sec at 25fps.
+            # ``yaw_deg_for_rate`` is sign-stabilized against landmark jitter
+            # on near-frontal faces (see ``_stabilize_yaw_for_rate``); the
+            # absolute ``yaw_deg`` above is unchanged.
             if (
                 not should_skip
                 and yaw_rate_skip_threshold > 0
@@ -1130,7 +1267,8 @@ class LipsyncPipeline(DiffusionPipeline):
                 and yaw_skip_threshold > 0
                 and yaw_available
             ):
-                rate = abs(yaw_deg - prev_yaw)
+                yaw_deg_for_rate = self._stabilize_yaw_for_rate(yaw_deg, prev_yaw)
+                rate = abs(yaw_deg_for_rate - prev_yaw)
                 if rate > yaw_rate_skip_threshold:
                     should_skip = True
                     yaw_rate_skip_count += 1
@@ -1294,65 +1432,25 @@ class LipsyncPipeline(DiffusionPipeline):
         # still unreliable; we extend the skip_mask to include those
         # transition frames so the whole turn becomes a single side-face
         # episode (instead of a fragmentary skip that lets blur sneak in
-        # at the boundaries).
+        # at the boundaries). The two passes below are extracted as
+        # static helpers so they can be unit-tested without a real video.
         yaw_warn_threshold = yaw_skip_threshold * yaw_warn_threshold_ratio
-        side_face_episode_extra_skip_count = 0
-        side_face_warn_run_skip_count = 0
-        if yaw_warn_threshold > 0 and (
-            side_face_episode_pre_pad > 0 or side_face_episode_post_pad > 0
-        ):
-            n = len(skip_mask)
-            i = 0
-            while i < n:
-                if not yaw_skip_reasons[i]:
-                    i += 1
-                    continue
-                # find run end (contiguous yaw-skipped frames)
-                j = i
-                while j < n and yaw_skip_reasons[j]:
-                    j += 1
-                # expand left into pre_pad window
-                for k in range(max(0, i - side_face_episode_pre_pad), i):
-                    if (
-                        not skip_mask[k]
-                        and yaws[k] is not None
-                        and abs(yaws[k]) > yaw_warn_threshold
-                    ):
-                        skip_mask[k] = True
-                        continuity_break_mask[k] = True
-                        side_face_episode_extra_skip_count += 1
-                # expand right into post_pad window
-                for k in range(j, min(n, j + side_face_episode_post_pad)):
-                    if (
-                        not skip_mask[k]
-                        and yaws[k] is not None
-                        and abs(yaws[k]) > yaw_warn_threshold
-                    ):
-                        skip_mask[k] = True
-                        continuity_break_mask[k] = True
-                        side_face_episode_extra_skip_count += 1
-                i = j
-        if yaw_warn_threshold > 0 and side_face_warn_min_run_frames > 0:
-            n = len(skip_mask)
-            i = 0
-            while i < n:
-                if skip_mask[i] or yaws[i] is None or abs(yaws[i]) <= yaw_warn_threshold:
-                    i += 1
-                    continue
-                j = i
-                while (
-                    j < n
-                    and not skip_mask[j]
-                    and yaws[j] is not None
-                    and abs(yaws[j]) > yaw_warn_threshold
-                ):
-                    j += 1
-                if j - i >= side_face_warn_min_run_frames:
-                    for k in range(i, j):
-                        skip_mask[k] = True
-                        continuity_break_mask[k] = True
-                        side_face_warn_run_skip_count += 1
-                i = j
+        side_face_episode_extra_skip_count = self._apply_episode_pad(
+            skip_mask,
+            continuity_break_mask,
+            yaws,
+            yaw_skip_reasons,
+            side_face_episode_pre_pad,
+            side_face_episode_post_pad,
+            yaw_warn_threshold,
+        )
+        side_face_warn_run_skip_count = self._apply_warn_run_skip(
+            skip_mask,
+            continuity_break_mask,
+            yaws,
+            yaw_warn_threshold,
+            side_face_warn_min_run_frames,
+        )
         self._last_side_face_episode_extra_skip_count = side_face_episode_extra_skip_count
         self._last_side_face_warn_run_skip_count = side_face_warn_run_skip_count
         if side_face_episode_extra_skip_count:
@@ -1462,8 +1560,8 @@ class LipsyncPipeline(DiffusionPipeline):
         lipsync_mouth_diff_break_threshold: float = 0.10,
         identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = True,
-        side_face_episode_pre_pad: int = 0,
-        side_face_episode_post_pad: int = 0,
+        side_face_episode_pre_pad: int = 3,
+        side_face_episode_post_pad: int = 3,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
     ):
@@ -1629,8 +1727,8 @@ class LipsyncPipeline(DiffusionPipeline):
         # around the episode (whose yaw is in the warn band between
         # yaw_skip_threshold * yaw_warn_threshold_ratio and yaw_skip_threshold).
         # Set pre_pad/post_pad to 0 to disable the padding.
-        side_face_episode_pre_pad: int = 0,
-        side_face_episode_post_pad: int = 0,
+        side_face_episode_pre_pad: int = 3,
+        side_face_episode_post_pad: int = 3,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
         # Mouth-occlusion prefilter: skip frames where the mouth is covered
