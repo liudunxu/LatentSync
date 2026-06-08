@@ -1561,7 +1561,7 @@ class LipsyncPipeline(DiffusionPipeline):
         faces_tensor = torch.stack(faces)
         return faces_tensor, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask
 
-    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, skip_mask=None, blend_mask=None):
+    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, skip_mask=None, blend_mask=None, aligned_mouth_info=None):
         video_frames = video_frames[: len(faces)]
         out_frames = []
         print(f"Restoring {len(faces)} faces...")
@@ -1577,7 +1577,24 @@ class LipsyncPipeline(DiffusionPipeline):
                 face_resized = torchvision.transforms.functional.resize(
                     face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
                 )
-                out_frame = self.image_processor.restorer.restore_img(video_frames[index], face_resized, affine_matrices[index])
+                # Build a per-frame inpaint mask in 512x512 aligned-face
+                # space so restore_img can use it (instead of the legacy
+                # 420x560 full-face rectangle) to constrain the paste
+                # region to the mouth area. None falls back to the legacy
+                # full-face paste path inside restore_img.
+                paste_mask_512 = None
+                if aligned_mouth_info is not None and index < len(aligned_mouth_info):
+                    mi = aligned_mouth_info[index]
+                    if mi is not None:
+                        paste_mask_512 = self.generate_dynamic_mouth_mask(
+                            mi, self.image_processor.resolution
+                        )
+                out_frame = self.image_processor.restorer.restore_img(
+                    video_frames[index],
+                    face_resized,
+                    affine_matrices[index],
+                    paste_mask_512=paste_mask_512,
+                )
                 if blend_coeff > 0.0:
                     # Cross-fade the inpaint output with the source frame
                     # at side-face boundaries. blend_coeff is 0.5 at the
@@ -2481,7 +2498,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     mouth_only_paste_enabled=codeformer_mouth_only_paste_enabled,
                 )
                 self._last_codeformer_stats = cf_stats.as_dict()
-        synced_video_frames = self.restore_video(all_faces, video_frames, boxes, affine_matrices, effective_skip_mask, blend_mask=effective_blend_mask)
+        synced_video_frames = self.restore_video(all_faces, video_frames, boxes, affine_matrices, effective_skip_mask, blend_mask=effective_blend_mask, aligned_mouth_info=aligned_mouth_info)
         logger.info(f"[LipSync] restored video frames shape={synced_video_frames.shape}")
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
