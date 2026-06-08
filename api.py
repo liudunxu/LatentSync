@@ -104,6 +104,13 @@ class Settings:
     codeformer_mouth_mask_feather_sigma: float = float(
         os.getenv("LATENTSYNC_CODEFORMER_MOUTH_FEATHER_SIGMA", "5.0")
     )
+    # When the mouth patch is taken from CodeFormer, its per-channel
+    # mean/std is locally recomputed to match the inpainter's same-
+    # region statistics, so the paste is invisible against the
+    # surrounding face. 1.0 = full match (default), 0.0 = no match.
+    codeformer_mouth_roi_color_match_strength: float = float(
+        os.getenv("LATENTSYNC_CODEFORMER_MOUTH_ROI_COLOR_MATCH_STRENGTH", "1.0")
+    )
     # Short-drama profile: when ``codeformer_short_drama_thresholds_enabled``
     # is True and the per-request ``codeformer_short_drama_profile`` is
     # also True, the three quality-check thresholds are loosened from
@@ -962,6 +969,7 @@ class LatentSyncApiRuntime:
             w_retry=settings.codeformer_w_retry,
             retry_max_frames=settings.codeformer_retry_max_frames,
             mouth_mask_feather_sigma=settings.codeformer_mouth_mask_feather_sigma,
+            mouth_roi_color_match_strength=settings.codeformer_mouth_roi_color_match_strength,
         )
         # Eagerly probe the load so we surface "checkpoint missing" at
         # the first request rather than after the inpainter has burned

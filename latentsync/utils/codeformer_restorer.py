@@ -155,8 +155,19 @@ class CodeFormerRestorer:
         # the eyes/forehead/cheeks. The ROI is a fixed rectangle
         # (matches the mouth_diff check) feathered with a Gaussian of
         # ``mouth_mask_feather_sigma`` pixels to avoid a hard seam.
+        # When the mouth patch is taken from CodeFormer, its color
+        # statistics (mean/std per channel) are recomputed locally
+        # to match the inpainter's same-region statistics, so the
+        # paste is invisible. ``mouth_roi_color_match_strength``
+        # controls how aggressively the color is matched: 1.0 = full
+        # match (default, no visible seam), 0.0 = no match (raw
+        # CodeFormer colors leak through). Strength between 0 and 1
+        # partially mixes the two; lower values preserve more of
+        # CodeFormer's own color in case the inpainter's mouth color
+        # is itself off.
         mouth_only_paste_enabled: bool = False,
         mouth_mask_feather_sigma: float = 5.0,
+        mouth_roi_color_match_strength: float = 1.0,
     ) -> None:
         self.checkpoint_path = checkpoint_path
         self.device = torch.device(device) if isinstance(device, str) else device
@@ -187,6 +198,7 @@ class CodeFormerRestorer:
         # Tier 3
         self.mouth_only_paste_enabled = bool(mouth_only_paste_enabled)
         self.mouth_mask_feather_sigma = float(mouth_mask_feather_sigma)
+        self.mouth_roi_color_match_strength = float(mouth_roi_color_match_strength)
         self._net = None  # type: Optional[torch.nn.Module]
         self._load_error: str = ""
 
@@ -639,9 +651,21 @@ class CodeFormerRestorer:
 
         Replaces the legacy full-face ``keep * restored + (1-keep) *
         batch`` blend with a per-pixel mask: inside the mouth ROI we
-        take the CodeFormer output, outside we keep the inpainter's
-        output. The ``keep`` mask still gates whether the CodeFormer
-        output (or the input) is used at all, regardless of region.
+        take the CodeFormer output (color-matched to the inpainter's
+        output in the same ROI, see below), outside we keep the
+        inpainter's original. The ``keep`` mask still gates whether
+        the CodeFormer output (or the input) is used at all,
+        regardless of region.
+
+        Why the per-ROI color match: CodeFormer runs ``adain=True`` so
+        its whole-face color statistics already track the inpainter
+        input. But the WHOLE-face AdaIN is computed over the full
+        512x512 face -- when we slice out only the mouth ROI for
+        paste-back, that sub-region's mean/std no longer matches the
+        surrounding face's mean/std, leaving a visible color seam
+        where the inpainter's mouth meets the CodeFormer mouth.
+        ``_color_match_to_roi`` recomputes the match locally so the
+        paste is invisible.
 
         Output shape: ``(B, 3, H, W)`` -- same as ``batch`` and
         ``restored``. ``keep`` is a ``(B,)`` bool tensor.
@@ -649,11 +673,100 @@ class CodeFormerRestorer:
         mask = self._mouth_mask_with_feather(
             batch.shape[-2], batch.shape[-1], batch.device
         )
-        # mouth_paste: take restored inside the mouth, batch outside.
-        mouth_paste = mask * restored + (1.0 - mask) * batch
+        # Recolor the CodeFormer mouth to match the inpainter mouth.
+        # ``restored`` carries the high-frequency detail (the whole
+        # point of running CodeFormer); ``batch`` carries the color
+        # statistics we want to keep. The affine transfer preserves
+        # ``restored``'s spatial detail while aligning its per-channel
+        # mean/std to ``batch``'s in the ROI.
+        if self.mouth_roi_color_match_strength > 0:
+            matched = self._color_match_to_roi(
+                restored,
+                batch,
+                mask,
+                strength=self.mouth_roi_color_match_strength,
+            )
+        else:
+            matched = restored
+        # mouth_paste: take the recolored CodeFormer output inside
+        # the mouth, inpainter output outside.
+        mouth_paste = mask * matched + (1.0 - mask) * batch
         keep_4d = keep.float().view(-1, 1, 1, 1)
         # Final: keep the paste where keep=True, else take batch.
         return keep_4d * mouth_paste + (1.0 - keep_4d) * batch
+
+    @staticmethod
+    def _color_match_to_roi(
+        source: torch.Tensor,
+        reference: torch.Tensor,
+        mask: torch.Tensor,
+        strength: float = 1.0,
+    ) -> torch.Tensor:
+        """Per-channel mean+std color transfer from ``source`` to
+        ``reference``, with statistics computed only inside ``mask``.
+
+        This is the localised equivalent of
+        ``LipsyncPipeline._match_color_to_reference``: it transfers
+        the per-channel color statistics of ``reference`` (the
+        inpainter output) onto ``source`` (the CodeFormer output)
+        using the masked region as the reference for both the
+        statistics and the magnitude of the transfer. High-frequency
+        content of ``source`` (edges, teeth, lip lines) is preserved
+        because the transfer is a per-channel affine, not a per-pixel
+        copy.
+
+        Args:
+            source: ``(B, 3, H, W)`` tensor to recolor (typically
+                CodeFormer output).
+            reference: ``(B, 3, H, W)`` tensor whose color statistics
+                to match (typically the inpainter output).
+            mask: ``(1, 1, H, W)`` (or broadcastable) float mask in
+                [0, 1] indicating which pixels to use for the
+                statistics AND to apply the transfer to. Pixels
+                outside the mask keep ``source``'s color.
+            strength: blend coefficient; 0 = no transfer (return
+                ``source`` unchanged), 1 = full transfer.
+
+        Returns:
+            Same shape as ``source``.
+        """
+        if strength <= 0 or source is None or reference is None or mask is None:
+            return source
+        if source.shape != reference.shape:
+            return source
+        try:
+            x = source.detach().to(torch.float32)
+            r = reference.detach().to(device=x.device, dtype=torch.float32)
+            m1 = mask.detach().to(device=x.device, dtype=torch.float32)
+            if m1.dim() == 4 and m1.shape[1] == 1:
+                m_w = m1
+                m3 = m1.expand(-1, 3, -1, -1)
+            elif m1.dim() == 2:
+                m_w = m1.unsqueeze(0).unsqueeze(0)
+                m3 = m_w.expand(-1, 3, -1, -1)
+            else:
+                return source
+            if m3.shape[0] == 1 and x.shape[0] > 1:
+                m3 = m3.expand(x.shape[0], -1, -1, -1)
+                m_w = m_w.expand(x.shape[0], -1, -1, -1)
+            if m3.shape[0] != x.shape[0]:
+                return source
+            weight_sum = m_w.sum(dim=(2, 3)).clamp_min(1.0).expand(-1, 3)
+            src_mean = (x * m3).sum(dim=(2, 3)) / weight_sum
+            tgt_mean = (r * m3).sum(dim=(2, 3)) / weight_sum
+            src_var = ((x - src_mean[:, :, None, None]) ** 2 * m3).sum(dim=(2, 3)) / weight_sum
+            tgt_var = ((r - tgt_mean[:, :, None, None]) ** 2 * m3).sum(dim=(2, 3)) / weight_sum
+            src_std = src_var.clamp_min(1e-6).sqrt()
+            tgt_std = tgt_var.clamp_min(1e-6).sqrt()
+            scale = tgt_std / src_std
+            shift = tgt_mean - src_mean * scale
+            adjusted = x * scale[:, :, None, None] + shift[:, :, None, None]
+            # Apply the transfer to the masked region only; outside
+            # the mask we keep ``source``'s original color.
+            out = x + m3 * strength * (adjusted - x)
+            return out.to(source.dtype)
+        except Exception:
+            return source
 
     # -- Tier 1/2/3 bucket runner ---------------------------------------
 

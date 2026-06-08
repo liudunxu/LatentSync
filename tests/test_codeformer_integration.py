@@ -747,6 +747,11 @@ class TestMouthOnlyBlend(unittest.TestCase):
         # quality check (one pixel is negligible vs the whole ROI's
         # mean abs diff), but it gives us a probe to verify the
         # mouth-only paste did or didn't take.
+        #
+        # We disable the ROI color match (``strength=0``) here so the
+        # test is checking the pure spatial-paste path without the
+        # color-statistic transfer changing the output. The color
+        # match itself is covered by ``TestMouthRoiColorMatch``.
         H = W = 512
         y0, y1 = int(H * 0.55), int(H * 0.74)
         x0, x1 = int(W * 0.30), int(W * 0.70)
@@ -765,6 +770,7 @@ class TestMouthOnlyBlend(unittest.TestCase):
             batch_size=2,
             mouth_only_paste_enabled=True,
             mouth_mask_feather_sigma=0.0,  # hard rectangle for the test
+            mouth_roi_color_match_strength=0.0,  # test the raw paste path
         )
         restorer._net = fake
 
@@ -884,6 +890,154 @@ class TestMouthOnlyBlend(unittest.TestCase):
         self.assertAlmostEqual(mask[0, 0, int(H * 0.65), int(W * 0.5)].item(), 1.0)
         # One pixel outside the rectangle -> 0.
         self.assertAlmostEqual(mask[0, 0, int(H * 0.74) + 1, int(W * 0.5)].item(), 0.0)
+
+
+class TestMouthRoiColorMatch(unittest.TestCase):
+    """When the mouth patch is taken from CodeFormer (Tier 3
+    mouth-only paste-back), its per-channel color statistics should
+    be locally recomputed to match the inpainter's same-region
+    statistics -- otherwise the paste shows as a visible color seam
+    against the surrounding face.
+    """
+
+    def test_color_match_aligns_means_and_stds(self):
+        # Make two tensors with very different per-channel means/stds
+        # in the mouth ROI. The color-match should bring ``source``'s
+        # statistics onto ``reference``'s statistics inside the ROI,
+        # while leaving pixels outside the ROI untouched.
+        from latentsync.utils.codeformer_restorer import CodeFormerRestorer
+
+        H = W = 512
+        y0, y1 = int(H * 0.55), int(H * 0.74)
+        x0, x1 = int(W * 0.30), int(W * 0.70)
+
+        # Source and reference have the SAME mean everywhere (not just
+        # in the ROI) -- so the feathered mask's weighted stats over
+        # the mask region match the ROI stats. If we left source=0
+        # outside the ROI, the feather would pull the weighted mean
+        # toward 0 and the test would fail for the right reason.
+        source = 0.3 * torch.ones(2, 3, H, W)
+        for ch in range(3):
+            source[:, ch, y0:y1, x0:x1] += 0.1 * torch.randn(2, y1 - y0, x1 - x0)
+        reference = -0.4 * torch.ones(2, 3, H, W)
+        for ch in range(3):
+            reference[:, ch, y0:y1, x0:x1] += 0.05 * torch.randn(2, y1 - y0, x1 - x0)
+
+        restorer = CodeFormerRestorer(
+            checkpoint_path="/nonexistent/codeformer.pth",
+            device="cpu",
+            batch_size=2,
+            mouth_mask_feather_sigma=10.0,  # wide Gaussian -> partial mask at the ROI boundary
+        )
+        mask = restorer._mouth_mask_with_feather(H, W, torch.device("cpu"))
+        out = restorer._color_match_to_roi(source, reference, mask, strength=1.0)
+
+        # Pixels WELL outside the ROI (50px clear of the rectangle)
+        # are untouched. The wide-feather mask bleeds up to ~3*sigma
+        # ~30px beyond the rectangle, so 50px of margin keeps us in
+        # the unaltered zone.
+        margin = 50
+        self.assertTrue(torch.equal(
+            out[:, :, :y0 - margin, :], source[:, :, :y0 - margin, :]
+        ))
+        self.assertTrue(torch.equal(
+            out[:, :, y1 + margin:, :], source[:, :, y1 + margin:, :]
+        ))
+        self.assertTrue(torch.equal(
+            out[:, :, :, :x0 - margin], source[:, :, :, :x0 - margin]
+        ))
+        self.assertTrue(torch.equal(
+            out[:, :, :, x1 + margin:], source[:, :, :, x1 + margin:]
+        ))
+
+        # Inside the ROI, the per-channel mean and std of the
+        # output should match the reference's. Probe deep inside
+        # the ROI where the feather mask is saturated at 1.0.
+        cy0, cy1 = (y0 + y1) // 2 - 20, (y0 + y1) // 2 + 20
+        cx0, cx1 = (x0 + x1) // 2 - 20, (x0 + x1) // 2 + 20
+        ref_roi = reference[:, :, cy0:cy1, cx0:cx1]
+        ref_mean = ref_roi.mean(dim=(2, 3))
+        ref_std = ref_roi.std(dim=(2, 3))
+        out_roi = out[:, :, cy0:cy1, cx0:cx1]
+        out_mean = out_roi.mean(dim=(2, 3))
+        out_std = out_roi.std(dim=(2, 3))
+        # Allow some slack for the small random sample.
+        for ch in range(3):
+            self.assertAlmostEqual(
+                out_mean[0, ch].item(), ref_mean[0, ch].item(), places=1,
+                msg=f"channel {ch} mean should match reference",
+            )
+            self.assertAlmostEqual(
+                out_std[0, ch].item(), ref_std[0, ch].item(), places=1,
+                msg=f"channel {ch} std should match reference",
+            )
+
+    def test_strength_zero_is_noop(self):
+        from latentsync.utils.codeformer_restorer import CodeFormerRestorer
+
+        H = W = 512
+        source = torch.rand(1, 3, H, W)
+        reference = torch.rand(1, 3, H, W)
+        restorer = CodeFormerRestorer(
+            checkpoint_path="/nonexistent/codeformer.pth",
+            device="cpu",
+            batch_size=1,
+        )
+        mask = restorer._mouth_mask_with_feather(H, W, torch.device("cpu"))
+        out = restorer._color_match_to_roi(source, reference, mask, strength=0.0)
+        # strength=0 -> unchanged.
+        self.assertTrue(torch.equal(out, source))
+
+    def test_mouth_only_blend_includes_color_match(self):
+        """End-to-end check that the mouth-only blend path applies
+        the color match: with mouth-only paste on, the output
+        inside the mouth ROI should have the inpainter's color
+        statistics, not CodeFormer's.
+        """
+        from latentsync.utils.codeformer_restorer import CodeFormerRestorer
+
+        H = W = 512
+        y0, y1 = int(H * 0.55), int(H * 0.74)
+        x0, x1 = int(W * 0.30), int(W * 0.70)
+
+        # Build a FakeNet whose output has very different color
+        # statistics from the input. Color-match should neutralize.
+        def output_fn(x, w, n):
+            # Invert the input + shift, so the output mean is way
+            # off from the input. The color match should pull it
+            # back to match the input in the ROI.
+            return -x + 0.5
+
+        fake = _RecordingFakeNet(output_fn=output_fn)
+        restorer = CodeFormerRestorer(
+            checkpoint_path="/nonexistent/codeformer.pth",
+            device="cpu",
+            batch_size=1,
+            mouth_only_paste_enabled=True,
+            mouth_mask_feather_sigma=0.0,  # hard rectangle for a clean test
+            mouth_roi_color_match_strength=1.0,
+        )
+        restorer._net = fake
+
+        # Input (batch) mouth: bright (mean ~ 0.5).
+        # FakeNet output (restored) mouth: -0.5 + 0.5 = 0 -- DARK
+        # Color-match should bring the output mean back up to 0.5.
+        faces = torch.zeros(1, 3, H, W) + 0.5
+        # Make the input mouth a different color so we can detect drift.
+        faces[:, :, y0:y1, x0:x1] = 0.5
+
+        out, stats = restorer.restore_faces(faces, mouth_only_paste_enabled=True)
+        # The output mouth should match the input's bright color
+        # (0.5), not CodeFormer's near-zero color.
+        out_mouth_mean = out[:, :, y0+5:y1-5, x0+5:x1-5].mean(dim=(2, 3))
+        for ch in range(3):
+            # Allow some slack for the small sample.
+            self.assertAlmostEqual(
+                out_mouth_mean[0, ch].item(), 0.5, places=1,
+                msg=f"channel {ch} mean should be ~0.5 (input), not ~0 (CodeFormer)",
+            )
+        # Outside the ROI: should still be the input color.
+        self.assertTrue(torch.equal(out[:, :, :y0, :], faces[:, :, :y0, :]))
 
 
 class TestBackwardCompatTier(unittest.TestCase):
