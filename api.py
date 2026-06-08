@@ -151,7 +151,15 @@ class LipSyncRequest(BaseModel):
     blend_mask_blur_ratio: float = Field(0.01, ge=0.0, le=0.2)
     color_match_strength: float = Field(0.60, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
-    mouth_sharpen_strength: float = Field(0.0, ge=0.0, le=1.0)
+    # Unsharp-mask amount applied to the generated mouth region. 0 = off,
+    # 1 = strong sharpen. Default 0.30 (was 0.0): the inpainter's output
+    # tends to be slightly soft -- the diffusion process encourages
+    # plausible-but-not-sharp, so a small amount of unsharp in the mouth
+    # region recovers the high-frequency detail (teeth, lip lines, mouth
+    # corners) that the generated content is missing. 0.30 is in the
+    # "mild" range documented in the unsharp-mask helper; values above
+    # ~0.7 start to look crunchy. Frontend can still override per request.
+    mouth_sharpen_strength: float = Field(0.30, ge=0.0, le=1.0)
     # Frame-to-frame mouth stabilization: was 0.08, raised to 0.15 so the
     # EMA carryover actually damps the high-frequency jitter the diffusion
     # output tends to have. 0 disables entirely.
