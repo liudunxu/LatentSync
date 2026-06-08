@@ -1561,7 +1561,7 @@ class LipsyncPipeline(DiffusionPipeline):
         faces_tensor = torch.stack(faces)
         return faces_tensor, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask
 
-    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, skip_mask=None, blend_mask=None, aligned_mouth_info=None):
+    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, skip_mask=None, blend_mask=None, aligned_mouth_info=None, dynamic_masks=None):
         video_frames = video_frames[: len(faces)]
         out_frames = []
         print(f"Restoring {len(faces)} faces...")
@@ -1580,10 +1580,18 @@ class LipsyncPipeline(DiffusionPipeline):
                 # Build a per-frame inpaint mask in 512x512 aligned-face
                 # space so restore_img can use it (instead of the legacy
                 # 420x560 full-face rectangle) to constrain the paste
-                # region to the mouth area. None falls back to the legacy
-                # full-face paste path inside restore_img.
+                # region to the mouth area.
+                #   * If the caller already computed the mask in the
+                #     inference loop (the common path), reuse it --
+                #     avoids recomputing the same generate_dynamic_mouth_mask
+                #     call twice per frame.
+                #   * Otherwise (legacy callers, detect-fail fallback),
+                #     compute on the fly. None falls back to the legacy
+                #     full-face paste path inside restore_img.
                 paste_mask_512 = None
-                if aligned_mouth_info is not None and index < len(aligned_mouth_info):
+                if dynamic_masks is not None and index < len(dynamic_masks):
+                    paste_mask_512 = dynamic_masks[index]
+                elif aligned_mouth_info is not None and index < len(aligned_mouth_info):
                     mi = aligned_mouth_info[index]
                     if mi is not None:
                         paste_mask_512 = self.generate_dynamic_mouth_mask(
@@ -2073,6 +2081,12 @@ class LipsyncPipeline(DiffusionPipeline):
         mouth_stabilization_applied_count = 0
 
         synced_video_frames = []
+        # Cache the per-frame dynamic mouth masks computed in the
+        # inference loop so restore_video can reuse them instead of
+        # calling generate_dynamic_mouth_mask a second time per
+        # frame. Each mask is (1, 512, 512) float32 ~= 1MB; the
+        # total is negligible relative to the per-request savings.
+        all_dynamic_masks: List[torch.Tensor] = []
 
         num_channels_latents = self.vae.config.latent_channels
 
@@ -2136,6 +2150,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 dm = self.generate_dynamic_mouth_mask(mi, height)
                 dynamic_region_masks.append(dm)
             dynamic_region_mask_batch = torch.stack(dynamic_region_masks)  # (B, 1, H, W)
+            all_dynamic_masks.append(dynamic_region_mask_batch)
 
             # 7. Prepare mask latent variables
             mask_latents, masked_image_latents = self.prepare_mask_latents(
@@ -2498,7 +2513,25 @@ class LipsyncPipeline(DiffusionPipeline):
                     mouth_only_paste_enabled=codeformer_mouth_only_paste_enabled,
                 )
                 self._last_codeformer_stats = cf_stats.as_dict()
-        synced_video_frames = self.restore_video(all_faces, video_frames, boxes, affine_matrices, effective_skip_mask, blend_mask=effective_blend_mask, aligned_mouth_info=aligned_mouth_info)
+        # Concatenate the per-batch dynamic mouth masks (computed in
+        # the inference loop above) and pass them to restore_video so
+        # it can reuse them instead of calling
+        # generate_dynamic_mouth_mask a second time per frame.
+        all_dynamic_mask_tensor = (
+            torch.cat(all_dynamic_masks, dim=0)[: len(aligned_mouth_info)]
+            if all_dynamic_masks
+            else None
+        )
+        synced_video_frames = self.restore_video(
+            all_faces,
+            video_frames,
+            boxes,
+            affine_matrices,
+            effective_skip_mask,
+            blend_mask=effective_blend_mask,
+            aligned_mouth_info=aligned_mouth_info,
+            dynamic_masks=all_dynamic_mask_tensor,
+        )
         logger.info(f"[LipSync] restored video frames shape={synced_video_frames.shape}")
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
