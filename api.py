@@ -86,6 +86,42 @@ class Settings:
     codeformer_preload: bool = os.getenv("LATENTSYNC_CODEFORMER_PRELOAD", "0").lower() in {"1", "true", "yes"}
     codeformer_batch_size: int = int(os.getenv("LATENTSYNC_CODEFORMER_BATCH_SIZE", "8"))
     codeformer_required: bool = os.getenv("LATENTSYNC_CODEFORMER_REQUIRED", "0").lower() in {"1", "true", "yes"}
+    # Tier 1 -- adaptive per-frame w bucketing. ``sharp_threshold`` and
+    # ``blurry_threshold`` are mouth-region Laplacian variance values
+    # (typical 0.001-0.1 for 512x512 aligned faces); the per-bucket w
+    # values follow. The defaults are conservative placeholders -- run
+    # ``tools/calibrate_codeformer_thresholds.py`` against a real
+    # short-drama sample to pick better numbers.
+    codeformer_sharp_threshold: float = float(os.getenv("LATENTSYNC_CODEFORMER_SHARP_THRESHOLD", "0.05"))
+    codeformer_blurry_threshold: float = float(os.getenv("LATENTSYNC_CODEFORMER_BLURRY_THRESHOLD", "0.01"))
+    codeformer_w_sharp: float = float(os.getenv("LATENTSYNC_CODEFORMER_W_SHARP", "0.85"))
+    codeformer_w_medium: float = float(os.getenv("LATENTSYNC_CODEFORMER_W_MEDIUM", "0.7"))
+    codeformer_w_blurry: float = float(os.getenv("LATENTSYNC_CODEFORMER_W_BLURRY", "0.5"))
+    # Tier 2 -- retry pass for frames that fail in the blurry bucket.
+    codeformer_w_retry: float = float(os.getenv("LATENTSYNC_CODEFORMER_W_RETRY", "0.4"))
+    codeformer_retry_max_frames: int = int(os.getenv("LATENTSYNC_CODEFORMER_RETRY_MAX_FRAMES", "64"))
+    # Tier 3 -- mouth-ROI paste-back feather (Gaussian sigma in pixels).
+    codeformer_mouth_mask_feather_sigma: float = float(
+        os.getenv("LATENTSYNC_CODEFORMER_MOUTH_FEATHER_SIGMA", "5.0")
+    )
+    # Short-drama profile: when ``codeformer_short_drama_thresholds_enabled``
+    # is True and the per-request ``codeformer_short_drama_profile`` is
+    # also True, the three quality-check thresholds are loosened from
+    # 0.20/0.15/[0.5,2.0] to the values below. Server-side defaults;
+    # per-request overrides of the individual thresholds aren't
+    # currently exposed (kept simple to avoid a 4-field UI).
+    codeformer_short_drama_thresholds_enabled: bool = os.getenv(
+        "LATENTSYNC_CODEFORMER_SHORT_DRAMA_THRESHOLDS", "1"
+    ).lower() in {"1", "true", "yes"}
+    codeformer_pixel_diff_short_drama: float = float(
+        os.getenv("LATENTSYNC_CODEFORMER_PIXEL_DIFF_SHORT_DRAMA", "0.30")
+    )
+    codeformer_mouth_diff_short_drama: float = float(
+        os.getenv("LATENTSYNC_CODEFORMER_MOUTH_DIFF_SHORT_DRAMA", "0.22")
+    )
+    codeformer_sharpness_high_short_drama: float = float(
+        os.getenv("LATENTSYNC_CODEFORMER_SHARP_HIGH_SHORT_DRAMA", "2.5")
+    )
 
 
 settings = Settings()
@@ -330,6 +366,41 @@ class LipSyncRequest(BaseModel):
     codeformer_required: bool = Field(
         settings.codeformer_required,
         description="If True and codeformer_enabled=True, fail the request when the CodeFormer checkpoint is missing.",
+    )
+    # --- CodeFormer Tier 1/2/3 (short-drama-tuned, added 2026-06) ---
+    # Master switch: when True, the three toggles below are honored and
+    # the looser quality-check thresholds (``codeformer_*_short_drama``
+    # in ``Settings``) replace the conservative 08cb35f defaults. When
+    # False, the per-tier toggles are ignored and behavior falls back
+    # to the 08cb35f single-w / strict-threshold path. Default True
+    # because the short-drama use case is the request shape the project
+    # is tuned for; clients that want the old behavior set False.
+    codeformer_short_drama_profile: bool = Field(
+        True,
+        description="Master switch for the short-drama-tuned CodeFormer: enables adaptive w, "
+                    "looser quality-check thresholds, mouth-only paste-back, and (when "
+                    "codeformer_retry_enabled is also True) the w=0.4 retry pass on the blurry "
+                    "bucket. Set False to restore 08cb35f conservative behavior.",
+    )
+    codeformer_adaptive_w_enabled: bool = Field(
+        True,
+        description="Bucket frames by input mouth-region sharpness; run CodeFormer with "
+                    "w_sharp=0.85, w_medium=0.7, w_blurry=0.5 per bucket. Only effective when "
+                    "codeformer_short_drama_profile is also True.",
+    )
+    codeformer_retry_enabled: bool = Field(
+        False,
+        description="If a frame in the blurry bucket fails the quality check on the first pass, "
+                    "re-run it with w=0.4 (more aggressive codebook). Capped at "
+                    "codeformer_retry_max_frames per request. Only effective when "
+                    "codeformer_short_drama_profile is also True.",
+    )
+    codeformer_mouth_only_paste_enabled: bool = Field(
+        True,
+        description="When the quality check passes, paste back only the mouth ROI from CodeFormer; "
+                    "rest of the face stays as the inpainter's original output. Decouples the "
+                    "aggressive-w passes from identity drift on eyes/forehead/cheeks. Only "
+                    "effective when codeformer_short_drama_profile is also True.",
     )
 
 
@@ -869,10 +940,28 @@ class LatentSyncApiRuntime:
             logger.error("[LipSync] %s", self.codeformer_load_error)
             return None, self.codeformer_load_error
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        # The restorer is a singleton (per the lazy-load pattern); the
+        # per-request ``codeformer_short_drama_profile`` flag only
+        # controls the 3 Tier toggles, NOT the quality-check thresholds
+        # (those are server-side via env vars). To get the original
+        # 08cb35f strict thresholds, set the corresponding
+        # ``LATENTSYNC_CODEFORMER_*_SHORT_DRAMA`` env vars to the old
+        # values (0.20 / 0.15 / 2.0).
         self.codeformer_restorer = CodeFormerRestorer(
             checkpoint_path=settings.codeformer_checkpoint_path,
             device=device,
             batch_size=settings.codeformer_batch_size,
+            fallback_pixel_diff=settings.codeformer_pixel_diff_short_drama,
+            fallback_mouth_diff=settings.codeformer_mouth_diff_short_drama,
+            fallback_sharpness_high=settings.codeformer_sharpness_high_short_drama,
+            sharp_threshold=settings.codeformer_sharp_threshold,
+            blurry_threshold=settings.codeformer_blurry_threshold,
+            w_sharp=settings.codeformer_w_sharp,
+            w_medium=settings.codeformer_w_medium,
+            w_blurry=settings.codeformer_w_blurry,
+            w_retry=settings.codeformer_w_retry,
+            retry_max_frames=settings.codeformer_retry_max_frames,
+            mouth_mask_feather_sigma=settings.codeformer_mouth_mask_feather_sigma,
         )
         # Eagerly probe the load so we surface "checkpoint missing" at
         # the first request rather than after the inpainter has burned
@@ -1216,10 +1305,26 @@ class LatentSyncApiRuntime:
                 # it didn't (e.g. checkpoint missing and not required) the
                 # pipeline logs a warning and skips. Either way, the
                 # pipeline still runs -- the failure mode is "no
-                # postprocess", not "broken output".
+                # postprocess", not "broken output". The three Tier 1/2/3
+                # toggles below are gated by the per-request master
+                # switch ``codeformer_short_drama_profile`` so clients
+                # can opt back to the conservative 08cb35f single-w
+                # behavior with a single flag flip.
                 codeformer_enabled=payload.codeformer_enabled,
                 codeformer_fidelity_weight=payload.codeformer_fidelity_weight,
                 codeformer_adain=payload.codeformer_adain,
+                codeformer_adaptive_w_enabled=(
+                    payload.codeformer_adaptive_w_enabled
+                    and payload.codeformer_short_drama_profile
+                ),
+                codeformer_retry_enabled=(
+                    payload.codeformer_retry_enabled
+                    and payload.codeformer_short_drama_profile
+                ),
+                codeformer_mouth_only_paste_enabled=(
+                    payload.codeformer_mouth_only_paste_enabled
+                    and payload.codeformer_short_drama_profile
+                ),
                 codeformer_restorer=codeformer_restorer,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")

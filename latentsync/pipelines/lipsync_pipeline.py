@@ -1903,9 +1903,17 @@ class LipsyncPipeline(DiffusionPipeline):
         # is *generated* content -- at w=0.5 the codebook path tends
         # to overwrite the lipsync result with a "more typical" face.
         # 0.7 keeps more of the input, at a small cost in sharpness.
+        # The Tier 1/2/3 toggles below default to False here; the
+        # restorer reads them as per-call overrides of its own
+        # instance-level config. ``api.py`` is responsible for
+        # combining the per-request short-drama master switch with
+        # the per-tier toggles before passing them down.
         codeformer_enabled: bool = False,
         codeformer_fidelity_weight: float = 0.7,
         codeformer_adain: bool = True,
+        codeformer_adaptive_w_enabled: bool = False,
+        codeformer_retry_enabled: bool = False,
+        codeformer_mouth_only_paste_enabled: bool = False,
         codeformer_restorer=None,
         **kwargs,
     ):
@@ -2427,19 +2435,24 @@ class LipsyncPipeline(DiffusionPipeline):
         #     apply unchanged.
         # Frames marked skipped by the pipeline are passed through
         # untouched (the restorer handles that internally) so the source
-        # video is never re-sharpened on top of itself.
-        self._last_codeformer_stats = {
-            "enabled": bool(codeformer_enabled),
-            "loaded": False,
-            "frames_total": int(all_faces.shape[0]),
-            "frames_enhanced": 0,
-            "frames_skipped_by_pipeline": int(sum(effective_skip_mask)),
-            "elapsed_seconds": 0.0,
-            "fidelity_weight": float(codeformer_fidelity_weight),
-            "batch_size": 0,
-            "checkpoint_path": "",
-            "error": "",
-        }
+        # video is never re-sharpened on top of itself. We build a
+        # CodeformerStats directly (rather than a hand-rolled dict) so
+        # the new Tier 1/2/3 fields stay in sync with the restorer's
+        # schema without a separate mirror.
+        from latentsync.utils.codeformer_restorer import CodeformerStats
+
+        self._last_codeformer_stats = CodeformerStats(
+            enabled=bool(codeformer_enabled),
+            loaded=False,
+            frames_total=int(all_faces.shape[0]),
+            frames_enhanced=0,
+            frames_skipped_by_pipeline=int(sum(effective_skip_mask)),
+            elapsed_seconds=0.0,
+            fidelity_weight=float(codeformer_fidelity_weight),
+            batch_size=0,
+            checkpoint_path="",
+            error="",
+        ).as_dict()
         if codeformer_enabled:
             if codeformer_restorer is None:
                 logger.warning(
@@ -2458,6 +2471,9 @@ class LipsyncPipeline(DiffusionPipeline):
                     skip_mask=effective_skip_mask,
                     fidelity_weight=codeformer_fidelity_weight,
                     adain=codeformer_adain,
+                    adaptive_w_enabled=codeformer_adaptive_w_enabled,
+                    retry_enabled=codeformer_retry_enabled,
+                    mouth_only_paste_enabled=codeformer_mouth_only_paste_enabled,
                 )
                 self._last_codeformer_stats = cf_stats.as_dict()
         synced_video_frames = self.restore_video(all_faces, video_frames, boxes, affine_matrices, effective_skip_mask, blend_mask=effective_blend_mask)
