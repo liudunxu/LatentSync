@@ -22,6 +22,19 @@ class AlignRestore(object):
             self.fill_value = torch.tensor([127, 127, 127], device=device, dtype=dtype)
             self.mask = torch.ones((1, 1, self.face_size[1], self.face_size[0]), device=device, dtype=dtype)
 
+    def reset_p_bias(self) -> None:
+        """Reset the cross-frame affine translation smoothing state.
+
+        Call this at the start of any batch where the previous
+        batch's end-of-stream bias would not be representative of
+        the incoming frames (e.g. a scene cut, a different camera
+        distance, or simply the start of a new video). Without a
+        reset, ``p_bias`` EMA converges to a value that drifts from
+        the per-frame true bias and corrupts ``M[:, 2]`` for the
+        first few frames of the new batch.
+        """
+        self.p_bias = None
+
     def align_warp_face(self, img, landmarks3, smooth=True):
         affine_matrix, self.p_bias = self.transformation_from_points(
             landmarks3, self.face_template, smooth, self.p_bias
