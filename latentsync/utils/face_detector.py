@@ -54,7 +54,15 @@ class FaceDetector:
                 logger.debug(f"[FaceDetector] Skipping side face: yaw={yaw:.1f}")
                 return None, None
 
-        lmk = np.round(face.landmark_2d_106).astype(np.int_)
+        # Keep the 106-point landmarks as float (sub-pixel). The bbox
+        # math on lines below still casts to int, so the bbox stays
+        # pixel-aligned -- only the per-landmark coordinates retain
+        # sub-pixel precision, which reduces alignment jitter on small
+        # or distant faces (the affine warp in
+        # ``affine_transform.transformation_from_points`` is float
+        # throughout, so the input precision is what determines output
+        # precision).
+        lmk = face.landmark_2d_106
 
         halk_face_coord = np.mean([lmk[74], lmk[73]], axis=0)
 

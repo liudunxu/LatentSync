@@ -88,7 +88,11 @@ class ImageProcessor:
         pt_right_eye = np.mean(landmark_2d_106[101:106], axis=0)  # right eyebrow center
         pt_nose = np.mean(landmark_2d_106[[74, 77, 83, 86]], axis=0)  # nose center
 
-        landmarks3 = np.round([pt_left_eye, pt_right_eye, pt_nose])
+        # Pass through the 3 align points as float -- the affine
+        # transform in AlignRestore.transformation_from_points is
+        # already float, so rounding upstream only adds alignment
+        # jitter on small / distant faces.
+        landmarks3 = np.array([pt_left_eye, pt_right_eye, pt_nose])
 
         face, affine_matrix = self.restorer.align_warp_face(image.copy(), landmarks3=landmarks3, smooth=True)
         box = [0, 0, face.shape[1], face.shape[0]]  # x1, y1, x2, y2
@@ -107,7 +111,9 @@ class ImageProcessor:
         pt_right_eye = np.mean(landmark_2d_106[101:106], axis=0)
         pt_nose = np.mean(landmark_2d_106[[74, 77, 83, 86]], axis=0)
 
-        landmarks3 = np.round([pt_left_eye, pt_right_eye, pt_nose])
+        # Keep align points as float so AlignRestore can use them at
+        # sub-pixel precision (see affine_transform for the rationale).
+        landmarks3 = np.array([pt_left_eye, pt_right_eye, pt_nose])
 
         face, affine_matrix = self.restorer.align_warp_face(image.copy(), landmarks3=landmarks3, smooth=True)
         box = [0, 0, face.shape[1], face.shape[0]]
