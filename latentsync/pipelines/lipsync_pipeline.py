@@ -1462,7 +1462,8 @@ class LipsyncPipeline(DiffusionPipeline):
             if mouth_info is not None:
                 prev_mouth_info = mouth_info
             aligned_mouth_info.append(mouth_info)
-            prev_yaw = yaw_deg if (yaw_skip_threshold > 0 and yaw_available) else None
+            if not yaw_was_skipped:
+                prev_yaw = yaw_deg if (yaw_skip_threshold > 0 and yaw_available) else None
             if not should_skip and motion_state is not None:
                 prev_motion_state = motion_state
                 prev_temporal_motion_state = motion_state
@@ -1852,7 +1853,7 @@ class LipsyncPipeline(DiffusionPipeline):
         mouth_motion_preserve_strength: float = 0.45,
         # Lightly stabilize mouth-core color/detail between consecutive valid
         # generated frames to reduce flicker without freezing lip motion.
-        mouth_temporal_stabilization_strength: float = 0.08,
+        mouth_temporal_stabilization_strength: float = 0.15,
         # If the current mouth core differs too much from the previous
         # stabilized mouth, clear carry state instead of blending. This keeps
         # stabilization from borrowing lips across speaker/shot changes that
@@ -1861,8 +1862,8 @@ class LipsyncPipeline(DiffusionPipeline):
         # Audio-adaptive mouth motion: preserve more current generated mouth
         # motion on high-energy speech frames and less on weak/silent frames.
         mouth_audio_adaptive_motion_enabled: bool = True,
-        mouth_audio_motion_min_scale: float = 0.65,
-        mouth_audio_motion_max_scale: float = 1.15,
+        mouth_audio_motion_min_scale: float = 0.75,
+        mouth_audio_motion_max_scale: float = 1.20,
         # Postfilter: skip frames where the generated mouth ROI is clearly
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
@@ -1923,7 +1924,7 @@ class LipsyncPipeline(DiffusionPipeline):
         color_match_strength: float = 0.60,
         # Unsharp-mask amount applied to the generated mouth region.
         # 0 = off, 1 = strong sharpen. Default 0.0.
-        mouth_sharpen_strength: float = 0.0,
+        mouth_sharpen_strength: float = 0.30,
         # Original-detail restoration outside the central mouth-motion core.
         # 0 = off, 1 = strong reference detail. Default 0.65.
         mouth_detail_strength: float = 0.65,
