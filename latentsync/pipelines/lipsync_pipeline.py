@@ -1590,11 +1590,23 @@ class LipsyncPipeline(DiffusionPipeline):
                 #     full-face paste path inside restore_img.
                 paste_mask_512 = None
                 if dynamic_masks is not None and index < len(dynamic_masks):
-                    paste_mask_512 = dynamic_masks[index]
+                    # generate_dynamic_mouth_mask returns a keep_mask
+                    # (1 = preserve original, 0 = inpaint / paste).
+                    # restore_img composes as
+                    # ``paste_mask * inv_face + (1 - paste_mask) * input``,
+                    # so we need the inverse: 1 = paste inv_face,
+                    # 0 = preserve input. The inference loop also
+                    # takes this inverse (see generated_region_mask
+                    # around line 2238).
+                    paste_mask_512 = 1.0 - dynamic_masks[index]
                 elif aligned_mouth_info is not None and index < len(aligned_mouth_info):
                     mi = aligned_mouth_info[index]
                     if mi is not None:
-                        paste_mask_512 = self.generate_dynamic_mouth_mask(
+                        # Same inverse convention as above -- the
+                        # raw generate_dynamic_mouth_mask output is a
+                        # keep_mask and restore_img expects a paste
+                        # weight.
+                        paste_mask_512 = 1.0 - self.generate_dynamic_mouth_mask(
                             mi, self.image_processor.resolution
                         )
                 out_frame = self.image_processor.restorer.restore_img(
