@@ -32,6 +32,7 @@ import logging
 
 from einops import rearrange
 import cv2
+from kornia.filters import gaussian_blur2d
 
 from ..models.unet import UNet3DConditionModel
 from ..utils.util import read_video, read_audio, write_video, check_ffmpeg_installed
@@ -914,20 +915,19 @@ class LipsyncPipeline(DiffusionPipeline):
         inpaint_region = (ellipse <= 1.0).float()
 
         if feather_sigma_px > 0:
+            # Same kernel length as the previous manual path
+            # (2*round(3*sigma)+1) and same reflect border, so the
+            # output is bit-identical to the hand-rolled reflect-pad
+            # + 2x F.conv2d version -- kornia's filter2d_separable
+            # dispatches to an explicit 1-D conv which is faster
+            # than PyTorch's generic 2-D conv with a (1,1,1,k)
+            # kernel.
             k = int(2 * round(3 * feather_sigma_px) + 1)
-            sigma = feather_sigma_px
-            kernel_1d = torch.exp(
-                -0.5 * (torch.arange(k, dtype=torch.float32) - k // 2).pow(2) / sigma ** 2
+            inpaint_4d = inpaint_region.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            smoothed = gaussian_blur2d(
+                inpaint_4d, (k, k), (feather_sigma_px, feather_sigma_px),
+                border_type="reflect", separable=True,
             )
-            kernel_1d = kernel_1d / kernel_1d.sum()
-            kx = kernel_1d.view(1, 1, 1, k).expand(1, 1, 1, k)
-            ky = kernel_1d.view(1, 1, k, 1).expand(1, 1, k, 1)
-            inpaint_4d = inpaint_region.unsqueeze(0).unsqueeze(0)
-            pad_size = k // 2
-            padded = torch.nn.functional.pad(inpaint_4d, (pad_size, pad_size, 0, 0), mode="reflect")
-            padded = torch.nn.functional.pad(padded, (0, 0, pad_size, pad_size), mode="reflect")
-            smoothed = torch.nn.functional.conv2d(padded, kx, groups=1)
-            smoothed = torch.nn.functional.conv2d(smoothed, ky, groups=1)
             inpaint_region = smoothed.squeeze(0).squeeze(0)
             inner_ellipse = ((xx - cx) / (rx * 0.75)) ** 2 + ((yy - cy) / (ry * 0.75)) ** 2
             inpaint_region = torch.where(inner_ellipse <= 1.0, torch.ones_like(inpaint_region), inpaint_region)
