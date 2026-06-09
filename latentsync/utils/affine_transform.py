@@ -81,12 +81,12 @@ class AlignRestore(object):
             # band, which produced a ~440x540 ellipse covering the
             # entire lower half of the face.
             inv_soft_mask = kornia.geometry.transform.warp_affine(
-                paste_mask_512.to(device=self.device, dtype=self.dtype),
+                paste_mask_512.to(device=self.device, dtype=self.dtype).unsqueeze(0),
                 inv_affine_matrix, (h, w), padding_mode="zeros",
-            ).squeeze(0)  # (1, h, w)
+            )  # (1, 1, h, w)
             inv_soft_mask = kornia.filters.gaussian_blur2d(
-                inv_soft_mask.unsqueeze(0), (21, 21), (4.0, 4.0)
-            ).squeeze(0)
+                inv_soft_mask, (21, 21), (4.0, 4.0)
+            ).squeeze(0)  # -> (1, h, w)
             inv_soft_mask_3d = inv_soft_mask.expand_as(inv_face)
             img_back = inv_soft_mask_3d * inv_face + (1 - inv_soft_mask_3d) * input_img
         else:
