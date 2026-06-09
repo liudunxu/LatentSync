@@ -2137,6 +2137,21 @@ class LipsyncPipeline(DiffusionPipeline):
                 prev_mouth_stabilized = None
                 prev_mouth_stabilized_valid = False
                 synced_video_frames.append(inference_faces.to(device=device, dtype=weight_dtype))
+                # Pad all_dynamic_masks with a placeholder so the
+                # per-frame index in restore_video still lines up
+                # with aligned_mouth_info. The skip path in
+                # restore_video returns the source frame directly
+                # without ever consuming this placeholder, so its
+                # value (zeros = "no paste" -- the inverse of the
+                # keep_mask convention) doesn't matter for the
+                # output.
+                all_dynamic_masks.append(
+                    torch.zeros(
+                        len(inference_skip_mask), 1,
+                        self.image_processor.resolution,
+                        self.image_processor.resolution,
+                    )
+                )
                 continue
             if self.unet.add_audio_layer:
                 audio_embeds = torch.stack(whisper_chunks[batch_start:batch_end])
