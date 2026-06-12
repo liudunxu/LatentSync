@@ -1608,6 +1608,12 @@ class LipsyncPipeline(DiffusionPipeline):
         side_face_blend_fade_frames: int = 3,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
+        # EMA alpha for the per-frame mouth_info (center + half-extents)
+        # used to draw the dynamic inpaint mask. 0.7 is the legacy
+        # default; bump toward 0.85-1.0 to fix individual frames whose
+        # inpaint region drifts off the mouth. Mirrors
+        # ``LipSyncRequest.aligned_mouth_ema_alpha``.
+        aligned_mouth_ema_alpha: float = 0.7,
     ):
         logger.info(
             f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
@@ -1859,8 +1865,14 @@ class LipsyncPipeline(DiffusionPipeline):
             )
             # EMA smoothing on mouth_info to reduce mask-boundary jitter
             # from noisy landmark detection across consecutive frames.
+            # Alpha is configurable (LipSyncRequest.aligned_mouth_ema_alpha);
+            # 0.7 is the legacy default. Higher alpha trusts the current
+            # frame more (less lag on fast mouth motion); lower trusts
+            # the previous frame more (smoother mask, but can drift off
+            # the real mouth on the specific frames where mouth position
+            # jumps -- visible as a washed-out patch on the cheek).
             if mouth_info is not None and prev_mouth_info is not None:
-                alpha = 0.7
+                alpha = aligned_mouth_ema_alpha
                 mouth_info = {
                     "center_x": alpha * mouth_info["center_x"] + (1 - alpha) * prev_mouth_info["center_x"],
                     "center_y": alpha * mouth_info["center_y"] + (1 - alpha) * prev_mouth_info["center_y"],
@@ -2180,6 +2192,12 @@ class LipsyncPipeline(DiffusionPipeline):
         side_face_blend_fade_frames: int = 3,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
+        # EMA alpha for the per-frame mouth_info (center + half-extents)
+        # used to draw the dynamic inpaint mask. 0.7 is the legacy
+        # default; bump toward 0.85-1.0 to fix individual frames whose
+        # inpaint region drifts off the mouth. Mirrors
+        # ``LipSyncRequest.aligned_mouth_ema_alpha``.
+        aligned_mouth_ema_alpha: float = 0.7,
     ):
         logger.info(
             f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
@@ -2227,6 +2245,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
                 side_face_warn_min_run_frames=side_face_warn_min_run_frames,
                 video_fps=video_fps,
+                aligned_mouth_ema_alpha=aligned_mouth_ema_alpha,
             )
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
             loop_video_frames = []
@@ -2317,6 +2336,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
                 side_face_warn_min_run_frames=side_face_warn_min_run_frames,
                 video_fps=video_fps,
+                aligned_mouth_ema_alpha=aligned_mouth_ema_alpha,
             )
             skip_mask = frame_skip_mask
             aligned_mouth_info = frame_aligned_mouth_info
@@ -2388,6 +2408,12 @@ class LipsyncPipeline(DiffusionPipeline):
         side_face_blend_fade_frames: int = 3,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
+        # EMA alpha for the per-frame mouth_info (center + half-extents)
+        # used to draw the dynamic inpaint mask. 0.7 is the legacy
+        # default; bump toward 0.85-1.0 to fix individual frames whose
+        # inpaint region drifts off the mouth. Mirrors
+        # ``LipSyncRequest.aligned_mouth_ema_alpha``.
+        aligned_mouth_ema_alpha: float = 0.7,
         # Mouth-occlusion prefilter: skip frames where the mouth is covered
         # by a hand, microphone, phone, mask, etc. Score 0..1; above the
         # threshold the frame is treated as not-lip-syncable and the original
@@ -2563,6 +2589,7 @@ class LipsyncPipeline(DiffusionPipeline):
             side_face_blend_fade_frames=side_face_blend_fade_frames,
             yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
             side_face_warn_min_run_frames=side_face_warn_min_run_frames,
+            aligned_mouth_ema_alpha=aligned_mouth_ema_alpha,
         )
         silent_skip_mask = [False] * len(skip_mask)
         if silent_skip_enabled:

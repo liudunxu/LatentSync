@@ -165,6 +165,16 @@ class LipSyncRequest(BaseModel):
     lipsync_continuity_max_gap_seconds: float = Field(0.35, ge=0.0, le=2.0)
     lipsync_continuity_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
     lipsync_continuity_max_scale_change: float = Field(0.35, ge=0.0, le=2.0)
+    # EMA alpha for the per-frame mouth_info (center + half-extents)
+    # used to draw the dynamic inpaint mask. Higher = more weight on
+    # the current frame (less lag, less mask-boundary smoothing);
+    # lower = more weight on the previous frame (smoother mask,
+    # but lags on fast mouth motion and can leave the inpaint region
+    # offset from the real mouth on the specific frames where mouth
+    # position jumps). 0.7 is the legacy default; bump toward 0.85-1.0
+    # when individual frames show the inpaint region drifting off the
+    # mouth onto the cheek / chin.
+    aligned_mouth_ema_alpha: float = Field(0.7, ge=0.0, le=1.0)
     # Mouth-region pixel diff break: complementary to the embedding
     # similarity check. When the mouth region mean abs diff between
     # consecutive aligned face crops exceeds this fraction, treat the
@@ -1439,6 +1449,7 @@ class LatentSyncApiRuntime:
                 face_jump_scale_threshold=payload.face_jump_scale_threshold,
                 lipsync_continuity_max_center_shift=payload.lipsync_continuity_max_center_shift,
                 lipsync_continuity_max_scale_change=payload.lipsync_continuity_max_scale_change,
+                aligned_mouth_ema_alpha=payload.aligned_mouth_ema_alpha,
                 lipsync_mouth_diff_break_threshold=payload.lipsync_mouth_diff_break_threshold,
                 lipsync_min_segment_frames=payload.lipsync_min_segment_frames,
                 segment_consistency_hard_cut_enabled=payload.segment_consistency_hard_cut_enabled,
