@@ -2407,6 +2407,25 @@ class LipsyncPipeline(DiffusionPipeline):
         # same-person expression/pose diff (~0.02-0.05) and well below
         # cross-person diff (~0.10-0.30).
         lipsync_mouth_diff_break_threshold: float = 0.10,
+        # Minimum valid-run length (in source frames) used as the
+        # time-window merge radius for segment consistency. After
+        # the merge, two adjacent valid runs separated by a gap
+        # of <= this many frames are joined. Activates the
+        # previously dead ``LipSyncRequest.lipsync_min_segment_frames``
+        # field.
+        lipsync_min_segment_frames: int = 5,
+        # --- HeyGen-like segment consistency (MuseTalk 4b4987a) ---
+        # Refuse the time-window merge when a hard cut is detected
+        # in the gap, or when the track_id of the two valid runs
+        # disagrees (a speaker switch is never bridged by a short
+        # passthrough). After the merge, force any valid run shorter
+        # than ``min_merged_lipsync_seconds`` back to passthrough so
+        # the diffusion side never spends a few frames generating a
+        # face that immediately reverts to source.
+        segment_consistency_hard_cut_enabled: bool = True,
+        segment_consistency_hard_cut_distance_threshold: float = 0.65,
+        segment_consistency_track_aware: bool = True,
+        min_merged_lipsync_seconds: float = 1.5,
         # Audio-energy prefilter: skip sustained silent runs before diffusion.
         silent_skip_enabled: bool = False,
         silent_rms_threshold: float = 0.003,
