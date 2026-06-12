@@ -1575,6 +1575,14 @@ class LipsyncPipeline(DiffusionPipeline):
         video_fps: float = 25.0,
         yaw_skip_threshold: float = 30.0,
         yaw_rate_skip_threshold: float = 28.0,
+        # Aggressive side-face passthrough. When > 0 and < yaw_skip_threshold,
+        # frames with abs(yaw) in the band (passthrough_threshold, yaw_skip_threshold)
+        # are also marked as passthrough -- i.e. the diffusion inpainter is
+        # bypassed and the original frame is kept. Useful when "side-face residue
+        # ghost" artifacts dominate the output: setting 22.5 in effect says
+        # "don't try to inpaint any non-frontal face". 0 disables. Default 0
+        # preserves the historical "30° absolute only" behavior.
+        side_face_passthrough_yaw_threshold: float = 0.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.08,
         face_jump_center_threshold: float = 0.0,
@@ -1669,6 +1677,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 [],
             )
         yaw_skip_count = 0
+        side_face_passthrough_count = 0
         yaw_rate_skip_count = 0
         mouth_occlusion_skip_count = 0
         motion_blur_skip_count = 0
@@ -1736,6 +1745,20 @@ class LipsyncPipeline(DiffusionPipeline):
                     should_skip = True
                     yaw_was_skipped = True
                     yaw_skip_count += 1
+                # Aggressive side-face passthrough: when the field is set
+                # in the (passthrough_threshold, yaw_skip_threshold) band,
+                # treat the frame as passthrough without bumping the
+                # yaw_skip_count (logged separately as side_face_passthrough).
+                # This kills the "side-face ghost" artifact that appears
+                # when the inpainter tries to redraw a face it can't
+                # align cleanly, by leaving the original frame in place.
+                if (
+                    not should_skip
+                    and side_face_passthrough_yaw_threshold > 0
+                    and abs(yaw_deg) > side_face_passthrough_yaw_threshold
+                ):
+                    should_skip = True
+                    side_face_passthrough_count += 1
             # Yaw-rate (deg/frame) catches the mid-turn frames where the face
             # hasn't crossed the absolute threshold yet but is rotating fast
             # enough that affine alignment is unreliable. Threshold is per
@@ -1899,6 +1922,7 @@ class LipsyncPipeline(DiffusionPipeline):
         logger.info(
             f"[FaceMatch] detect_fail={detect_fail_count}, identity_skip={identity_skip_count}, "
             f"yaw_skip={yaw_skip_count}, yaw_rate_skip={yaw_rate_skip_count}, "
+            f"side_face_passthrough={side_face_passthrough_count}, "
             f"mouth_occlusion_skip={mouth_occlusion_skip_count}, "
             f"motion_blur_skip={motion_blur_skip_count}, "
             f"face_jump_skip={face_jump_skip_count}, "
@@ -2159,6 +2183,14 @@ class LipsyncPipeline(DiffusionPipeline):
         video_fps: float = 25.0,
         yaw_skip_threshold: float = 30.0,
         yaw_rate_skip_threshold: float = 28.0,
+        # Aggressive side-face passthrough. When > 0 and < yaw_skip_threshold,
+        # frames with abs(yaw) in the band (passthrough_threshold, yaw_skip_threshold)
+        # are also marked as passthrough -- i.e. the diffusion inpainter is
+        # bypassed and the original frame is kept. Useful when "side-face residue
+        # ghost" artifacts dominate the output: setting 22.5 in effect says
+        # "don't try to inpaint any non-frontal face". 0 disables. Default 0
+        # preserves the historical "30° absolute only" behavior.
+        side_face_passthrough_yaw_threshold: float = 0.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.08,
         face_jump_center_threshold: float = 0.0,
@@ -2225,6 +2257,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 reference_embedding,
                 yaw_skip_threshold=yaw_skip_threshold,
                 yaw_rate_skip_threshold=yaw_rate_skip_threshold,
+                side_face_passthrough_yaw_threshold=side_face_passthrough_yaw_threshold,
                 mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
                 motion_blur_skip_threshold=motion_blur_skip_threshold,
                 face_jump_center_threshold=face_jump_center_threshold,
@@ -2316,6 +2349,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 reference_embedding,
                 yaw_skip_threshold=yaw_skip_threshold,
                 yaw_rate_skip_threshold=yaw_rate_skip_threshold,
+                side_face_passthrough_yaw_threshold=side_face_passthrough_yaw_threshold,
                 mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
                 motion_blur_skip_threshold=motion_blur_skip_threshold,
                 face_jump_center_threshold=face_jump_center_threshold,
@@ -2398,6 +2432,14 @@ class LipsyncPipeline(DiffusionPipeline):
         # intentionally permissive so clear frontal faces are not filtered out.
         yaw_skip_threshold: float = 30.0,
         yaw_rate_skip_threshold: float = 28.0,
+        # Aggressive side-face passthrough. When > 0 and < yaw_skip_threshold,
+        # frames with abs(yaw) in the band (passthrough_threshold, yaw_skip_threshold)
+        # are also marked as passthrough -- i.e. the diffusion inpainter is
+        # bypassed and the original frame is kept. Useful when "side-face residue
+        # ghost" artifacts dominate the output: setting 22.5 in effect says
+        # "don't try to inpaint any non-frontal face". 0 disables. Default 0
+        # preserves the historical "30° absolute only" behavior.
+        side_face_passthrough_yaw_threshold: float = 0.0,
         # Episode-level side-face filter: when contiguous frames exceed
         # yaw_skip_threshold, also skip pre_pad/post_pad transition frames
         # around the episode (whose yaw is in the warn band between
@@ -2570,6 +2612,7 @@ class LipsyncPipeline(DiffusionPipeline):
             video_fps=video_fps,
             yaw_skip_threshold=yaw_skip_threshold,
             yaw_rate_skip_threshold=yaw_rate_skip_threshold,
+            side_face_passthrough_yaw_threshold=side_face_passthrough_yaw_threshold,
             mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
             motion_blur_skip_threshold=motion_blur_skip_threshold,
             face_jump_center_threshold=face_jump_center_threshold,

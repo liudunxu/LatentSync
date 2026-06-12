@@ -299,6 +299,15 @@ class LipSyncRequest(BaseModel):
     # per second (28°/frame at 25fps ≈ 700°/sec).
     yaw_skip_threshold: float = Field(30.0, ge=0.0, le=90.0)
     yaw_rate_skip_threshold: float = Field(28.0, ge=0.0, le=45.0)
+    # Aggressive side-face passthrough. When > 0, frames with abs(yaw) in
+    # the band (side_face_passthrough_yaw_threshold, yaw_skip_threshold)
+    # are also marked as passthrough -- i.e. the diffusion inpainter is
+    # bypassed and the original frame is kept. Useful when "side-face
+    # residue ghost" artifacts dominate the output. 22.5 in effect says
+    # "don't try to inpaint any non-frontal face"; the inpainter only
+    # runs on faces at or below the threshold. 0 disables (legacy
+    # 30°-only behavior).
+    side_face_passthrough_yaw_threshold: float = Field(0.0, ge=0.0, le=90.0)
     # Episode-level side-face filter: when N consecutive frames exceed
     # yaw_skip_threshold, also skip `pre_pad`/`post_pad` frames of
     # transition zone around the episode (frames whose yaw is between
@@ -1438,6 +1447,7 @@ class LatentSyncApiRuntime:
                 quality_max_fallback_ratio=payload.quality_max_fallback_ratio,
                 yaw_skip_threshold=payload.yaw_skip_threshold,
                 yaw_rate_skip_threshold=payload.yaw_rate_skip_threshold,
+                side_face_passthrough_yaw_threshold=payload.side_face_passthrough_yaw_threshold,
                 side_face_episode_pre_pad=payload.side_face_episode_pre_pad,
                 side_face_episode_post_pad=payload.side_face_episode_post_pad,
                 side_face_blend_fade_frames=payload.side_face_blend_fade_frames,
