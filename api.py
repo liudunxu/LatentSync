@@ -186,6 +186,47 @@ class LipSyncRequest(BaseModel):
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
     lipsync_min_segment_frames: int = Field(5, ge=1, le=300)
+    # --- HeyGen-like segment consistency (adapted from MuseTalk 4b4987a) ---
+    # Refuse the time-window merge of two adjacent valid runs if a
+    # hard cut is detected in the gap (a hard cut / shot boundary
+    # would otherwise be bridged by a short passthrough, causing
+    # the inpainter to splice across the cut). 0 disables the
+    # per-frame histogram-distance check. See
+    # MuseTalk docs/heygen_like_lipsync_segmentation_td.md §5.1.
+    segment_consistency_hard_cut_enabled: bool = Field(
+        True,
+        description="When True, refuse the time-window merge if a hard cut is detected in the gap. Mirrors MuseTalk 4b4987a §5.1.",
+    )
+    segment_consistency_hard_cut_distance_threshold: float = Field(
+        0.65,
+        ge=0.0,
+        le=2.0,
+        description="Face-crop histogram distance above which a frame boundary is treated as a hard cut. 0.65 is conservative (obvious cuts only); 0 disables.",
+    )
+    # Track-aware merge. The pipeline already assigns a per-source-frame
+    # ``track_id`` from ``continuity_break`` (identity / geometry /
+    # mouth-region pixel diff). When two adjacent valid runs have
+    # different track_ids the merge is refused even if the gap is
+    # short -- a speaker switch is never bridged by a short
+    # passthrough. Falls back to time-window merge when track_id is
+    # missing on either side. Mirrors MuseTalk 4b4987a §5.5.
+    segment_consistency_track_aware: bool = Field(
+        True,
+        description="When True, only merge adjacent valid runs whose track_id matches. Falls back to time-window merge when track_id is missing. Mirrors MuseTalk 4b4987a §5.5.",
+    )
+    # Post-merge minimum duration. After the merge, any valid run
+    # whose total length is below this many seconds is forced
+    # entirely to passthrough to avoid the splice artifacts that a
+    # short isolated segment would produce (a 3-frame isolated
+    # segment is usually detector jitter -- it's safer to drop the
+    # inpaint for that run than to show a flicker). 0 disables.
+    # Mirrors MuseTalk 4b4987a §5.7.
+    min_merged_lipsync_seconds: float = Field(
+        1.5,
+        ge=0.0,
+        le=10.0,
+        description="After segment consistency merge, valid runs shorter than this many seconds are forced to passthrough. 0 disables. Mirrors MuseTalk 4b4987a §5.7.",
+    )
     lipsync_min_face_area_ratio: float = Field(0.015, ge=0.0, le=1.0)
     bbox_shift: int = 0
     extra_margin: int = Field(10, ge=0, le=100)
@@ -409,6 +450,28 @@ class LipSyncRequest(BaseModel):
                     "aggressive-w passes from identity drift on eyes/forehead/cheeks. Only "
                     "effective when codeformer_short_drama_profile is also True.",
     )
+    # Post-CodeFormer cross-frame 1-order EMA on the restored crops.
+    # CodeFormer is stateless per-frame so a high-frequency flicker can
+    # persist across consecutive valid frames. This EMA dampens that
+    # flicker by blending each restored crop toward the previous one
+    # (alpha = weight on the previous frame). 0 disables. Mirrors
+    # MuseTalk commit ce7b684 (``codeformer_temporal_alpha``).
+    # Track-aware mode (default True) refuses the mix across
+    # speaker/identity boundaries -- a track switch with EMA on would
+    # otherwise smear the old face onto the new identity for one frame
+    # (a single-frame pop that downstream smoothing can amplify).
+    codeformer_post_ema_alpha: float = Field(
+        0.8,
+        ge=0.0,
+        le=1.0,
+        description="Post-CodeFormer cross-frame EMA on the restored face crops. 0 disables; 0.8 (default) "
+                    "dampens per-frame CF flicker. See MuseTalk commit ce7b684.",
+    )
+    codeformer_post_ema_track_aware: bool = Field(
+        True,
+        description="When True, refuse the post-CF EMA mix across speaker/track_id boundaries. Falls "
+                    "back to legacy adjacency-only rule when track_id is missing on either side.",
+    )
 
 
 class FaceListRequest(BaseModel):
@@ -423,6 +486,22 @@ class FaceListRequest(BaseModel):
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
     crop_padding: float = Field(0.8, ge=0.0, le=1.5)
+    # Filter to only return face clusters whose mouth was visibly open at
+    # some sampled frame during the scan. ``mouth_motion_max_openness`` is
+    # the highest dark-pixel ratio observed in the mouth region across all
+    # frames that hit the cluster. A closed-mouth face (listener, profile
+    # glance) typically scores < 0.08; an open-mouth face with visible
+    # cavity scores 0.15-0.50. Default 0.10 drops most silent faces
+    # (listener / side face) while keeping any face that visibly spoke.
+    # Set to 0.0 to disable the filter and return every distinct face.
+    # Mirrors MuseTalk commit 8a382f0 ("/api/faces filters silent clusters
+    # by mouth openness").
+    min_mouth_openness: float = Field(
+        0.10,
+        ge=0.0,
+        le=1.0,
+        description="Drop clusters whose max mouth-region dark-pixel ratio across the scan is below this. 0 disables; default 0.10 drops silent faces.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1150,41 @@ class LatentSyncApiRuntime:
         norm_dist = max(0.0, 1.0 - dist / max(scale, 1.0))
         return 0.5 * iou + 0.5 * norm_dist
 
+    @staticmethod
+    def _compute_mouth_openness(frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
+        """Estimate how open the mouth is, in [0.0, 1.0].
+
+        Cheap HSV dark-pixel ratio over the lower-middle third of the bbox
+        (typical mouth location under a frontal face detector). A closed
+        mouth (lip line only) scores 0.02-0.08; an open mouth showing
+        dark cavity scores 0.15-0.50; a wide-open shout can reach 0.6+.
+
+        Intentionally cheap (no extra model forward) so it can run on every
+        accepted detection during the scan. Mirrors MuseTalk commit
+        8a382f0 (``_compute_mouth_openness``); the V < 80 cutoff matches
+        their tuning. Returns 0.0 on bad bbox / tiny region.
+        """
+        x1, y1, x2, y2 = bbox
+        h, w = y2 - y1, x2 - x1
+        if h <= 0 or w <= 0:
+            return 0.0
+        # Lower 40% of the bbox (typical mouth strip), horizontally the
+        # middle 60% (avoid jaw / face edges).
+        my1 = y1 + int(h * 0.60)
+        my2 = y2
+        mx1 = x1 + int(w * 0.20)
+        mx2 = x2 - int(w * 0.20)
+        if my2 - my1 < 4 or mx2 - mx1 < 4:
+            return 0.0
+        region = frame[my1:my2, mx1:mx2]
+        if region.size == 0:
+            return 0.0
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+        v = hsv[:, :, 2]
+        # 80 is well below typical lip color (100-160) and well above the
+        # noise floor on dark skin. Matches MuseTalk's V < 80 threshold.
+        return float((v < 80).mean())
+
     def extract_distinct_faces(
         self,
         video_path: Path,
@@ -1116,6 +1230,10 @@ class LatentSyncApiRuntime:
                         rejected_embedding += 1
                         continue
                     detections += 1
+                    # Cheap HSV dark-pixel ratio on the lower-middle bbox --
+                    # cached on the face dict so the cluster loop can take the
+                    # max without recomputing. Mirrors MuseTalk 8a382f0.
+                    face["mouth_openness"] = self._compute_mouth_openness(frame, face["bbox"])
                     face["frame_index"] = frame_index
                     face_infos.append(face)
 
@@ -1136,6 +1254,12 @@ class LatentSyncApiRuntime:
                         best_score = score
                         best_cluster = i
 
+                # Per-cluster max mouth openness -- a face that briefly
+                # opened its mouth once should be kept even if 90% of its
+                # sampled frames show a closed mouth. Mirrors MuseTalk
+                # 8a382f0.
+                info_openness = float(info.get("mouth_openness", 0.0))
+
                 if best_cluster is not None and best_score >= threshold:
                     c = clusters[best_cluster]
                     c["count"] = int(c["count"]) + 1
@@ -1146,6 +1270,8 @@ class LatentSyncApiRuntime:
                         c["best_frame_index"] = info["frame_index"]
                         c["best_bbox"] = info["bbox"]
                         c["best_detection_score"] = info["detection_score"]
+                    if info_openness > float(c.get("mouth_motion_max_openness", 0.0)):
+                        c["mouth_motion_max_openness"] = info_openness
                 else:
                     clusters.append({
                         "embedding": embedding,
@@ -1155,9 +1281,25 @@ class LatentSyncApiRuntime:
                         "best_bbox": info["bbox"],
                         "best_detection_score": info["detection_score"],
                         "descriptors": [info],
+                        "mouth_motion_max_openness": info_openness,
                     })
 
             clusters.sort(key=lambda c: (int(c["count"]), int(c["max_area"])), reverse=True)
+
+            # Drop silent clusters: faces whose mouth never visibly opened
+            # during the scan. Default threshold 0.10 keeps visible speakers
+            # and drops listeners / side-glance faces. Set
+            # ``min_mouth_openness=0`` on the request to disable.
+            # Mirrors MuseTalk 8a382f0.
+            rejected_silent_face_count = 0
+            if payload.min_mouth_openness > 0.0:
+                kept_clusters: List[Dict[str, object]] = []
+                for c in clusters:
+                    if float(c.get("mouth_motion_max_openness", 0.0)) >= payload.min_mouth_openness:
+                        kept_clusters.append(c)
+                    else:
+                        rejected_silent_face_count += 1
+                clusters = kept_clusters
 
             faces_dir = output_dir / "faces"
             faces_dir.mkdir(parents=True, exist_ok=True)
@@ -1179,6 +1321,9 @@ class LatentSyncApiRuntime:
                     "frame_index": int(cluster["best_frame_index"]),
                     "detection_score": float(cluster["best_detection_score"]),
                     "count": int(cluster["count"]),
+                    "mouth_motion_max_openness": float(
+                        cluster.get("mouth_motion_max_openness", 0.0)
+                    ),
                 })
 
             return {
@@ -1193,6 +1338,8 @@ class LatentSyncApiRuntime:
                 "rejected_landmark_count": rejected_landmarks,
                 "rejected_embedding_count": rejected_embedding,
                 "rejected_avatar_crop_count": rejected_avatar_crop,
+                "rejected_silent_face_count": rejected_silent_face_count,
+                "min_mouth_openness_threshold": float(payload.min_mouth_openness),
                 "face_identity_backend": "embedding" if payload.require_face_embedding else "visual",
             }
 
@@ -1293,6 +1440,11 @@ class LatentSyncApiRuntime:
                 lipsync_continuity_max_center_shift=payload.lipsync_continuity_max_center_shift,
                 lipsync_continuity_max_scale_change=payload.lipsync_continuity_max_scale_change,
                 lipsync_mouth_diff_break_threshold=payload.lipsync_mouth_diff_break_threshold,
+                lipsync_min_segment_frames=payload.lipsync_min_segment_frames,
+                segment_consistency_hard_cut_enabled=payload.segment_consistency_hard_cut_enabled,
+                segment_consistency_hard_cut_distance_threshold=payload.segment_consistency_hard_cut_distance_threshold,
+                segment_consistency_track_aware=payload.segment_consistency_track_aware,
+                min_merged_lipsync_seconds=payload.min_merged_lipsync_seconds,
                 silent_skip_enabled=payload.speech_gate_enabled,
                 silent_rms_threshold=payload.speech_gate_min_rms,
                 silent_min_run_frames=max(
@@ -1333,6 +1485,8 @@ class LatentSyncApiRuntime:
                     payload.codeformer_mouth_only_paste_enabled
                     and payload.codeformer_short_drama_profile
                 ),
+                codeformer_post_ema_alpha=payload.codeformer_post_ema_alpha,
+                codeformer_post_ema_track_aware=payload.codeformer_post_ema_track_aware,
                 codeformer_restorer=codeformer_restorer,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")
@@ -1369,6 +1523,7 @@ class LatentSyncApiRuntime:
             identity_skip_count = int(run_stats.get("identity_skip_count", 0))
             codeformer_stats = run_stats.get("codeformer") or {}
             mouth_temporal_stats = run_stats.get("mouth_temporal") or {}
+            segment_consistency_reasons = run_stats.get("segment_consistency") or {}
 
             return {
                 "output_path": output_path,
@@ -1389,7 +1544,11 @@ class LatentSyncApiRuntime:
                 "filtered_fast_motion_frames": 0,
                 "continuity_filled_source_frames": 0,
                 "filtered_small_face_frames": 0,
-                "filtered_short_segment_frames": 0,
+                "filtered_short_segment_frames": int(segment_consistency_reasons.get("too_short", 0)),
+                "segment_consistency_reasons": dict(segment_consistency_reasons),
+                "segment_consistency_hard_cut_enabled": bool(run_stats.get("segment_consistency_hard_cut_enabled", False)),
+                "segment_consistency_track_aware": bool(run_stats.get("segment_consistency_track_aware", False)),
+                "min_merged_lipsync_seconds": float(run_stats.get("min_merged_lipsync_seconds", 0.0)),
                 "smoothed_source_frames": 0,
                 "matched_or_filled_source_frames": source_frame_count,
                 "eligible_source_frames": source_frame_count,
@@ -1522,6 +1681,7 @@ def list_distinct_faces(payload: FaceListRequest, request: Request) -> Dict[str,
             "frame_index": item["frame_index"],
             "detection_score": item["detection_score"],
             "count": item["count"],
+            "mouth_motion_max_openness": float(item.get("mouth_motion_max_openness", 0.0)),
         })
 
     response = {

@@ -66,6 +66,15 @@ class CodeformerStats:
     bucket_counts: Dict[str, int] = field(default_factory=dict)
     frames_retry_attempted: int = 0
     frames_retry_succeeded: int = 0
+    # Post-CodeFormer cross-frame 1-order EMA chain counters
+    # (populated by the pipeline, not the restorer -- the restorer is
+    # stateless across frames). ``ema_chain_breaks`` is the total count
+    # of frames where the EMA refused to mix (idx gap / shape mismatch /
+    # track_id switch); ``ema_resets_on_track_switch`` is the subset
+    # where the cause was a track_id change. Mirrors MuseTalk commit
+    # ce7b684 ("CodeFormer EMA tracks speaker switches").
+    ema_chain_breaks: int = 0
+    ema_resets_on_track_switch: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -91,6 +100,8 @@ class CodeformerStats:
             "bucket_counts": dict(self.bucket_counts),
             "frames_retry_attempted": self.frames_retry_attempted,
             "frames_retry_succeeded": self.frames_retry_succeeded,
+            "ema_chain_breaks": int(self.ema_chain_breaks),
+            "ema_resets_on_track_switch": int(self.ema_resets_on_track_switch),
         }
 
 

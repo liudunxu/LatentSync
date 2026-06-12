@@ -464,6 +464,224 @@ class LipsyncPipeline(DiffusionPipeline):
         return extra
 
     @staticmethod
+    def _face_crop_histogram_distance(
+        crop_a: np.ndarray,
+        crop_b: np.ndarray,
+        bins: int = 16,
+        resize_to: int = 32,
+    ) -> float:
+        """Return ``1 - histogram_intersection`` over downsized BGR crops.
+
+        Cheap O(1) helper for hard-cut / track-switch detection inside a
+        short gap. Compares the BGR color distribution of two aligned face
+        crops after downsampling to ``resize_to`` x ``resize_to`` --
+        anything finer is wasted at this scale because the histogram is
+        dominated by skin tone and overall lighting.
+
+        Direction: 0.0 = identical content, ~1.0 = unrelated content.
+        The default ``hard_cut_distance_threshold`` (0.65) is tuned to
+        fire on a real cross-character / cross-shot jump while NOT
+        triggering on detector jitter or mild head turns (which only
+        change lighting slightly).
+
+        Returns 0.0 on shape mismatch / empty input so callers can
+        safely skip a pair.
+        """
+        if (
+            crop_a is None
+            or crop_b is None
+            or crop_a.size == 0
+            or crop_b.size == 0
+        ):
+            return 0.0
+        if resize_to <= 0:
+            return 0.0
+        a = cv2.resize(crop_a, (resize_to, resize_to), interpolation=cv2.INTER_AREA)
+        b = cv2.resize(crop_b, (resize_to, resize_to), interpolation=cv2.INTER_AREA)
+        a_hist = cv2.calcHist([a], [0, 1, 2], None, [bins] * 3, [0, 256] * 3)
+        b_hist = cv2.calcHist([b], [0, 1, 2], None, [bins] * 3, [0, 256] * 3)
+        # L1-normalize to probability histograms (sum=1) so the
+        # HISTCMP_INTERSECT metric stays in [0, 1]. The MuseTalk
+        # 4b4987a reference uses bare ``cv2.normalize(...)`` which
+        # defaults to L2 norm -- that produces inflated intersections
+        # (~10) and the resulting ``1 - intersection`` is always
+        # clamped to 0, so the hard-cut gate never fires. We fix the
+        # bug here by explicitly requesting L1.
+        cv2.normalize(a_hist, a_hist, 1.0, 0.0, cv2.NORM_L1)
+        cv2.normalize(b_hist, b_hist, 1.0, 0.0, cv2.NORM_L1)
+        intersection = float(
+            cv2.compareHist(a_hist, b_hist, cv2.HISTCMP_INTERSECT)
+        )
+        return max(0.0, min(1.0, 1.0 - intersection))
+
+    @staticmethod
+    def _tensor_face_to_bgr_uint8(face: torch.Tensor) -> Optional[np.ndarray]:
+        """Convert an aligned face tensor (3, H, W) in [-1, 1] to a BGR
+        uint8 ndarray (H, W, 3) for histogram-based helpers. Returns
+        None on bad input.
+        """
+        if face is None or face.numel() == 0:
+            return None
+        arr = face.detach().cpu().to(torch.float32).numpy()
+        if arr.ndim != 3:
+            return None
+        # (-1, 1) -> (0, 255) uint8
+        arr = np.clip((arr + 1.0) * 0.5 * 255.0, 0, 255).astype(np.uint8)
+        # channel-first (C, H, W) RGB -> HWC BGR for cv2.calcHist
+        arr = np.transpose(arr, (1, 2, 0))
+        arr = arr[..., ::-1].copy()
+        return arr
+
+    def _enforce_segment_consistency(
+        self,
+        skip_mask: List[bool],
+        faces: List[torch.Tensor],
+        track_ids: List[Optional[int]],
+        fps: float,
+        hard_cut_enabled: bool,
+        hard_cut_threshold: float,
+        track_aware: bool,
+        min_merged_seconds: float,
+        merge_window_frames: int,
+    ) -> Dict[str, int]:
+        """HeyGen-like segment consistency pass on the per-source-frame
+        skip_mask. Mirrors MuseTalk commit 4b4987a §5.1, §5.5, §5.7.
+
+        Mutates ``skip_mask`` in place. The pass has two phases:
+
+        **Phase 1 -- time-window merge with hard-cut / track-aware
+        gates.** Find every pair of adjacent valid runs (a valid run is
+        a maximal contiguous run of ``skip_mask[k] == False``). If the
+        gap between them is ``<= merge_window_frames``, the gap is
+        upgraded to valid (``skip_mask[k] = False``) UNLESS one of the
+        gates fires:
+
+        * **Track-aware** (when ``track_aware`` is True): both runs
+          have a non-None track_id AND they differ. Increments
+          ``speaker_switch``.
+        * **Hard-cut** (when ``hard_cut_enabled`` is True): any frame
+          in the gap has ``_face_crop_histogram_distance`` > the
+          threshold when compared to either the last valid frame of
+          run A or the first valid frame of run B. Increments
+          ``hard_cut`` (one increment per refused merge, not per frame).
+
+        **Phase 2 -- min-merged downgrade.** After all merges, any
+        valid run whose total duration is below
+        ``min_merged_seconds`` is forced entirely to passthrough
+        (``skip_mask[k] = True`` for the whole run). Increments
+        ``too_short``. Avoids the splice artifacts that a short
+        isolated segment would produce (a 3-frame isolated segment is
+        usually detector jitter -- safer to drop the inpaint than to
+        show a flicker).
+
+        Returns a per-reason counter dict. Mutates ``skip_mask``;
+        callers should re-derive ``continuity_break_mask`` from the
+        updated skip_mask if they need it (existing code only
+        forwards the skip_mask downstream, where it's OR-merged with
+        quality-gate / silent-skip masks).
+        """
+        reasons: Dict[str, int] = {
+            "speaker_switch": 0,
+            "hard_cut": 0,
+            "too_short": 0,
+        }
+        n = len(skip_mask)
+        if n == 0 or merge_window_frames <= 0:
+            return reasons
+
+        # --- Phase 1: time-window merge with gates ---
+        # Locate every valid run as (start, end_exclusive) so we can
+        # walk the gaps between them. Skip-frame (True) positions are
+        # never part of a run.
+        runs: List[Tuple[int, int]] = []
+        i = 0
+        while i < n:
+            if skip_mask[i]:
+                i += 1
+                continue
+            j = i
+            while j < n and not skip_mask[j]:
+                j += 1
+            runs.append((i, j))
+            i = j
+
+        if len(runs) < 2:
+            # Single valid run: nothing to merge. Still apply Phase 2.
+            pass
+        else:
+            for r in range(len(runs) - 1):
+                end_a = runs[r][1]
+                start_b = runs[r + 1][0]
+                gap_size = start_b - end_a
+                if gap_size <= 0 or gap_size > merge_window_frames:
+                    continue
+
+                # Track-aware gate. If track_ids agree (or one side is
+                # None), fall through; otherwise refuse.
+                track_a = track_ids[end_a - 1] if end_a - 1 >= 0 else None
+                track_b = track_ids[start_b] if start_b < n else None
+                if (
+                    track_aware
+                    and track_a is not None
+                    and track_b is not None
+                    and track_a != track_b
+                ):
+                    reasons["speaker_switch"] += 1
+                    continue
+
+                # Hard-cut gate. Look at every frame in the gap; if
+                # any of them has a histogram distance > threshold
+                # from EITHER adjacent valid run's boundary frame,
+                # refuse.
+                if hard_cut_enabled and hard_cut_threshold > 0.0:
+                    boundary_a = self._tensor_face_to_bgr_uint8(
+                        faces[end_a - 1] if end_a - 1 >= 0 else None
+                    )
+                    boundary_b = self._tensor_face_to_bgr_uint8(
+                        faces[start_b] if start_b < n else None
+                    )
+                    if boundary_a is not None and boundary_b is not None:
+                        refused = False
+                        for k in range(end_a, start_b):
+                            mid = self._tensor_face_to_bgr_uint8(faces[k])
+                            if mid is None:
+                                continue
+                            d_a = self._face_crop_histogram_distance(
+                                mid, boundary_a
+                            )
+                            d_b = self._face_crop_histogram_distance(
+                                mid, boundary_b
+                            )
+                            if d_a > hard_cut_threshold or d_b > hard_cut_threshold:
+                                refused = True
+                                break
+                        if refused:
+                            reasons["hard_cut"] += 1
+                            continue
+
+                # Both gates passed (or disabled) -- merge the gap.
+                for k in range(end_a, start_b):
+                    skip_mask[k] = False
+
+        # --- Phase 2: min-merged downgrade ---
+        if min_merged_seconds > 0.0 and fps > 0.0:
+            min_frames = max(1, int(round(min_merged_seconds * fps)))
+            i = 0
+            while i < n:
+                if skip_mask[i]:
+                    i += 1
+                    continue
+                j = i
+                while j < n and not skip_mask[j]:
+                    j += 1
+                if j - i < min_frames:
+                    for k in range(i, j):
+                        skip_mask[k] = True
+                    reasons["too_short"] += 1
+                i = j
+        return reasons
+
+    @staticmethod
     def _stabilize_yaw_for_rate(
         yaw_deg: float,
         prev_yaw: Optional[float],
@@ -1179,6 +1397,144 @@ class LipsyncPipeline(DiffusionPipeline):
 
         return smoothed, last_face, last_valid
 
+    @staticmethod
+    def _post_codeformer_temporal_ema(
+        all_faces: torch.Tensor,
+        skip_mask: List[bool],
+        track_ids: List[Optional[int]],
+        alpha: float,
+        track_aware: bool = True,
+    ) -> Tuple[torch.Tensor, Dict[str, int]]:
+        """1-order cross-frame EMA on CodeFormer-restored face crops.
+
+        CodeFormer is a stateless per-frame network: each restored crop is
+        sharp on its own but the high-frequency detail can flicker across
+        consecutive frames because the model doesn't have access to
+        previous outputs. This helper applies an EMA between consecutive
+        *non-skipped* output frames, so the restored crop blends toward
+        the previous restored crop (in [0, 255] uint8 space) and per-frame
+        flicker is dampened.
+
+        Two guards refuse the blend:
+
+        1. **Adjacency only.** Skipped frames do not participate in the
+           EMA chain (``prev_restored`` is reset on every skip). The next
+           valid frame after a gap will only blend if it is the immediate
+           successor of the previous valid frame -- this matches the
+           MuseTalk ce7b684 rule ``idx - prev_restored_index == 1``.
+        2. **Track-aware.** When ``track_aware`` is True and the per-frame
+           ``track_id`` (assigned in ``affine_transform_video`` from
+           ``continuity_break``) just changed, the previous restored
+           crop belongs to a different identity -- mixing it onto the new
+           identity would smear the old face onto the new one. We refuse
+           the mix but still record the current frame as the new chain
+           seed so the next frame starts smoothing from it without an
+           artificial pop. When track_id is missing on either side
+           (``track_aware=False`` or detect-fail gap), the guard falls
+           back to the legacy adjacency rule.
+
+        Args:
+            all_faces: ``(T, 3, 512, 512)`` tensor in [-1, 1].
+            skip_mask: per-source-frame list of bools, length T. True =
+                passthrough (no inpainting done by the pipeline).
+            track_ids: per-source-frame list of optional ints, length T.
+                None = unknown (leading detect-fail frames). track_id
+                changes at speaker / identity switches.
+            alpha: EMA weight on the previous frame (1-alpha on the
+                current). 0 disables; 0.8 (default) is the MuseTalk
+                ``codeformer_temporal_alpha`` value.
+            track_aware: when True, refuse the mix across track_id
+                boundaries. When False, fall back to the legacy
+                adjacency-only rule.
+
+        Returns:
+            ``(smoothed_all_faces, stats)`` where ``stats`` has
+            ``breaks`` (any reason for refusing the mix) and
+            ``track_switch`` (subset where the cause was a track_id
+            change). Both counts exclude the first frame's "no
+            previous" bootstrap.
+        """
+        if all_faces.shape[0] == 0 or alpha <= 0.0:
+            return all_faces, {"breaks": 0, "track_switch": 0}
+        T = int(all_faces.shape[0])
+        if len(skip_mask) < T:
+            skip_mask = list(skip_mask) + [True] * (T - len(skip_mask))
+        if len(track_ids) < T:
+            track_ids = list(track_ids) + [None] * (T - len(track_ids))
+
+        # Work in float32 on CPU in [0, 1] for cv2.addWeighted (which
+        # expects single-channel float or uint8). We convert back to the
+        # input dtype/range at the end.
+        out = all_faces.detach().clone()
+        out_cpu = out.detach().to(device="cpu", dtype=torch.float32)
+        # [-1, 1] -> [0, 1]
+        out_cpu = (out_cpu + 1.0) / 2.0
+        out_cpu = out_cpu.clamp(0.0, 1.0).numpy()  # (T, 3, 512, 512) RGB
+
+        ema_chain_breaks = 0
+        ema_resets_on_track_switch = 0
+        prev_restored: Optional[np.ndarray] = None
+        prev_idx: Optional[int] = None
+        prev_track_id: Optional[int] = None
+
+        for idx in range(T):
+            if skip_mask[idx]:
+                # Passthrough frame: don't pollute the chain.
+                prev_restored = None
+                prev_idx = None
+                prev_track_id = None
+                continue
+
+            cur_track_id = track_ids[idx]
+            tracks_match = (
+                not track_aware
+                or prev_track_id is None
+                or cur_track_id is None
+                or prev_track_id == cur_track_id
+            )
+            face_out = out_cpu[idx]  # (3, 512, 512) in [0, 1] RGB
+
+            blended = (
+                0.0 < alpha < 1.0
+                and prev_restored is not None
+                and prev_idx is not None
+                and idx - prev_idx == 1
+                and prev_restored.shape == face_out.shape
+                and tracks_match
+            )
+            if blended:
+                # cv2.addWeighted expects HWC; transpose once.
+                cur_hwc = np.transpose(face_out, (1, 2, 0))
+                prev_hwc = np.transpose(prev_restored, (1, 2, 0))
+                blended_hwc = cv2.addWeighted(
+                    cur_hwc,
+                    1.0 - alpha,
+                    prev_hwc,
+                    alpha,
+                    0.0,
+                )
+                face_out = np.transpose(blended_hwc, (2, 0, 1))
+            elif prev_restored is not None:
+                # Real chain break (first frame is bootstrap, not counted).
+                ema_chain_breaks += 1
+                if not tracks_match and cur_track_id is not None:
+                    ema_resets_on_track_switch += 1
+
+            out_cpu[idx] = face_out
+            prev_restored = face_out
+            prev_idx = idx
+            prev_track_id = cur_track_id
+
+        # [0, 1] -> [-1, 1], back to the input dtype
+        out_cpu = out_cpu * 2.0 - 1.0
+        out_cpu = np.clip(out_cpu, -1.0, 1.0)
+        out_tensor = torch.from_numpy(out_cpu).to(dtype=out.dtype, device=out.device)
+        out.copy_(out_tensor)
+        return out, {
+            "breaks": ema_chain_breaks,
+            "track_switch": ema_resets_on_track_switch,
+        }
+
     def detect_main_speaker_embedding(self, video_frames: np.ndarray, face_embedder) -> Optional[np.ndarray]:
         if face_embedder is None or len(video_frames) == 0:
             return None
@@ -1221,6 +1577,25 @@ class LipsyncPipeline(DiffusionPipeline):
         lipsync_continuity_max_center_shift: float = 0.35,
         lipsync_continuity_max_scale_change: float = 0.35,
         lipsync_mouth_diff_break_threshold: float = 0.10,
+        # Minimum valid-run length (in source frames) used as the
+        # time-window merge radius for segment consistency. After the
+        # merge, two adjacent valid runs separated by a gap of <=
+        # this many frames are joined. Activates the previously
+        # dead ``LipSyncRequest.lipsync_min_segment_frames`` field.
+        lipsync_min_segment_frames: int = 5,
+        # --- HeyGen-like segment consistency (MuseTalk 4b4987a) ---
+        # Refuse the time-window merge when a hard cut is detected
+        # in the gap, or when the track_id of the two valid runs
+        # disagrees (a speaker switch is never bridged by a short
+        # passthrough). After the merge, force any valid run
+        # shorter than ``min_merged_lipsync_seconds`` back to
+        # passthrough. See MuseTalk
+        # docs/heygen_like_lipsync_segmentation_td.md §5.1, §5.5,
+        # §5.7.
+        segment_consistency_hard_cut_enabled: bool = True,
+        segment_consistency_hard_cut_distance_threshold: float = 0.65,
+        segment_consistency_track_aware: bool = True,
+        min_merged_lipsync_seconds: float = 1.5,
         identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 3,
@@ -1258,6 +1633,15 @@ class LipsyncPipeline(DiffusionPipeline):
         #     represent a "side face" and shouldn't trigger the episode pad).
         yaws: List[Optional[float]] = []
         yaw_skip_reasons: List[bool] = []
+        # Per-frame track_id (None = unknown, e.g. leading detect-fail frames).
+        # A new track_id is assigned whenever ``continuity_break`` fires; detect-
+        # fail and skipped frames inherit the previous track_id (we don't know
+        # who they are, but the EMA chain shouldn't drop on a brief gap).
+        # Consumed by the post-CodeFormer cross-frame EMA so it can refuse to
+        # mix the previous identity's restored crop onto a freshly-detected
+        # new identity (a single-frame pop that downstream smoothing can
+        # amplify). See MuseTalk commit ``ce7b684``.
+        track_ids: List[Optional[int]] = []
         if video_frames is None or len(video_frames) == 0:
             # Empty input: don't crash with `stack expects a non-empty TensorList`.
             # `restore_video` already returns the empty array as a no-op downstream.
@@ -1265,6 +1649,7 @@ class LipsyncPipeline(DiffusionPipeline):
             empty_zeros = torch.zeros(0, 3, self.image_processor.resolution, self.image_processor.resolution)
             return (
                 empty_zeros,
+                [],
                 [],
                 [],
                 [],
@@ -1289,6 +1674,7 @@ class LipsyncPipeline(DiffusionPipeline):
         prev_temporal_embedding = None
         prev_temporal_face: Optional[torch.Tensor] = None
         prev_mouth_info: Optional[Dict[str, float]] = None
+        prev_track_id: Optional[int] = None
         continuity_break_mask = []
         print(f"Affine transforming {len(video_frames)} faces...")
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
@@ -1307,6 +1693,11 @@ class LipsyncPipeline(DiffusionPipeline):
                 aligned_mouth_info.append(None)
                 yaws.append(None)
                 yaw_skip_reasons.append(False)
+                # Detect-fail: identity is unknown; inherit prev_track_id so
+                # the post-CF EMA chain survives a brief gap (chain break is
+                # captured by continuity_break_mask=True, which resets the
+                # EMA carry separately).
+                track_ids.append(prev_track_id)
                 prev_yaw = None  # reset so we don't carry a stale yaw across a detect-fail gap
                 prev_motion_state = None
                 prev_temporal_motion_state = None
@@ -1443,6 +1834,18 @@ class LipsyncPipeline(DiffusionPipeline):
             continuity_break_mask.append(should_skip or continuity_break)
             yaws.append(yaw_deg if (yaw_skip_threshold > 0 and yaw_available) else None)
             yaw_skip_reasons.append(yaw_was_skipped)
+            # track_id assignment: detect-fail (handled above) and should_skip
+            # inherit the previous track_id; valid frames with continuity_break
+            # start a new track; valid frames without break stay on the same
+            # track. The break check is gated on prev_temporal_embedding being
+            # non-None, so the first valid frame after a gap has break=False
+            # and inherits -- which matches "assume same identity until
+            # contradicted" semantics.
+            if continuity_break:
+                track_ids.append((prev_track_id + 1) if prev_track_id is not None else 0)
+                prev_track_id = track_ids[-1]
+            else:
+                track_ids.append(prev_track_id)
             faces.append(face)
             boxes.append(box)
             affine_matrices.append(affine_matrix)
@@ -1547,6 +1950,47 @@ class LipsyncPipeline(DiffusionPipeline):
                 f"(min_run={side_face_warn_min_run_frames}, warn_threshold={yaw_warn_threshold:.1f}°)"
             )
 
+        # HeyGen-like segment consistency: time-window merge adjacent
+        # valid runs separated by a short passthrough gap, gated on
+        # hard-cut detection (refuse bridging a shot boundary) and
+        # track_id agreement (refuse bridging a speaker switch).
+        # Followed by a min-merged-length downgrade that flips short
+        # isolated runs back to passthrough. Mirrors MuseTalk 4b4987a.
+        # Mutates ``skip_mask`` and ``continuity_break_mask`` in place.
+        seg_reasons = self._enforce_segment_consistency(
+            skip_mask,
+            faces,
+            track_ids,
+            fps=video_fps,
+            hard_cut_enabled=segment_consistency_hard_cut_enabled,
+            hard_cut_threshold=segment_consistency_hard_cut_distance_threshold,
+            track_aware=segment_consistency_track_aware,
+            min_merged_seconds=min_merged_lipsync_seconds,
+            merge_window_frames=lipsync_min_segment_frames,
+        )
+        # Any segment-consistency flip from False -> True (downgrade)
+        # or True -> False (merge) also flips continuity_break_mask so
+        # the EMA carry / post-CF EMA chain reset on the same boundary.
+        # Cheap: a single zip + set per reason; runs only when at least
+        # one reason triggered.
+        if any(seg_reasons.values()):
+            for k in range(len(skip_mask)):
+                # If a previously-valid frame was just downgraded to
+                # passthrough, mark the boundary as a break so the
+                # diffusion-side EMA resets here.
+                if skip_mask[k]:
+                    continuity_break_mask[k] = True
+            logger.info(
+                f"[Segment] consistency reasons: speaker_switch={seg_reasons['speaker_switch']} "
+                f"hard_cut={seg_reasons['hard_cut']} too_short={seg_reasons['too_short']} "
+                f"(hard_cut_enabled={segment_consistency_hard_cut_enabled}, "
+                f"hard_cut_threshold={segment_consistency_hard_cut_distance_threshold:.2f}, "
+                f"track_aware={segment_consistency_track_aware}, "
+                f"min_merged={min_merged_lipsync_seconds}s, "
+                f"merge_window={lipsync_min_segment_frames}f)"
+            )
+        self._last_segment_reasons = seg_reasons
+
         # Cross-fade blend zone at every inpaint<->source boundary. See
         # ``_compute_blend_zone`` for the coefficient curve; the
         # returned ``blend_mask`` is consumed by ``restore_video`` to
@@ -1560,7 +2004,7 @@ class LipsyncPipeline(DiffusionPipeline):
             )
 
         faces_tensor = torch.stack(faces)
-        return faces_tensor, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask
+        return faces_tensor, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask, track_ids
 
     def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, skip_mask=None, blend_mask=None, aligned_mouth_info=None, dynamic_masks=None):
         video_frames = video_frames[: len(faces)]
@@ -1701,6 +2145,25 @@ class LipsyncPipeline(DiffusionPipeline):
         lipsync_continuity_max_center_shift: float = 0.35,
         lipsync_continuity_max_scale_change: float = 0.35,
         lipsync_mouth_diff_break_threshold: float = 0.10,
+        # Minimum valid-run length (in source frames) used as the
+        # time-window merge radius for segment consistency. After the
+        # merge, two adjacent valid runs separated by a gap of <=
+        # this many frames are joined. Activates the previously
+        # dead ``LipSyncRequest.lipsync_min_segment_frames`` field.
+        lipsync_min_segment_frames: int = 5,
+        # --- HeyGen-like segment consistency (MuseTalk 4b4987a) ---
+        # Refuse the time-window merge when a hard cut is detected
+        # in the gap, or when the track_id of the two valid runs
+        # disagrees (a speaker switch is never bridged by a short
+        # passthrough). After the merge, force any valid run
+        # shorter than ``min_merged_lipsync_seconds`` back to
+        # passthrough. See MuseTalk
+        # docs/heygen_like_lipsync_segmentation_td.md §5.1, §5.5,
+        # §5.7.
+        segment_consistency_hard_cut_enabled: bool = True,
+        segment_consistency_hard_cut_distance_threshold: float = 0.65,
+        segment_consistency_track_aware: bool = True,
+        min_merged_lipsync_seconds: float = 1.5,
         identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 3,
@@ -1730,7 +2193,7 @@ class LipsyncPipeline(DiffusionPipeline):
             reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
             logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
         if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices, frame_skip_mask, frame_continuity_break_mask, frame_aligned_mouth_info, frame_blend_mask = self.affine_transform_video(
+            faces, boxes, affine_matrices, frame_skip_mask, frame_continuity_break_mask, frame_aligned_mouth_info, frame_blend_mask, frame_track_ids = self.affine_transform_video(
                 video_frames,
                 reference_embedding,
                 yaw_skip_threshold=yaw_skip_threshold,
@@ -1742,6 +2205,11 @@ class LipsyncPipeline(DiffusionPipeline):
                 lipsync_continuity_max_center_shift=lipsync_continuity_max_center_shift,
                 lipsync_continuity_max_scale_change=lipsync_continuity_max_scale_change,
                 lipsync_mouth_diff_break_threshold=lipsync_mouth_diff_break_threshold,
+                lipsync_min_segment_frames=lipsync_min_segment_frames,
+                segment_consistency_hard_cut_enabled=segment_consistency_hard_cut_enabled,
+                segment_consistency_hard_cut_distance_threshold=segment_consistency_hard_cut_distance_threshold,
+                segment_consistency_track_aware=segment_consistency_track_aware,
+                min_merged_lipsync_seconds=min_merged_lipsync_seconds,
                 identity_similarity_threshold=identity_similarity_threshold,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
@@ -1749,6 +2217,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 side_face_blend_fade_frames=side_face_blend_fade_frames,
                 yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
                 side_face_warn_min_run_frames=side_face_warn_min_run_frames,
+                video_fps=video_fps,
             )
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
             loop_video_frames = []
@@ -1759,6 +2228,7 @@ class LipsyncPipeline(DiffusionPipeline):
             loop_continuity_break_mask = []
             loop_aligned_mouth_info = []
             loop_blend_mask = []
+            loop_track_ids = []
             for i in range(num_loops):
                 if i % 2 == 0:
                     loop_video_frames.append(video_frames)
@@ -1772,6 +2242,14 @@ class LipsyncPipeline(DiffusionPipeline):
                         for k, value in enumerate(frame_continuity_break_mask)
                     ]
                     loop_blend_mask += frame_blend_mask
+                    # track_id is a source-frame property, so the forward
+                    # pass just copies it as-is. The boundary break is
+                    # already captured by ``loop_continuity_break_mask``
+                    # which forces the EMA carry to reset; track_id itself
+                    # doesn't need a parallel boundary bump because the
+                    # post-CF EMA compares consecutive OUTPUT positions,
+                    # and ``prev_track_id`` is updated per-iteration.
+                    loop_track_ids += list(frame_track_ids)
                 else:
                     loop_video_frames.append(video_frames[::-1])
                     loop_faces.append(faces.flip(0))
@@ -1786,6 +2264,13 @@ class LipsyncPipeline(DiffusionPipeline):
                     ]
                     loop_continuity_break_mask += reversed_breaks
                     loop_blend_mask += frame_blend_mask[::-1]
+                    # Reverse pass: output position k corresponds to
+                    # source frame (N-1-k), so the per-output-position
+                    # track_id we expose must also be the source track_id
+                    # at the mirrored position. Just reverse the list --
+                    # no per-element bump needed because the loop boundary
+                    # break already resets the EMA carry.
+                    loop_track_ids += list(frame_track_ids[::-1])
 
             video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
             faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
@@ -1795,9 +2280,10 @@ class LipsyncPipeline(DiffusionPipeline):
             continuity_break_mask = loop_continuity_break_mask[: len(whisper_chunks)]
             aligned_mouth_info = loop_aligned_mouth_info[: len(whisper_chunks)]
             blend_mask = loop_blend_mask[: len(whisper_chunks)]
+            track_ids = loop_track_ids[: len(whisper_chunks)]
         else:
             video_frames = video_frames[: len(whisper_chunks)]
-            faces, boxes, affine_matrices, frame_skip_mask, continuity_break_mask, frame_aligned_mouth_info, frame_blend_mask = self.affine_transform_video(
+            faces, boxes, affine_matrices, frame_skip_mask, continuity_break_mask, frame_aligned_mouth_info, frame_blend_mask, frame_track_ids = self.affine_transform_video(
                 video_frames,
                 reference_embedding,
                 yaw_skip_threshold=yaw_skip_threshold,
@@ -1809,6 +2295,11 @@ class LipsyncPipeline(DiffusionPipeline):
                 lipsync_continuity_max_center_shift=lipsync_continuity_max_center_shift,
                 lipsync_continuity_max_scale_change=lipsync_continuity_max_scale_change,
                 lipsync_mouth_diff_break_threshold=lipsync_mouth_diff_break_threshold,
+                lipsync_min_segment_frames=lipsync_min_segment_frames,
+                segment_consistency_hard_cut_enabled=segment_consistency_hard_cut_enabled,
+                segment_consistency_hard_cut_distance_threshold=segment_consistency_hard_cut_distance_threshold,
+                segment_consistency_track_aware=segment_consistency_track_aware,
+                min_merged_lipsync_seconds=min_merged_lipsync_seconds,
                 identity_similarity_threshold=identity_similarity_threshold,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
@@ -1816,12 +2307,14 @@ class LipsyncPipeline(DiffusionPipeline):
                 side_face_blend_fade_frames=side_face_blend_fade_frames,
                 yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
                 side_face_warn_min_run_frames=side_face_warn_min_run_frames,
+                video_fps=video_fps,
             )
             skip_mask = frame_skip_mask
             aligned_mouth_info = frame_aligned_mouth_info
             blend_mask = frame_blend_mask
+            track_ids = frame_track_ids
 
-        return video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask
+        return video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask, track_ids
 
     @torch.no_grad()
     def __call__(
@@ -1953,6 +2446,19 @@ class LipsyncPipeline(DiffusionPipeline):
         codeformer_retry_enabled: bool = False,
         codeformer_mouth_only_paste_enabled: bool = False,
         codeformer_restorer=None,
+        # Post-CodeFormer cross-frame 1-order EMA on the restored face
+        # crops. CodeFormer itself is stateless per-frame, so a
+        # high-frequency flicker can persist across consecutive valid
+        # frames. This EMA dampens that flicker by blending each
+        # restored crop toward the previous one. Mirrors MuseTalk
+        # commit ce7b684 (``codeformer_temporal_alpha``). 0 disables.
+        # Track-aware mode (default True) refuses the mix across
+        # speaker/identity boundaries -- a track switch with EMA on
+        # would otherwise smear the old face onto the new identity for
+        # one frame. Falls back to adjacency-only when track_id is
+        # missing on either side.
+        codeformer_post_ema_alpha: float = 0.8,
+        codeformer_post_ema_track_aware: bool = True,
         **kwargs,
     ):
         is_train = self.unet.training
@@ -2002,7 +2508,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # not reliable enough to reject other frames (false positives on
         # busy/occluded faces), so we keep all detected faces.
         apply_identity_filter = reference_embedding is not None
-        video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask = self.loop_video(
+        video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask, track_ids = self.loop_video(
             whisper_chunks,
             video_frames,
             reference_embedding=reference_embedding,
@@ -2016,6 +2522,11 @@ class LipsyncPipeline(DiffusionPipeline):
             lipsync_continuity_max_center_shift=lipsync_continuity_max_center_shift,
             lipsync_continuity_max_scale_change=lipsync_continuity_max_scale_change,
             lipsync_mouth_diff_break_threshold=lipsync_mouth_diff_break_threshold,
+            lipsync_min_segment_frames=lipsync_min_segment_frames,
+            segment_consistency_hard_cut_enabled=segment_consistency_hard_cut_enabled,
+            segment_consistency_hard_cut_distance_threshold=segment_consistency_hard_cut_distance_threshold,
+            segment_consistency_track_aware=segment_consistency_track_aware,
+            min_merged_lipsync_seconds=min_merged_lipsync_seconds,
             identity_similarity_threshold=identity_similarity_threshold,
             apply_identity_filter=apply_identity_filter,
             side_face_episode_pre_pad=side_face_episode_pre_pad,
@@ -2389,11 +2900,14 @@ class LipsyncPipeline(DiffusionPipeline):
                                 (current_frame - prev_frame).abs() * mask_k
                             ).sum() / mask_sum
                             mouth_delta_values.append(float(mouth_delta.item()))
-                            if mouth_delta.item() > mouth_temporal_stabilization_max_delta:
-                                mouth_stabilization_delta_skip_count += 1
-                                prev_mouth_stabilized = current_frame.detach()
-                                prev_mouth_stabilized_valid = True
-                                continue
+                            # Smoothstep taper: full blend at delta==0, zero at
+                            # delta>=max_delta. The hard "continue" was removed so
+                            # very large mouth motion (head turn / scene cut) now
+                            # rolls off the blend weight smoothly instead of
+                            # producing a single-frame "no blend" pop, while the
+                            # carry-state reset (prev_mouth_stabilized := current)
+                            # is still applied so the next frame blends from a
+                            # fresh baseline.
                             continuity = 1.0 - (
                                 mouth_delta / mouth_temporal_stabilization_max_delta
                             ).clamp(0.0, 1.0)
@@ -2401,6 +2915,11 @@ class LipsyncPipeline(DiffusionPipeline):
                             effective_stabilization_strength = (
                                 mouth_temporal_stabilization_strength * float(continuity.item())
                             )
+                            if float(mouth_delta.item()) > mouth_temporal_stabilization_max_delta:
+                                mouth_stabilization_delta_skip_count += 1
+                                prev_mouth_stabilized = current_frame.detach()
+                                prev_mouth_stabilized_valid = True
+                                continue
                         stabilized = (
                             current_frame
                             + mouth_stabilize_mask[k]
@@ -2541,6 +3060,24 @@ class LipsyncPipeline(DiffusionPipeline):
                     mouth_only_paste_enabled=codeformer_mouth_only_paste_enabled,
                 )
                 self._last_codeformer_stats = cf_stats.as_dict()
+                # Cross-frame 1-order EMA on the restored crops. Only
+                # runs when CF actually ran (otherwise we'd be blending
+                # diffusion output, which already has its own smoother
+                # via ``temporal_smoothing_enabled``). 0 disables.
+                if codeformer_post_ema_alpha > 0.0:
+                    all_faces, post_ema_stats = self._post_codeformer_temporal_ema(
+                        all_faces,
+                        skip_mask=effective_skip_mask,
+                        track_ids=track_ids,
+                        alpha=codeformer_post_ema_alpha,
+                        track_aware=codeformer_post_ema_track_aware,
+                    )
+                    self._last_codeformer_stats["ema_chain_breaks"] = int(
+                        post_ema_stats["breaks"]
+                    )
+                    self._last_codeformer_stats["ema_resets_on_track_switch"] = int(
+                        post_ema_stats["track_switch"]
+                    )
         # Concatenate the per-batch dynamic mouth masks (computed in
         # the inference loop above) and pass them to restore_video so
         # it can reuse them instead of calling
@@ -2639,6 +3176,11 @@ class LipsyncPipeline(DiffusionPipeline):
             "mouth_detail_strength": mouth_detail_strength,
             "mouth_sharpen_strength": mouth_sharpen_strength,
             "codeformer": self._last_codeformer_stats,
+            "segment_consistency": getattr(self, "_last_segment_reasons", {}),
+            "segment_consistency_hard_cut_enabled": segment_consistency_hard_cut_enabled,
+            "segment_consistency_hard_cut_distance_threshold": segment_consistency_hard_cut_distance_threshold,
+            "segment_consistency_track_aware": segment_consistency_track_aware,
+            "min_merged_lipsync_seconds": min_merged_lipsync_seconds,
         }
 
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
