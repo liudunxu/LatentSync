@@ -1568,6 +1568,11 @@ class LipsyncPipeline(DiffusionPipeline):
         self,
         video_frames: np.ndarray,
         reference_embedding=None,
+        # Source video frame rate. Used by segment-consistency to
+        # convert time-window merge / min-merged length from seconds
+        # into frames. 0 disables the time-based gates (falls back to
+        # the legacy frame-only logic).
+        video_fps: float = 25.0,
         yaw_skip_threshold: float = 30.0,
         yaw_rate_skip_threshold: float = 28.0,
         mouth_occlusion_skip_threshold: float = 1.0,
@@ -2136,6 +2141,10 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         skip_mask=None,
+        # Source video frame rate. Forwarded to
+        # ``affine_transform_video`` for the time-based segment
+        # consistency gates.
+        video_fps: float = 25.0,
         yaw_skip_threshold: float = 30.0,
         yaw_rate_skip_threshold: float = 28.0,
         mouth_occlusion_skip_threshold: float = 1.0,
@@ -2532,6 +2541,7 @@ class LipsyncPipeline(DiffusionPipeline):
             video_frames,
             reference_embedding=reference_embedding,
             face_embedder=face_embedder,
+            video_fps=video_fps,
             yaw_skip_threshold=yaw_skip_threshold,
             yaw_rate_skip_threshold=yaw_rate_skip_threshold,
             mouth_occlusion_skip_threshold=mouth_occlusion_skip_threshold,
