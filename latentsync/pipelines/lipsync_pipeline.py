@@ -273,13 +273,20 @@ class LipsyncPipeline(DiffusionPipeline):
     def _estimate_yaw_degrees(lmk: np.ndarray) -> float:
         """Yaw estimation (degrees) from 106-point landmarks, conservative multi-signal.
 
-        Three signals, all noise-gated so landmark jitter on a frontal face
+        Five signals, all noise-gated so landmark jitter on a frontal face
         can't trip a skip:
         1. Nose offset (signed, original *60 mapping) - the low-noise baseline.
         2. Eye-width asymmetry (unsigned) - fires only when ratio > 1.5;
            ratio 1.5 -> 0 deg, 2.0 -> 15, 2.5 -> 30, 3.0 -> 45.
         3. Mouth-corner asymmetry (unsigned) - fires only when diff > 0.2;
            0.2 -> 0 deg, 0.3 -> 10, 0.4 -> 20, 0.5 -> 30.
+        4. Mouth area / landmark bbox area (unsigned) - the 3D mouth
+           projects to a smaller 2D area as the face turns. 0 deg
+           typically ~0.04, 30 deg ~0.034, 60 deg ~0.020. Noise floor
+           0.025; below that we have no signal.
+        5. Mouth aspect ratio width/height (unsigned) - a frontal mouth
+           has aspect ~2.5 (wide, short); a side mouth narrows to ~1.0.
+           Noise floor 2.0; below that we have no signal.
 
         Returns the max absolute yaw across signals; sign from the nose
         offset. Compared to the earlier v2 (zero-floor eye/mouth + *75 nose)
@@ -323,8 +330,47 @@ class LipsyncPipeline(DiffusionPipeline):
             if mouth_asym > 0.2:
                 mouth_yaw = (mouth_asym - 0.2) * 100.0
 
+        # Signals 4 + 5: mouth geometry (area, aspect). These complement
+        # the corner-position signals (1-3) which only see the asymmetry
+        # between two landmarks; the new signals see the whole mouth
+        # shape compressed by the yaw rotation. Both unsigned.
+        #
+        # 48 (L corner), 54 (R corner), 51 (top center), 57 (bottom center).
+        # ``mouth_w`` = corner-to-corner distance, ``mouth_h`` = top-to-
+        # bottom half-distance, ``area_ellipse`` = the bounding ellipse
+        # area. ``face_area`` uses the landmark bbox (proxy for the face
+        # bbox -- they track each other closely because landmark 0-105
+        # covers the whole face).
+        area_yaw = 0.0
+        aspect_yaw = 0.0
+        try:
+            lmk_x_min = float(lmk[:, 0].min())
+            lmk_x_max = float(lmk[:, 0].max())
+            lmk_y_min = float(lmk[:, 1].min())
+            lmk_y_max = float(lmk[:, 1].max())
+            face_area = (lmk_x_max - lmk_x_min) * (lmk_y_max - lmk_y_min)
+            if face_area > 1e-3:
+                mouth_w = float(np.linalg.norm(lmk[54] - lmk[48]))
+                mouth_h = float(
+                    max(np.linalg.norm(lmk[57] - lmk[51]) / 2.0, 2.0)
+                )
+                area_norm = (math.pi * (mouth_w / 2.0) * mouth_h) / face_area
+                # Signal 4: area_norm < 0.025 -> 0 deg; 0.020 -> 12 deg;
+                # 0.015 -> 24 deg; 0.010 -> 36 deg.
+                if area_norm < 0.025:
+                    area_yaw = (0.025 - area_norm) * 1200.0
+                # Signal 5: aspect = width/height. Frontal ~2.5, side ~1.0.
+                # aspect < 2.0 -> 0 deg; 1.5 -> 30 deg; 1.0 -> 60 deg.
+                if mouth_w > 1e-3 and mouth_h > 1e-3:
+                    aspect = mouth_w / mouth_h
+                    if aspect < 2.0:
+                        aspect_yaw = (2.0 - aspect) * 60.0
+        except (IndexError, TypeError, ValueError):
+            # Leave area_yaw / aspect_yaw at 0.0 on any unexpected input.
+            pass
+
         sign = 1.0 if nose_yaw >= 0 else -1.0
-        return float(sign * max(abs(nose_yaw), eye_yaw, mouth_yaw))
+        return float(sign * max(abs(nose_yaw), eye_yaw, mouth_yaw, area_yaw, aspect_yaw))
 
     @staticmethod
     def _select_yaw_degrees(landmark_yaw: float, pose_yaw: Optional[float]) -> float:
