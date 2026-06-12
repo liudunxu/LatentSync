@@ -108,7 +108,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ### Two-repo project
 - `LatentSync` (this repo) - server + pipeline
-- `~/Downloads/dub` (separate git repo) - frontend
+- `~/workspace/others/dubbing` (separate git repo) - frontend
 - **Frontend form fields must use the `*_override` suffix** to take
   effect on the server. Sending `guidance_scale` is silently ignored;
   the server only reads `guidance_scale_override`. The frontend already
@@ -126,7 +126,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 LatentSync/
 ├── api.py                          # FastAPI server, /api/lipsync + /api/faces + /health + /api/download
 ├── predict.py                      # Replicate / Cog entry point
-├── gradio_app.py                   # Gradio UI (alternative to ~/Downloads/dub)
+├── gradio_app.py                   # Gradio UI (alternative to ~/workspace/others/dubbing)
 ├── inference.sh                    # CLI inference (calls scripts/inference.py)
 ├── setup_env.sh                    # Python env + ffmpeg setup
 │
@@ -295,7 +295,7 @@ All filter counts log under `[FaceMatch]` — first place to look when output lo
    face_jump_skip, detect_fail). If a sample looks wrong, this is the
    first place to look to know WHICH filter is firing.
 
-9. **Two-repo coupling: LatentSync + ~/Downloads/dub.** Tunable
+9. **Two-repo coupling: LatentSync + ~/workspace/others/dubbing.** Tunable
    defaults need coordinated commits in both repos. Adding a new
    field to `LipSyncRequest` without frontend support means it can
    only be set via direct API call.
