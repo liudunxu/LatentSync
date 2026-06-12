@@ -337,6 +337,20 @@ class LipSyncRequest(BaseModel):
         le=120,
         description="Skip sustained near-profile runs above the yaw warn threshold; 0 disables.",
     )
+    # Time-based alternative to ``side_face_warn_min_run_frames``. The
+    # warn-run skip uses ``max(min_run_frames, round(min_run_seconds *
+    # fps))`` as the effective threshold. The time form is more
+    # intuitive to set from a UI ("skip if the side face lasts >0.5s").
+    # 0 disables (the run-skip still respects ``min_run_frames``).
+    # Combined with the absolute yaw thresholds this implements the
+    # "if a side face is sustained, just passthrough the whole run
+    # instead of trying to inpaint" behavior.
+    side_face_warn_min_run_seconds: float = Field(
+        0.0,
+        ge=0.0,
+        le=10.0,
+        description="Skip sustained near-profile runs whose duration is > this many seconds; 0 disables.",
+    )
     # Per-request inference overrides. None = use server-side setting
     # (LATENTSYNC_GUIDANCE_SCALE / LATENTSYNC_INFERENCE_STEPS / LATENTSYNC_SEED
     # env vars, or their CLI flags). Frontend (~/Downloads/dub) sends these
@@ -1453,6 +1467,7 @@ class LatentSyncApiRuntime:
                 side_face_blend_fade_frames=payload.side_face_blend_fade_frames,
                 yaw_warn_threshold_ratio=payload.yaw_warn_threshold_ratio,
                 side_face_warn_min_run_frames=payload.side_face_warn_min_run_frames,
+                side_face_warn_min_run_seconds=payload.side_face_warn_min_run_seconds,
                 mouth_occlusion_skip_threshold=payload.mouth_occlusion_skip_threshold,
                 motion_blur_skip_threshold=getattr(payload, "motion_blur_skip_threshold", 0.08),
                 face_jump_center_threshold=payload.face_jump_center_threshold,

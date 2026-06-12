@@ -17,6 +17,7 @@ new signals in isolation by checking:
 """
 import math
 import sys
+import re
 import numpy as np
 import ast
 
@@ -139,3 +140,85 @@ def test_new_signals_fire_under_yaw():
     fn = _load_yaw_fn()
     yaw60 = abs(fn(_synth_lmk(60)))
     assert yaw60 > 20, f"60 deg should produce >20 deg yaw, got {yaw60}"
+
+
+def test_apply_warn_run_skip_seconds():
+    """Time-based gate: a run of warn-band frames lasting >min_run_seconds
+    is marked entirely as passthrough. Mirrors the absolute yaw passthrough
+    in the same module but uses wall-clock duration instead of frame count.
+    """
+    # Lift the static method without importing the full module
+    # (which would require torch/insightface).
+    src_path = '/Users/dunxu.liu/workspace/others/LatentSync/latentsync/pipelines/lipsync_pipeline.py'
+    with open(src_path) as f:
+        src = f.read()
+    import ast as _ast
+    tree = _ast.parse(src)
+    fn_src = None
+    for node in tree.body:
+        if isinstance(node, _ast.ClassDef):
+            for sub in node.body:
+                if isinstance(sub, _ast.FunctionDef) and sub.name == '_apply_warn_run_skip':
+                    fn_src = _ast.get_source_segment(src, sub)
+                    break
+    assert fn_src is not None
+    # Strip the type annotations (List[bool], etc.) so the function
+    # can exec without typing imports.
+    fn_src_clean = re.sub(r': List\[bool\]', '', fn_src)
+    fn_src_clean = re.sub(r': List\[Optional\[float\]\]', '', fn_src_clean)
+    fn_src_clean = re.sub(r'-> int:', '-> None:', fn_src_clean)
+    ns = {}
+    exec(fn_src_clean, ns)
+    fn = ns['_apply_warn_run_skip']
+
+    # 10 frames of yaw=25° (>22.5 warn), fps=25, min_run_seconds=0.2
+    # 10 frames * 0.04s = 0.4s > 0.2s -> all skipped
+    skip = [False] * 10
+    continuity = [False] * 10
+    yaws = [25.0] * 10
+    fn(
+        skip, continuity, yaws, warn_threshold=22.5,
+        min_run_frames=0, min_run_seconds=0.2, fps=25.0,
+    )
+    assert all(skip), f"all frames should be skipped, got {sum(skip)}/10"
+
+    # Below the time gate (5 frames at 25fps = 0.2s, but threshold is 0.5s)
+    skip = [False] * 5
+    continuity = [False] * 5
+    yaws = [25.0] * 5
+    fn(
+        skip, continuity, yaws, warn_threshold=22.5,
+        min_run_frames=0, min_run_seconds=0.5, fps=25.0,
+    )
+    assert not any(skip), "5 frames (0.2s) should NOT clear 0.5s gate"
+
+    # min_run_frames takes effect when seconds is 0
+    skip = [False] * 6
+    continuity = [False] * 6
+    yaws = [25.0] * 6
+    fn(
+        skip, continuity, yaws, warn_threshold=22.5,
+        min_run_frames=5, min_run_seconds=0.0, fps=25.0,
+    )
+    assert all(skip), "6 frames >= min_run_frames=5 should all skip"
+
+    # Whichever is larger wins
+    skip = [False] * 4
+    continuity = [False] * 4
+    yaws = [25.0] * 4
+    fn(
+        skip, continuity, yaws, warn_threshold=22.5,
+        min_run_frames=5, min_run_seconds=0.5, fps=25.0,
+    )
+    # min_run_frames=5, min_run_seconds*fps=12.5 -> effective=12. 4 < 12, no skip
+    assert not any(skip), "effective=12 frames > 4 frames should NOT clear"
+
+    # Both disabled
+    skip = [False] * 100
+    continuity = [False] * 100
+    yaws = [25.0] * 100
+    fn(
+        skip, continuity, yaws, warn_threshold=22.5,
+        min_run_frames=0, min_run_seconds=0.0, fps=25.0,
+    )
+    assert not any(skip), "both disabled -> no skip"

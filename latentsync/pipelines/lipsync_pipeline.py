@@ -474,17 +474,31 @@ class LipsyncPipeline(DiffusionPipeline):
         yaws: List[Optional[float]],
         warn_threshold: float,
         min_run_frames: int,
+        min_run_seconds: float = 0.0,
+        fps: float = 25.0,
     ) -> int:
         """Skip a contiguous run of warn-band frames when it lasts long enough.
 
         Independent of ``_apply_episode_pad``: this fires on a sequence of
-        non-skipped warn-band frames that crosses ``min_run_frames`` and
-        marks the whole run as skipped. Useful for the case where yaw
-        hovers just below the absolute threshold for half a second but
-        never crosses it. Mutates in place. Returns the number of newly-
+        non-skipped warn-band frames that crosses ``min_run_frames`` (or
+        ``min_run_seconds * fps``, whichever is larger) and marks the
+        whole run as skipped. Useful for the case where yaw hovers
+        just below the absolute threshold for half a second but never
+        crosses it. Mutates in place. Returns the number of newly-
         skipped frames.
+
+        ``min_run_frames`` and ``min_run_seconds`` are alternatives --
+        the function uses ``max(min_run_frames, round(min_run_seconds *
+        fps))`` as the effective threshold. This lets the operator
+        pick a time-based threshold (more intuitive, e.g. "0.5 s of
+        side face -> passthrough the whole segment") without having
+        to convert to a frame count for every video.
         """
-        if warn_threshold <= 0 or min_run_frames <= 0:
+        if warn_threshold <= 0:
+            return 0
+        seconds_threshold = max(0, int(round(min_run_seconds * fps))) if min_run_seconds > 0 else 0
+        effective_min_run = max(min_run_frames, seconds_threshold)
+        if effective_min_run <= 0:
             return 0
         extra = 0
         n = len(skip_mask)
@@ -501,7 +515,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 and abs(yaws[j]) > warn_threshold
             ):
                 j += 1
-            if j - i >= min_run_frames:
+            if j - i >= effective_min_run:
                 for k in range(i, j):
                     skip_mask[k] = True
                     continuity_break_mask[k] = True
@@ -1662,6 +1676,15 @@ class LipsyncPipeline(DiffusionPipeline):
         side_face_blend_fade_frames: int = 3,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
+        # Time-based alternative to ``side_face_warn_min_run_frames``.
+        # When > 0, a run of frames in the yaw warn band that lasts
+        # longer than this many seconds is marked as passthrough
+        # (the diffusion inpainter is bypassed, original frame is
+        # kept). Useful for "sustained side face -> don't try to
+        # inpaint" -- the operator picks a wall-clock duration
+        # instead of a frame count. 0 disables (the run-skip still
+        # respects ``min_run_frames``).
+        side_face_warn_min_run_seconds: float = 0.0,
         # EMA alpha for the per-frame mouth_info (center + half-extents)
         # used to draw the dynamic inpaint mask. 0.7 is the legacy
         # default; bump toward 0.85-1.0 to fix individual frames whose
@@ -2022,6 +2045,8 @@ class LipsyncPipeline(DiffusionPipeline):
             yaws,
             yaw_warn_threshold,
             side_face_warn_min_run_frames,
+            min_run_seconds=side_face_warn_min_run_seconds,
+            fps=video_fps,
         )
         self._last_side_face_episode_extra_skip_count = side_face_episode_extra_skip_count
         self._last_side_face_warn_run_skip_count = side_face_warn_run_skip_count
@@ -2034,7 +2059,8 @@ class LipsyncPipeline(DiffusionPipeline):
         if side_face_warn_run_skip_count:
             logger.info(
                 f"[FaceMatch] side_face_warn_run_skip={side_face_warn_run_skip_count} "
-                f"(min_run={side_face_warn_min_run_frames}, warn_threshold={yaw_warn_threshold:.1f}°)"
+                f"(min_run={side_face_warn_min_run_frames}f/{side_face_warn_min_run_seconds}s, "
+                f"warn_threshold={yaw_warn_threshold:.1f}°)"
             )
 
         # HeyGen-like segment consistency: time-window merge adjacent
@@ -2270,6 +2296,15 @@ class LipsyncPipeline(DiffusionPipeline):
         side_face_blend_fade_frames: int = 3,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
+        # Time-based alternative to ``side_face_warn_min_run_frames``.
+        # When > 0, a run of frames in the yaw warn band that lasts
+        # longer than this many seconds is marked as passthrough
+        # (the diffusion inpainter is bypassed, original frame is
+        # kept). Useful for "sustained side face -> don't try to
+        # inpaint" -- the operator picks a wall-clock duration
+        # instead of a frame count. 0 disables (the run-skip still
+        # respects ``min_run_frames``).
+        side_face_warn_min_run_seconds: float = 0.0,
         # EMA alpha for the per-frame mouth_info (center + half-extents)
         # used to draw the dynamic inpaint mask. 0.7 is the legacy
         # default; bump toward 0.85-1.0 to fix individual frames whose
@@ -2323,6 +2358,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 side_face_blend_fade_frames=side_face_blend_fade_frames,
                 yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
                 side_face_warn_min_run_frames=side_face_warn_min_run_frames,
+                side_face_warn_min_run_seconds=side_face_warn_min_run_seconds,
                 video_fps=video_fps,
                 aligned_mouth_ema_alpha=aligned_mouth_ema_alpha,
             )
@@ -2415,6 +2451,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 side_face_blend_fade_frames=side_face_blend_fade_frames,
                 yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
                 side_face_warn_min_run_frames=side_face_warn_min_run_frames,
+                side_face_warn_min_run_seconds=side_face_warn_min_run_seconds,
                 video_fps=video_fps,
                 aligned_mouth_ema_alpha=aligned_mouth_ema_alpha,
             )
@@ -2496,6 +2533,15 @@ class LipsyncPipeline(DiffusionPipeline):
         side_face_blend_fade_frames: int = 3,
         yaw_warn_threshold_ratio: float = 0.75,
         side_face_warn_min_run_frames: int = 0,
+        # Time-based alternative to ``side_face_warn_min_run_frames``.
+        # When > 0, a run of frames in the yaw warn band that lasts
+        # longer than this many seconds is marked as passthrough
+        # (the diffusion inpainter is bypassed, original frame is
+        # kept). Useful for "sustained side face -> don't try to
+        # inpaint" -- the operator picks a wall-clock duration
+        # instead of a frame count. 0 disables (the run-skip still
+        # respects ``min_run_frames``).
+        side_face_warn_min_run_seconds: float = 0.0,
         # EMA alpha for the per-frame mouth_info (center + half-extents)
         # used to draw the dynamic inpaint mask. 0.7 is the legacy
         # default; bump toward 0.85-1.0 to fix individual frames whose
@@ -2678,6 +2724,7 @@ class LipsyncPipeline(DiffusionPipeline):
             side_face_blend_fade_frames=side_face_blend_fade_frames,
             yaw_warn_threshold_ratio=yaw_warn_threshold_ratio,
             side_face_warn_min_run_frames=side_face_warn_min_run_frames,
+            side_face_warn_min_run_seconds=side_face_warn_min_run_seconds,
             aligned_mouth_ema_alpha=aligned_mouth_ema_alpha,
         )
         silent_skip_mask = [False] * len(skip_mask)
@@ -3286,6 +3333,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "yaw_rate_skip_threshold": yaw_rate_skip_threshold,
             "yaw_warn_threshold_ratio": yaw_warn_threshold_ratio,
             "side_face_warn_min_run_frames": side_face_warn_min_run_frames,
+            "side_face_warn_min_run_seconds": side_face_warn_min_run_seconds,
             "mouth_occlusion_skip_threshold": mouth_occlusion_skip_threshold,
             "motion_blur_skip_threshold": motion_blur_skip_threshold,
             "face_jump_center_threshold": face_jump_center_threshold,
