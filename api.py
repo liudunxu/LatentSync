@@ -227,12 +227,12 @@ class LipSyncRequest(BaseModel):
     # Post-merge minimum duration. After the merge, any valid run
     # whose total length is below this many seconds is forced
     # entirely to passthrough to avoid the splice artifacts that a
-    # short isolated segment would produce. 0.6s keeps the guardrail
-    # against isolated flicker while avoiding the old 1.5s default
-    # dropping normal short utterances / short shots. 0 disables.
+    # short isolated segment would produce. 0.4s keeps the guardrail
+    # against isolated flicker while allowing normal short utterances /
+    # short shots to still generate. 0 disables.
     # Mirrors MuseTalk 4b4987a §5.7.
     min_merged_lipsync_seconds: float = Field(
-        0.6,
+        0.4,
         ge=0.0,
         le=10.0,
         description="After segment consistency merge, valid runs shorter than this many seconds are forced to passthrough. 0 disables. Mirrors MuseTalk 4b4987a §5.7.",
@@ -254,17 +254,16 @@ class LipSyncRequest(BaseModel):
     # "mild" range documented in the unsharp-mask helper; values above
     # ~0.7 start to look crunchy. Frontend can still override per request.
     mouth_sharpen_strength: float = Field(0.30, ge=0.0, le=1.0)
-    # Frame-to-frame mouth stabilization: was 0.08, raised to 0.15 so the
-    # EMA carryover actually damps the high-frequency jitter the diffusion
-    # output tends to have. 0 disables entirely.
-    mouth_temporal_stabilization_strength: float = Field(0.15, ge=0.0, le=0.6)
+    # Frame-to-frame mouth stabilization. Keep this light: too much carryover
+    # damps open-mouth frames and makes speech look under-articulated.
+    mouth_temporal_stabilization_strength: float = Field(0.10, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     mouth_audio_adaptive_motion_enabled: bool = True
-    # Adaptive motion: 0.75 floor means even on weak/silent audio we keep
-    # 75% of the generated current-frame motion (was 0.65, which over-
-    # smoothed soft speech and made lips look "frozen" between syllables).
-    mouth_audio_motion_min_scale: float = Field(0.75, ge=0.0, le=2.0)
-    mouth_audio_motion_max_scale: float = Field(1.20, ge=0.0, le=2.0)
+    # Adaptive motion: preserve a little more current generated mouth motion,
+    # especially on high-energy speech, so open-mouth frames are not pulled
+    # back toward the smoothed/previous-frame mouth too aggressively.
+    mouth_audio_motion_min_scale: float = Field(0.85, ge=0.0, le=2.0)
+    mouth_audio_motion_max_scale: float = Field(1.35, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default
     # (self.config.data.mask_image_path, usually latentsync/utils/mask.png).
     # Set to "latentsync/utils/mask5.png" to use the tight mouth-only mask,
@@ -315,8 +314,8 @@ class LipSyncRequest(BaseModel):
     # turning and the affine alignment is unreliable there). Set
     # pre_pad/post_pad to 0 to disable the padding and only do the
     # per-frame yaw skip.
-    side_face_episode_pre_pad: int = Field(2, ge=0, le=30)
-    side_face_episode_post_pad: int = Field(2, ge=0, le=30)
+    side_face_episode_pre_pad: int = Field(1, ge=0, le=30)
+    side_face_episode_post_pad: int = Field(1, ge=0, le=30)
     # Cross-fade between inpaint and source at side-face boundaries. The
     # episode pad above creates a hard binary inpaint->source cut at the
     # warn-band edge. The blend zone softens that cut: the N inpaint
@@ -329,8 +328,9 @@ class LipSyncRequest(BaseModel):
     side_face_blend_fade_frames: int = Field(3, ge=0, le=30)
     # Warn-band ratio: yaws above `yaw_skip_threshold * ratio` but below
     # `yaw_skip_threshold` are treated as transition frames / near-profile
-    # runs. Default 0.75 = warn @ 22.5° for the default 30° threshold.
-    yaw_warn_threshold_ratio: float = Field(0.75, ge=0.0, le=1.0)
+    # runs. Default 0.80 = warn @ 24° for the default 30° threshold, keeping
+    # the side-face guardrail while avoiding over-skipping mild turns.
+    yaw_warn_threshold_ratio: float = Field(0.80, ge=0.0, le=1.0)
     side_face_warn_min_run_frames: int = Field(
         0,
         ge=0,
