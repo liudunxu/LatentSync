@@ -227,12 +227,12 @@ class LipSyncRequest(BaseModel):
     # Post-merge minimum duration. After the merge, any valid run
     # whose total length is below this many seconds is forced
     # entirely to passthrough to avoid the splice artifacts that a
-    # short isolated segment would produce (a 3-frame isolated
-    # segment is usually detector jitter -- it's safer to drop the
-    # inpaint for that run than to show a flicker). 0 disables.
+    # short isolated segment would produce. 0.6s keeps the guardrail
+    # against isolated flicker while avoiding the old 1.5s default
+    # dropping normal short utterances / short shots. 0 disables.
     # Mirrors MuseTalk 4b4987a §5.7.
     min_merged_lipsync_seconds: float = Field(
-        1.5,
+        0.6,
         ge=0.0,
         le=10.0,
         description="After segment consistency merge, valid runs shorter than this many seconds are forced to passthrough. 0 disables. Mirrors MuseTalk 4b4987a §5.7.",
@@ -315,8 +315,8 @@ class LipSyncRequest(BaseModel):
     # turning and the affine alignment is unreliable there). Set
     # pre_pad/post_pad to 0 to disable the padding and only do the
     # per-frame yaw skip.
-    side_face_episode_pre_pad: int = Field(3, ge=0, le=30)
-    side_face_episode_post_pad: int = Field(3, ge=0, le=30)
+    side_face_episode_pre_pad: int = Field(2, ge=0, le=30)
+    side_face_episode_post_pad: int = Field(2, ge=0, le=30)
     # Cross-fade between inpaint and source at side-face boundaries. The
     # episode pad above creates a hard binary inpaint->source cut at the
     # warn-band edge. The blend zone softens that cut: the N inpaint
