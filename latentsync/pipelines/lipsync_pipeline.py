@@ -1304,6 +1304,7 @@ class LipsyncPipeline(DiffusionPipeline):
         min_rx_norm: float = 0.12,
         max_ry_norm: float = 0.30,
         max_rx_norm: float = 0.40,
+        fixed_keep_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Generate a per-frame mouth inpainting mask from landmark info.
 
@@ -1315,6 +1316,13 @@ class LipsyncPipeline(DiffusionPipeline):
         When ``mouth_info`` is None (face not detected or landmarks unavailable),
         falls back to a default elliptical mask matching the old hard-coded
         ``_mouth_core_mask`` geometry.
+
+        If ``fixed_keep_mask`` is provided, the returned keep mask is the
+        element-wise maximum of the dynamic keep mask and the fixed mask. This
+        prevents extreme mouth expressions from pushing the generated region
+        outside the lower-face area the UNet was trained to inpaint, which is
+        the root cause of ``color block outside the face`` artifacts on wide
+        open mouths.
         """
         H = W = resolution
         if mouth_info is not None:
@@ -1360,7 +1368,17 @@ class LipsyncPipeline(DiffusionPipeline):
             inpaint_region = torch.where(ellipse > 1.0, torch.zeros_like(inpaint_region), inpaint_region)
 
         keep_mask = 1.0 - inpaint_region
-        return keep_mask.unsqueeze(0)
+        keep_mask = keep_mask.unsqueeze(0)
+        if fixed_keep_mask is not None:
+            try:
+                m = fixed_keep_mask.to(dtype=keep_mask.dtype, device=keep_mask.device)
+                if m.dim() == 2:
+                    m = m.unsqueeze(0)
+                if m.dim() == 3 and m.shape[-2:] == keep_mask.shape[-2:]:
+                    keep_mask = torch.maximum(keep_mask, m)
+            except Exception:
+                pass
+        return keep_mask
 
     @staticmethod
     def _mouth_occlusion_score(face: torch.Tensor) -> float:
@@ -2344,7 +2362,9 @@ class LipsyncPipeline(DiffusionPipeline):
                         # keep_mask and restore_img expects a paste
                         # weight.
                         paste_mask_512 = 1.0 - self.generate_dynamic_mouth_mask(
-                            mi, self.image_processor.resolution
+                            mi,
+                            self.image_processor.resolution,
+                            fixed_keep_mask=self.image_processor.mask_image[0:1],
                         )
                 out_frame = self.image_processor.restorer.restore_img(
                     source_frame,
@@ -3083,8 +3103,9 @@ class LipsyncPipeline(DiffusionPipeline):
         all_ref_pixel_values, all_masked_pixel_values, all_masks = self.image_processor.prepare_masks_and_masked_images(
             faces, affine_transform=False
         )
+        fixed_keep_mask = self.image_processor.mask_image[0:1]
         all_dynamic_region_masks = torch.stack([
-            self.generate_dynamic_mouth_mask(mi, height)
+            self.generate_dynamic_mouth_mask(mi, height, fixed_keep_mask=fixed_keep_mask)
             for mi in aligned_mouth_info
         ])
 

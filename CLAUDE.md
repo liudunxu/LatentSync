@@ -85,6 +85,11 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
   times. **Baseline: `ef3903f` with `latentsync/utils/mask.png`.**
 - Do not toggle masks, mask width, or feather without an explicit ask.
   Previous revert cycles were explicitly rejected.
+- Exception: the per-frame dynamic mouth mask may be **clamped to the
+  fixed mask boundary** (`generate_dynamic_mouth_mask(..., fixed_keep_mask)`)
+  so extreme expressions do not paste generated content outside the
+  lower-face region. This preserves the `mask.png` default and only
+  shrinks the generated region in outlier frames.
 
 ### Side-face detection is delicate
 - Current implementation in `_estimate_yaw_degrees`
