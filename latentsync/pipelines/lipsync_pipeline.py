@@ -2347,7 +2347,7 @@ class LipsyncPipeline(DiffusionPipeline):
                             mi, self.image_processor.resolution
                         )
                 out_frame = self.image_processor.restorer.restore_img(
-                    video_frames[index],
+                    source_frame,
                     face_resized,
                     affine_matrices[index],
                     paste_mask_512=paste_mask_512,
