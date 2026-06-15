@@ -230,8 +230,9 @@ api.py returns { video_url, download_url, job_id, run_stats, ... }
 7. **mouth_occlusion** (default disabled, threshold 1.0)
 8. **motion_blur** (Laplacian variance, default 0.08)
 9. **identity_similarity** (vs avatar embedding, default 0.5)
+10. **adaptive_quality_fallback** (opt-in; composite score after diffusion)
 
-All filter counts log under `[FaceMatch]` — first place to look when output looks wrong.
+All filter counts log under `[FaceMatch]` — first place to look when output looks wrong. When `adaptive_quality_fallback_enabled=True`, also check `[LipSync]` for `adaptive_quality_fallback=N`.
 
 ### Post-processes (applied to generated mouth)
 - color match → mouth detail recovery → mouth sharpen → temporal EMA → motion preserve → stabilization
@@ -304,6 +305,21 @@ All filter counts log under `[FaceMatch]` — first place to look when output lo
     `LipsyncPipeline.__call__` is 1100+ lines with 30+ helper methods
     and many interacting prefilters. Threshold tweaks can have
     non-obvious cascade effects. Plan → verify checklist → execute.
+
+11. **`audio_sync_offset_seconds` semantics are fixed.** Positive means
+    the provided audio is **ahead** of the video; the pipeline uses
+    earlier audio features for each frame and delays the output audio
+    by padding zeros at the start. If your frontend uses the opposite
+    convention, negate the value before sending it.
+
+12. **Adaptive quality fallback is opt-in.** The composite score
+    (`adaptive_quality_fallback_enabled=False` by default) combines
+    mouth sharpness, mouth-region diff, identity similarity, yaw,
+    audio confidence and temporal stability. It is capped by
+    `adaptive_quality_fallback_max_ratio` and passed through a
+    hysteresis filter to suppress isolated-frame flicker. Enable it
+    for short-drama content where a bad generated mouth is worse than
+    keeping the original.
 
 ---
 

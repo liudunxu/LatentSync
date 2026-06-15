@@ -505,6 +505,37 @@ class LipSyncRequest(BaseModel):
         description="When True, refuse the post-CF EMA mix across speaker/track_id boundaries. Falls "
                     "back to legacy adjacency-only rule when track_id is missing on either side.",
     )
+    # --- Adaptive quality fallback (added 2026-06) ---
+    # After diffusion/post-processing, evaluate a per-frame composite quality
+    # score and fallback to the source frame when it is too low. Designed for
+    # short-drama content where a bad generated mouth is worse than the
+    # original, but isolated fallback decisions must be suppressed to avoid
+    # visible flicker.
+    adaptive_quality_fallback_enabled: bool = Field(
+        False,
+        description="Enable per-frame adaptive quality fallback. Combines mouth sharpness, "
+                    "mouth-region diff, identity similarity, yaw, audio confidence and "
+                    "temporal stability into a single score; frames below the adaptive "
+                    "threshold are replaced with the source frame.",
+    )
+    adaptive_quality_fallback_threshold: float = Field(
+        0.35, ge=0.0, le=1.0,
+        description="Base quality threshold in [0, 1]. Lower = more tolerant of artefacts. "
+                    "The actual threshold is raised automatically if the fallback ratio "
+                    "would exceed adaptive_quality_fallback_max_ratio.",
+    )
+    adaptive_quality_fallback_max_ratio: float = Field(
+        0.35, ge=0.0, le=1.0,
+        description="Maximum fraction of non-prefiltered frames allowed to fallback. "
+                    "If the base threshold would skip more than this, the threshold is "
+                    "raised until the budget is met.",
+    )
+    adaptive_quality_fallback_hysteresis_frames: int = Field(
+        2, ge=0, le=10,
+        description="Suppress isolated single-frame fallback decisions. A run of fallback "
+                    "frames shorter than or equal to this length is reverted unless it "
+                    "touches the start/end of the clip.",
+    )
 
 
 class FaceListRequest(BaseModel):
@@ -1443,6 +1474,7 @@ class LatentSyncApiRuntime:
                 video_path=str(video_path),
                 audio_path=str(audio_path),
                 video_out_path=str(output_path),
+                audio_sync_offset_seconds=payload.audio_sync_offset_seconds,
                 num_frames=self.config.data.num_frames,
                 num_inference_steps=effective_inference_steps,
                 guidance_scale=effective_guidance_scale,
@@ -1524,6 +1556,10 @@ class LatentSyncApiRuntime:
                 codeformer_post_ema_alpha=payload.codeformer_post_ema_alpha,
                 codeformer_post_ema_track_aware=payload.codeformer_post_ema_track_aware,
                 codeformer_restorer=codeformer_restorer,
+                adaptive_quality_fallback_enabled=payload.adaptive_quality_fallback_enabled,
+                adaptive_quality_fallback_threshold=payload.adaptive_quality_fallback_threshold,
+                adaptive_quality_fallback_max_ratio=payload.adaptive_quality_fallback_max_ratio,
+                adaptive_quality_fallback_hysteresis_frames=payload.adaptive_quality_fallback_hysteresis_frames,
             )
             logger.info(f"[LipSync] Pipeline completed, output={output_path}")
 
@@ -1551,6 +1587,21 @@ class LatentSyncApiRuntime:
             )
             pre_skip_frames = int(run_stats.get("pre_skip_frames", 0))
             quality_skip_frames = int(run_stats.get("quality_skip_frames", 0))
+            adaptive_quality_fallback_frames = int(
+                run_stats.get("adaptive_quality_fallback_frames", 0)
+            )
+            adaptive_quality_fallback_enabled = bool(
+                run_stats.get("adaptive_quality_fallback_enabled", False)
+            )
+            adaptive_quality_fallback_threshold = float(
+                run_stats.get("adaptive_quality_fallback_threshold", 0.35)
+            )
+            adaptive_quality_fallback_max_ratio = float(
+                run_stats.get("adaptive_quality_fallback_max_ratio", 0.35)
+            )
+            adaptive_quality_fallback_hysteresis_frames = int(
+                run_stats.get("adaptive_quality_fallback_hysteresis_frames", 2)
+            )
             effective_skip_frames = int(run_stats.get("effective_skip_frames", 0))
             silent_skip_frames = int(run_stats.get("silent_skip_frames", 0))
             skipped_inference_batches = int(run_stats.get("skipped_inference_batches", 0))
@@ -1568,9 +1619,9 @@ class LatentSyncApiRuntime:
                 "audio_frame_count": 0,
                 "source_fps": round(float(source_fps), 6),
                 "audio_feature_fps": 0.0,
-                "audio_sync_offset_frames": 0,
-                "audio_sync_offset_output_frames": 0,
-                "audio_sync_offset_seconds": payload.audio_sync_offset_seconds,
+                "audio_sync_offset_frames": int(run_stats.get("audio_sync_offset_frames", 0)),
+                "audio_sync_offset_output_frames": int(run_stats.get("audio_sync_offset_output_frames", 0)),
+                "audio_sync_offset_seconds": float(run_stats.get("audio_sync_offset_seconds", payload.audio_sync_offset_seconds)),
                 "effective_guidance_scale": effective_guidance_scale,
                 "effective_inference_steps": effective_inference_steps,
                 "effective_seed": effective_seed,
@@ -1592,6 +1643,11 @@ class LatentSyncApiRuntime:
                 "quality_fallback_frames": quality_fallback_frames,
                 "prefilter_skip_frames": pre_skip_frames,
                 "quality_skip_frames": quality_skip_frames,
+                "adaptive_quality_fallback_enabled": adaptive_quality_fallback_enabled,
+                "adaptive_quality_fallback_frames": adaptive_quality_fallback_frames,
+                "adaptive_quality_fallback_threshold": adaptive_quality_fallback_threshold,
+                "adaptive_quality_fallback_max_ratio": adaptive_quality_fallback_max_ratio,
+                "adaptive_quality_fallback_hysteresis_frames": adaptive_quality_fallback_hysteresis_frames,
                 "yaw_skip_count": yaw_skip_count,
                 "yaw_rate_skip_count": yaw_rate_skip_count,
                 "mouth_occlusion_skip_count": mouth_occlusion_skip_count,

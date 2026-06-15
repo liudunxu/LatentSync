@@ -85,15 +85,20 @@ class Audio2Feature:
         selected_feature = torch.from_numpy(selected_feature)
         return selected_feature, selected_idx
 
-    def feature2chunks(self, feature_array, fps):
+    def feature2chunks(self, feature_array, fps, offset_seconds=0.0):
         whisper_chunks = []
         whisper_idx_multiplier = 50.0 / fps
+        offset_frames = int(round(offset_seconds * fps))
         i = 0
-        print(f"video in {fps} FPS, audio idx in 50FPS")
+        print(f"video in {fps} FPS, audio idx in 50FPS, audio_sync_offset={offset_seconds}s ({offset_frames} frames)")
 
         while True:
             start_idx = int(i * whisper_idx_multiplier)
-            selected_feature, selected_idx = self.get_sliced_feature(feature_array=feature_array, vid_idx=i, fps=fps)
+            # Apply audio sync offset: positive offset means the audio is
+            # ahead of the video, so we use an earlier audio window to drive
+            # the current video frame.
+            vid_idx = max(0, i - offset_frames)
+            selected_feature, selected_idx = self.get_sliced_feature(feature_array=feature_array, vid_idx=vid_idx, fps=fps)
             # print(f"i:{i},selected_idx {selected_idx}")
             whisper_chunks.append(selected_feature)
             i += 1

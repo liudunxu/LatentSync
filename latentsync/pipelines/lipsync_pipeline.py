@@ -851,6 +851,154 @@ class LipsyncPipeline(DiffusionPipeline):
         return blend
 
     @staticmethod
+    def _mouth_region_diff_normalized(prev_face: torch.Tensor, curr_face: torch.Tensor) -> float:
+        """Mean absolute diff in the mouth band for tensors in [-1, 1].
+
+        Same ROI as ``_mouth_region_diff`` but normalised to [0, 1] using
+        the [-1, 1] dynamic range instead of uint8/255.
+        """
+        if prev_face is None or curr_face is None or prev_face.shape != curr_face.shape or prev_face.dim() != 3:
+            return 0.0
+        try:
+            H, W = curr_face.shape[-2:]
+            y0, y1 = int(H * 0.55), int(H * 0.74)
+            x0, x1 = int(W * 0.30), int(W * 0.70)
+            prev = prev_face[..., y0:y1, x0:x1].to(torch.float32)
+            curr = curr_face[..., y0:y1, x0:x1].to(torch.float32)
+            return float((curr - prev).abs().mean().item()) / 2.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _compute_frame_quality_score(
+        gen_face: torch.Tensor,
+        ref_face: torch.Tensor,
+        yaw: Optional[float] = None,
+        identity_sim: Optional[float] = None,
+        audio_scale: float = 1.0,
+        mouth_temporal_delta: Optional[float] = None,
+    ) -> float:
+        """Composite quality score in [0, 1]; higher = better.
+
+        Combines mouth sharpness ratio, mouth-region diff, identity
+        similarity, yaw magnitude, audio confidence and temporal stability.
+        Designed to catch blurry/drifted generated mouths while tolerating
+        closed-mouth and low-texture frames.
+        """
+        if gen_face is None or ref_face is None:
+            return 0.0
+
+        # 1. Mouth sharpness ratio vs reference (30%).
+        gen_sharp = LipsyncPipeline._mouth_sharpness(gen_face)
+        ref_sharp = LipsyncPipeline._mouth_sharpness(ref_face)
+        if ref_sharp > 1e-6:
+            sharp_ratio = gen_sharp / ref_sharp
+        else:
+            sharp_ratio = 1.0
+        # ratio >= 1 -> full score; ratio <= 0 -> 0; linear in between.
+        sharp_score = float(np.clip(sharp_ratio, 0.0, 1.0))
+
+        # 2. Mouth-region diff (25%).
+        mouth_diff = LipsyncPipeline._mouth_region_diff_normalized(ref_face, gen_face)
+        # diff=0 -> 1; diff=0.25 -> 0
+        diff_score = float(np.clip(1.0 - mouth_diff * 4.0, 0.0, 1.0))
+
+        # 3. Identity similarity (20%).
+        identity_score = float(identity_sim) if identity_sim is not None else 1.0
+
+        # 4. Yaw magnitude (10%).
+        yaw_score = float(1.0 - min(abs(yaw) / 45.0, 1.0)) if yaw is not None else 1.0
+
+        # 5. Audio motion scale (10%).
+        audio_score = float(np.clip(audio_scale, 0.0, 1.0))
+
+        # 6. Temporal stability (5%).
+        if mouth_temporal_delta is not None:
+            delta_score = float(np.clip(1.0 - mouth_temporal_delta * 5.0, 0.0, 1.0))
+        else:
+            delta_score = 1.0
+
+        return float(
+            0.30 * sharp_score
+            + 0.25 * diff_score
+            + 0.20 * identity_score
+            + 0.10 * yaw_score
+            + 0.10 * audio_score
+            + 0.05 * delta_score
+        )
+
+    @staticmethod
+    def _adaptive_quality_threshold(
+        scores: List[float],
+        base_threshold: float,
+        max_fallback_ratio: float,
+        already_skipped: List[bool],
+    ) -> List[bool]:
+        """Return per-frame fallback bools, capping fallback ratio.
+
+        First applies ``base_threshold``; if the resulting fallback ratio
+        among non-already-skipped frames exceeds ``max_fallback_ratio``,
+        raises the threshold until the budget is met.
+        """
+        n = len(scores)
+        if n == 0:
+            return []
+        candidates = [s < base_threshold for s in scores]
+        eligible_count = sum(1 for s in already_skipped if not s)
+        if eligible_count == 0:
+            return [False] * n
+
+        fallback_count = sum(
+            1 for i in range(n) if candidates[i] and not already_skipped[i]
+        )
+        ratio = fallback_count / eligible_count
+        if ratio <= max_fallback_ratio:
+            return candidates
+
+        allowed_fallback = max(0, int(math.floor(max_fallback_ratio * eligible_count)))
+        if allowed_fallback == 0:
+            return [False] * n
+
+        eligible_scores = sorted(
+            [(scores[i], i) for i in range(n) if not already_skipped[i]],
+            key=lambda x: x[0],
+        )
+        cutoff_score = eligible_scores[min(allowed_fallback - 1, len(eligible_scores) - 1)][0]
+        # Include everything at or below the cutoff; tiny epsilon avoids float
+        # boundary issues when multiple frames share the same score.
+        return [s <= cutoff_score + 1e-6 for s in scores]
+
+    @staticmethod
+    def _apply_quality_hysteresis(
+        fallback: List[bool],
+        hysteresis_frames: int,
+    ) -> List[bool]:
+        """Suppress short isolated fallback runs to reduce flicker.
+
+        Only interior runs shorter than or equal to ``hysteresis_frames``
+        are reverted; runs touching the clip boundaries are kept on the
+        assumption that the boundary condition is real.
+        """
+        if hysteresis_frames <= 0:
+            return fallback[:]
+        n = len(fallback)
+        out = fallback[:]
+        i = 0
+        while i < n:
+            if not out[i]:
+                i += 1
+                continue
+            j = i
+            while j < n and out[j]:
+                j += 1
+            run_len = j - i
+            if run_len <= hysteresis_frames and i > 0 and j < n:
+                for k in range(i, j):
+                    out[k] = False
+            i = j
+        return out
+
+    @staticmethod
     def _match_color_to_reference(
         face: torch.Tensor,
         ref_face: torch.Tensor,
@@ -1721,6 +1869,9 @@ class LipsyncPipeline(DiffusionPipeline):
         #     represent a "side face" and shouldn't trigger the episode pad).
         yaws: List[Optional[float]] = []
         yaw_skip_reasons: List[bool] = []
+        # Per-frame identity similarity vs reference_embedding (None when no
+        # reference is provided or no embedding is available).
+        frame_identity_similarities: List[Optional[float]] = []
         # Per-frame track_id (None = unknown, e.g. leading detect-fail frames).
         # A new track_id is assigned whenever ``continuity_break`` fires; detect-
         # fail and skipped frames inherit the previous track_id (we don't know
@@ -1737,6 +1888,8 @@ class LipsyncPipeline(DiffusionPipeline):
             empty_zeros = torch.zeros(0, 3, self.image_processor.resolution, self.image_processor.resolution)
             return (
                 empty_zeros,
+                [],
+                [],
                 [],
                 [],
                 [],
@@ -1782,6 +1935,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 aligned_mouth_info.append(None)
                 yaws.append(None)
                 yaw_skip_reasons.append(False)
+                frame_identity_similarities.append(None)
                 # Detect-fail: identity is unknown; inherit prev_track_id so
                 # the post-CF EMA chain survives a brief gap (chain break is
                 # captured by continuity_break_mask=True, which resets the
@@ -1796,12 +1950,14 @@ class LipsyncPipeline(DiffusionPipeline):
                 continuity_break_mask.append(True)
                 continue
             should_skip = False
+            frame_identity_sim = None
             if apply_identity_filter and reference_embedding is not None and face_emb is not None:
-                similarity = float(np.dot(face_emb, reference_embedding))
-                identity_similarities.append(similarity)
-                if similarity < identity_similarity_threshold:
+                frame_identity_sim = float(np.dot(face_emb, reference_embedding))
+                identity_similarities.append(frame_identity_sim)
+                if frame_identity_sim < identity_similarity_threshold:
                     should_skip = True
                     identity_skip_count += 1
+            frame_identity_similarities.append(frame_identity_sim)
             yaw_deg = 0.0
             yaw_available = False
             yaw_was_skipped = False  # tracks the absolute yaw threshold (not yaw_rate)
@@ -2117,10 +2273,30 @@ class LipsyncPipeline(DiffusionPipeline):
             )
 
         faces_tensor = torch.stack(faces)
-        return faces_tensor, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask, track_ids
+        return (
+            faces_tensor,
+            boxes,
+            affine_matrices,
+            skip_mask,
+            continuity_break_mask,
+            aligned_mouth_info,
+            blend_mask,
+            track_ids,
+            yaws,
+            frame_identity_similarities,
+        )
 
-    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, skip_mask=None, blend_mask=None, aligned_mouth_info=None, dynamic_masks=None):
-        video_frames = video_frames[: len(faces)]
+    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list, skip_mask=None, blend_mask=None, aligned_mouth_info=None, dynamic_masks=None, source_indices=None):
+        # ``source_indices`` maps each output position to the corresponding
+        # source frame index. When provided we avoid materialising a full
+        # duplicated ``video_frames`` array for audio-loop scenarios.
+        has_indices = source_indices is not None and len(source_indices) == len(faces)
+        if has_indices:
+            effective_source_len = len(video_frames)
+        else:
+            video_frames = video_frames[: len(faces)]
+            effective_source_len = len(video_frames)
+            source_indices = list(range(effective_source_len))
         out_frames = []
         print(f"Restoring {len(faces)} faces...")
         for index, face in enumerate(tqdm.tqdm(faces)):
@@ -2129,8 +2305,11 @@ class LipsyncPipeline(DiffusionPipeline):
             width = int(x2 - x1)
             should_skip = skip_mask[index] if skip_mask and index < len(skip_mask) else False
             blend_coeff = (blend_mask[index] if blend_mask and index < len(blend_mask) else 0.0)
+            source_idx = source_indices[index] if index < len(source_indices) else index
+            source_idx = max(0, min(effective_source_len - 1, source_idx))
+            source_frame = video_frames[source_idx]
             if should_skip or height <= 0 or width <= 0:
-                out_frames.append(video_frames[index])
+                out_frames.append(source_frame)
             else:
                 face_resized = torchvision.transforms.functional.resize(
                     face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
@@ -2181,7 +2360,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     # so we never fully replace the inpaint output with
                     # the source -- a small inpaint contribution keeps
                     # the look stable while smoothing the transition.
-                    src = video_frames[index].astype(np.float32)
+                    src = source_frame.astype(np.float32)
                     gen = out_frame.astype(np.float32)
                     out_frame = ((1.0 - blend_coeff) * gen + blend_coeff * src).astype(out_frame.dtype)
                 out_frames.append(out_frame)
@@ -2333,7 +2512,18 @@ class LipsyncPipeline(DiffusionPipeline):
             reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
             logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
         if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices, frame_skip_mask, frame_continuity_break_mask, frame_aligned_mouth_info, frame_blend_mask, frame_track_ids = self.affine_transform_video(
+            (
+                faces,
+                boxes,
+                affine_matrices,
+                frame_skip_mask,
+                frame_continuity_break_mask,
+                frame_aligned_mouth_info,
+                frame_blend_mask,
+                frame_track_ids,
+                frame_yaws,
+                frame_identity_sims,
+            ) = self.affine_transform_video(
                 video_frames,
                 reference_embedding,
                 yaw_skip_threshold=yaw_skip_threshold,
@@ -2363,7 +2553,6 @@ class LipsyncPipeline(DiffusionPipeline):
                 aligned_mouth_ema_alpha=aligned_mouth_ema_alpha,
             )
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
-            loop_video_frames = []
             loop_faces = []
             loop_boxes = []
             loop_affine_matrices = []
@@ -2372,9 +2561,13 @@ class LipsyncPipeline(DiffusionPipeline):
             loop_aligned_mouth_info = []
             loop_blend_mask = []
             loop_track_ids = []
+            loop_yaws = []
+            loop_identity_sims = []
+            source_indices = []
+            num_source_frames = len(video_frames)
             for i in range(num_loops):
                 if i % 2 == 0:
-                    loop_video_frames.append(video_frames)
+                    source_indices += list(range(num_source_frames))
                     loop_faces.append(faces)
                     loop_boxes += boxes
                     loop_affine_matrices += affine_matrices
@@ -2393,8 +2586,10 @@ class LipsyncPipeline(DiffusionPipeline):
                     # post-CF EMA compares consecutive OUTPUT positions,
                     # and ``prev_track_id`` is updated per-iteration.
                     loop_track_ids += list(frame_track_ids)
+                    loop_yaws += list(frame_yaws)
+                    loop_identity_sims += list(frame_identity_sims)
                 else:
-                    loop_video_frames.append(video_frames[::-1])
+                    source_indices += list(range(num_source_frames - 1, -1, -1))
                     loop_faces.append(faces.flip(0))
                     loop_boxes += boxes[::-1]
                     loop_affine_matrices += affine_matrices[::-1]
@@ -2414,8 +2609,10 @@ class LipsyncPipeline(DiffusionPipeline):
                     # no per-element bump needed because the loop boundary
                     # break already resets the EMA carry.
                     loop_track_ids += list(frame_track_ids[::-1])
+                    loop_yaws += list(frame_yaws[::-1])
+                    loop_identity_sims += list(frame_identity_sims[::-1])
 
-            video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
+            source_indices = source_indices[: len(whisper_chunks)]
             faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
             boxes = loop_boxes[: len(whisper_chunks)]
             affine_matrices = loop_affine_matrices[: len(whisper_chunks)]
@@ -2424,10 +2621,22 @@ class LipsyncPipeline(DiffusionPipeline):
             aligned_mouth_info = loop_aligned_mouth_info[: len(whisper_chunks)]
             blend_mask = loop_blend_mask[: len(whisper_chunks)]
             track_ids = loop_track_ids[: len(whisper_chunks)]
+            yaws = loop_yaws[: len(whisper_chunks)]
+            identity_sims = loop_identity_sims[: len(whisper_chunks)]
         else:
-            video_frames = video_frames[: len(whisper_chunks)]
-            faces, boxes, affine_matrices, frame_skip_mask, continuity_break_mask, frame_aligned_mouth_info, frame_blend_mask, frame_track_ids = self.affine_transform_video(
-                video_frames,
+            (
+                faces,
+                boxes,
+                affine_matrices,
+                frame_skip_mask,
+                continuity_break_mask,
+                frame_aligned_mouth_info,
+                frame_blend_mask,
+                frame_track_ids,
+                yaws,
+                identity_sims,
+            ) = self.affine_transform_video(
+                video_frames[: len(whisper_chunks)],
                 reference_embedding,
                 yaw_skip_threshold=yaw_skip_threshold,
                 yaw_rate_skip_threshold=yaw_rate_skip_threshold,
@@ -2459,8 +2668,12 @@ class LipsyncPipeline(DiffusionPipeline):
             aligned_mouth_info = frame_aligned_mouth_info
             blend_mask = frame_blend_mask
             track_ids = frame_track_ids
+            source_indices = list(range(min(len(video_frames), len(whisper_chunks))))
 
-        return video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask, track_ids
+        # ``video_frames`` remains the original source frames (not expanded).
+        # Callers must use ``source_indices`` to map an output position back
+        # to the source frame for restore / blend operations.
+        return video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask, track_ids, source_indices, yaws, identity_sims
 
     @torch.no_grad()
     def __call__(
@@ -2471,6 +2684,10 @@ class LipsyncPipeline(DiffusionPipeline):
         num_frames: int = 16,
         video_fps: int = 25,
         audio_sample_rate: int = 16000,
+        # Audio sync offset: positive means the provided audio is ahead of the
+        # video. We use earlier audio features to drive each frame, and delay
+        # the output audio by padding zeros at the start.
+        audio_sync_offset_seconds: float = 0.0,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 40,
@@ -2511,6 +2728,13 @@ class LipsyncPipeline(DiffusionPipeline):
         quality_min_sharpness_ratio: float = 0.05,
         quality_ref_min_laplacian: float = 1.00,
         quality_max_fallback_ratio: float = 0.80,
+        # Adaptive composite quality fallback: after diffusion/post-processing,
+        # evaluate a per-frame quality score and fallback to the source frame
+        # when it is too low. Default off to preserve existing behavior.
+        adaptive_quality_fallback_enabled: bool = False,
+        adaptive_quality_fallback_threshold: float = 0.35,
+        adaptive_quality_fallback_max_ratio: float = 0.35,
+        adaptive_quality_fallback_hysteresis_frames: int = 2,
         # Yaw-based prefilters for side faces / fast head turns. Defaults are
         # intentionally permissive so clear frontal faces are not filtered out.
         yaw_skip_threshold: float = 30.0,
@@ -2683,10 +2907,29 @@ class LipsyncPipeline(DiffusionPipeline):
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         whisper_feature = self.audio_encoder.audio2feat(audio_path)
-        whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
-        logger.info(f"[LipSync] audio: whisper_chunks={len(whisper_chunks)}, video_fps={video_fps}")
+        whisper_chunks = self.audio_encoder.feature2chunks(
+            feature_array=whisper_feature,
+            fps=video_fps,
+            offset_seconds=audio_sync_offset_seconds,
+        )
+        logger.info(
+            f"[LipSync] audio: whisper_chunks={len(whisper_chunks)}, video_fps={video_fps}, "
+            f"audio_sync_offset_seconds={audio_sync_offset_seconds}"
+        )
 
         audio_samples = read_audio(audio_path)
+        # Shift output audio so the muxed result is actually in sync.
+        # Positive offset -> audio is ahead -> delay it by padding zeros at start.
+        if abs(audio_sync_offset_seconds) > 1e-6:
+            offset_samples = int(round(audio_sync_offset_seconds * audio_sample_rate))
+            if offset_samples > 0:
+                pad = torch.zeros(offset_samples, dtype=audio_samples.dtype, device=audio_samples.device)
+                audio_samples = torch.cat([pad, audio_samples[: -offset_samples]], dim=0)
+            elif offset_samples < 0:
+                offset_samples = -offset_samples
+                pad = torch.zeros(offset_samples, dtype=audio_samples.dtype, device=audio_samples.device)
+                audio_samples = torch.cat([audio_samples[offset_samples:], pad], dim=0)
+
         video_frames = read_video(video_path, use_decord=False)
         logger.info(f"[LipSync] video_frames shape={video_frames.shape}")
 
@@ -2696,7 +2939,20 @@ class LipsyncPipeline(DiffusionPipeline):
         # not reliable enough to reject other frames (false positives on
         # busy/occluded faces), so we keep all detected faces.
         apply_identity_filter = reference_embedding is not None
-        video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask, track_ids = self.loop_video(
+        (
+            source_video_frames,
+            faces,
+            boxes,
+            affine_matrices,
+            skip_mask,
+            continuity_break_mask,
+            aligned_mouth_info,
+            blend_mask,
+            track_ids,
+            source_indices,
+            yaws,
+            identity_sims,
+        ) = self.loop_video(
             whisper_chunks,
             video_frames,
             reference_embedding=reference_embedding,
@@ -2795,6 +3051,8 @@ class LipsyncPipeline(DiffusionPipeline):
         mouth_delta_values: List[float] = []
         mouth_stabilization_delta_skip_count = 0
         mouth_stabilization_applied_count = 0
+        adaptive_quality_scores: List[Optional[float]] = [None] * len(skip_mask)
+        adaptive_quality_fallback_count: int = 0
 
         synced_video_frames = []
         # Cache the per-frame dynamic mouth masks computed in the
@@ -2816,6 +3074,19 @@ class LipsyncPipeline(DiffusionPipeline):
             device,
             generator,
         )
+
+        # Precompute pixel-level masks and masked images once for the whole
+        # sequence. Each frame only belongs to one inference batch, so this
+        # avoids repeating the torchvision resize/normalize/mask ops inside
+        # the loop. VAE encode is still done per-batch to keep memory bounded.
+        logger.info("[LipSync] precomputing masks and dynamic mouth masks for %d frames", len(faces))
+        all_ref_pixel_values, all_masked_pixel_values, all_masks = self.image_processor.prepare_masks_and_masked_images(
+            faces, affine_transform=False
+        )
+        all_dynamic_region_masks = torch.stack([
+            self.generate_dynamic_mouth_mask(mi, height)
+            for mi in aligned_mouth_info
+        ])
 
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
         logger.info(f"[LipSync] num_inferences={num_inferences}, num_frames={num_frames}, add_audio_layer={self.unet.add_audio_layer}")
@@ -2866,21 +3137,12 @@ class LipsyncPipeline(DiffusionPipeline):
             else:
                 audio_embeds = None
             latents = all_latents[:, :, batch_start:batch_end]
-            batch_mouth_info = aligned_mouth_info[batch_start:batch_end]
             # Fixed U-shaped mask for the UNet (model was trained on this).
-            ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
-                inference_faces, affine_transform=False
-            )
+            ref_pixel_values = all_ref_pixel_values[batch_start:batch_end]
+            masked_pixel_values = all_masked_pixel_values[batch_start:batch_end]
+            masks = all_masks[batch_start:batch_end]
             # Dynamic mouth-centered mask for post-processing paste-back.
-            # This uses per-frame mouth landmarks to create a tight mask
-            # that only covers the mouth area, avoiding identity drift and
-            # cheek ghosting while the model still sees the full U-shaped
-            # inpainting region during inference.
-            dynamic_region_masks = []
-            for k_mi, mi in enumerate(batch_mouth_info):
-                dm = self.generate_dynamic_mouth_mask(mi, height)
-                dynamic_region_masks.append(dm)
-            dynamic_region_mask_batch = torch.stack(dynamic_region_masks)  # (B, 1, H, W)
+            dynamic_region_mask_batch = all_dynamic_region_masks[batch_start:batch_end]
             all_dynamic_masks.append(dynamic_region_mask_batch)
 
             # 7. Prepare mask latent variables
@@ -3028,6 +3290,7 @@ class LipsyncPipeline(DiffusionPipeline):
 
             # Compute per-frame mouth center norm from aligned landmarks for
             # dynamic mask positioning in _mouth_core_mask calls below.
+            batch_mouth_info = aligned_mouth_info[batch_start:batch_end]
             first_center = None
             for mi in batch_mouth_info:
                 if mi is not None:
@@ -3075,6 +3338,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 )
                 if mouth_stabilize_mask.dim() == 4 and mouth_stabilize_mask.shape[1] == 1:
                     mouth_stabilize_mask = mouth_stabilize_mask.expand(-1, 3, -1, -1)
+                batch_mouth_deltas: List[Optional[float]] = [None] * decoded_latents.shape[0]
                 for k in range(decoded_latents.shape[0]):
                     if inference_skip_mask[k] or inference_continuity_break_mask[k]:
                         prev_mouth_stabilized = None
@@ -3092,6 +3356,7 @@ class LipsyncPipeline(DiffusionPipeline):
                                 (current_frame - prev_frame).abs() * mask_k
                             ).sum() / mask_sum
                             mouth_delta_values.append(float(mouth_delta.item()))
+                            batch_mouth_deltas[k] = float(mouth_delta.item())
                             # Smoothstep taper: full blend at delta==0, zero at
                             # delta>=max_delta. The hard "continue" was removed so
                             # very large mouth motion (head turn / scene cut) now
@@ -3160,6 +3425,31 @@ class LipsyncPipeline(DiffusionPipeline):
                         f"ref min={min(ref_laps):.2f} max={max(ref_laps):.2f} median={statistics.median(ref_laps):.2f}"
                     )
 
+            # Adaptive composite quality fallback: compute a per-frame score
+            # after all post-processing so bad generated mouths can be replaced
+            # by the source frame. Scores are stored for the final thresholding
+            # pass after all batches complete.
+            if adaptive_quality_fallback_enabled:
+                B = decoded_latents.shape[0]
+                base = i * num_frames
+                for k in range(B):
+                    if inference_skip_mask[k]:
+                        continue
+                    gen_face = decoded_latents[k].detach().cpu()
+                    ref_face = ref_pixel_values[k].detach().cpu()
+                    yaw = yaws[base + k] if base + k < len(yaws) else None
+                    identity_sim = identity_sims[base + k] if base + k < len(identity_sims) else None
+                    audio_scale = batch_audio_motion_scales[k] if k < len(batch_audio_motion_scales) else 1.0
+                    mouth_delta = batch_mouth_deltas[k] if mouth_temporal_stabilization_strength > 0 else None
+                    adaptive_quality_scores[base + k] = self._compute_frame_quality_score(
+                        gen_face,
+                        ref_face,
+                        yaw=yaw,
+                        identity_sim=identity_sim,
+                        audio_scale=audio_scale,
+                        mouth_temporal_delta=mouth_delta,
+                    )
+
             synced_video_frames.append(decoded_latents)
 
         logger.info(f"[LipSync] decoded {len(synced_video_frames)} batches, restoring video...")
@@ -3177,8 +3467,33 @@ class LipsyncPipeline(DiffusionPipeline):
             )
             quality_skip_mask = [False] * len(quality_skip_mask)
             quality_fallback_count = 0
-        # OR-merge the quality postfilter with the original skip_mask
-        effective_skip_mask = [a or b for a, b in zip(skip_mask, quality_skip_mask)]
+
+        # Apply adaptive composite quality fallback.
+        adaptive_quality_skip_mask: List[bool] = [False] * len(skip_mask)
+        if adaptive_quality_fallback_enabled:
+            adaptive_quality_skip_mask = self._adaptive_quality_threshold(
+                [s if s is not None else 1.0 for s in adaptive_quality_scores],
+                base_threshold=adaptive_quality_fallback_threshold,
+                max_fallback_ratio=adaptive_quality_fallback_max_ratio,
+                already_skipped=skip_mask,
+            )
+            adaptive_quality_skip_mask = self._apply_quality_hysteresis(
+                adaptive_quality_skip_mask,
+                hysteresis_frames=adaptive_quality_fallback_hysteresis_frames,
+            )
+            adaptive_quality_fallback_count = sum(adaptive_quality_skip_mask)
+            if adaptive_quality_fallback_count:
+                logger.info(
+                    f"[LipSync] adaptive_quality_fallback={adaptive_quality_fallback_count} / {len(skip_mask)} "
+                    f"(threshold={adaptive_quality_fallback_threshold}, max_ratio={adaptive_quality_fallback_max_ratio}, "
+                    f"hysteresis={adaptive_quality_fallback_hysteresis_frames})"
+                )
+
+        # OR-merge the quality postfilters with the original skip_mask.
+        effective_skip_mask = [
+            a or b or c
+            for a, b, c in zip(skip_mask, quality_skip_mask, adaptive_quality_skip_mask)
+        ]
         # Recompute the blend zone against the *effective* skip mask so
         # any new boundaries the quality postfilter introduced (e.g. a
         # blurry generated mouth) also get a cross-fade. The blend_mask
@@ -3191,6 +3506,7 @@ class LipsyncPipeline(DiffusionPipeline):
         effective_generated = len(effective_skip_mask) - effective_skip
         logger.info(
             f"[Diag] skip summary: pre(loop_video)={pre_skip} quality_postfilter={quality_skip} "
+            f"adaptive_quality_fallback={adaptive_quality_fallback_count} "
             f"effective_total={effective_skip} generated={effective_generated} / {len(skip_mask)} "
             f"inference_short_circuit_batches={skipped_inference_batches} "
             f"inference_short_circuit_frames={skipped_inference_frames}"
@@ -3281,17 +3597,19 @@ class LipsyncPipeline(DiffusionPipeline):
         )
         synced_video_frames = self.restore_video(
             all_faces,
-            video_frames,
+            source_video_frames,
             boxes,
             affine_matrices,
             effective_skip_mask,
             blend_mask=effective_blend_mask,
             aligned_mouth_info=aligned_mouth_info,
             dynamic_masks=all_dynamic_mask_tensor,
+            source_indices=source_indices,
         )
         logger.info(f"[LipSync] restored video frames shape={synced_video_frames.shape}")
 
-        audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
+        output_frame_count = len(source_indices) if source_indices else synced_video_frames.shape[0]
+        audio_samples_remain_length = int(output_frame_count / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
 
         if is_train:
@@ -3306,6 +3624,11 @@ class LipsyncPipeline(DiffusionPipeline):
         # Stash stats for the API layer to read (synthesize() consumes this).
         self._last_run_stats = {
             "quality_fallback_frames": quality_fallback_count,
+            "adaptive_quality_fallback_frames": adaptive_quality_fallback_count,
+            "adaptive_quality_fallback_enabled": adaptive_quality_fallback_enabled,
+            "adaptive_quality_fallback_threshold": adaptive_quality_fallback_threshold,
+            "adaptive_quality_fallback_max_ratio": adaptive_quality_fallback_max_ratio,
+            "adaptive_quality_fallback_hysteresis_frames": adaptive_quality_fallback_hysteresis_frames,
             "pre_skip_frames": pre_skip,
             "quality_skip_frames": quality_skip,
             "effective_skip_frames": effective_skip,
@@ -3362,6 +3685,9 @@ class LipsyncPipeline(DiffusionPipeline):
                 "audio_motion_median_scale": float(statistics.median(audio_motion_scales)) if audio_motion_scales else 1.0,
                 "audio_motion_max_scale": float(max(audio_motion_scales)) if audio_motion_scales else 1.0,
             },
+            "audio_sync_offset_seconds": float(audio_sync_offset_seconds),
+            "audio_sync_offset_frames": int(round(audio_sync_offset_seconds * video_fps)),
+            "audio_sync_offset_output_frames": int(round(audio_sync_offset_seconds * audio_sample_rate)),
             "quality_gate_enabled": quality_gate_enabled,
             "quality_ref_min_laplacian": quality_ref_min_laplacian,
             "quality_max_fallback_ratio": quality_max_fallback_ratio,
