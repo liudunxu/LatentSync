@@ -90,6 +90,26 @@ class TestTemporalContinuity(unittest.TestCase):
         # Wrong rank -> 0.0
         self.assertEqual(LipsyncPipeline._mouth_region_diff(a, c), 0.0)
 
+    def test_source_frame_scene_cut_score(self):
+        import numpy as np
+
+        try:
+            from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"pipeline optional dependency missing: {exc.name}")
+
+        black = np.zeros((96, 128, 3), dtype=np.uint8)
+        white = np.full((96, 128, 3), 255, dtype=np.uint8)
+        dim = np.full((96, 128, 3), 8, dtype=np.uint8)
+
+        self.assertEqual(LipsyncPipeline._source_frame_scene_cut_score(black, black), 0.0)
+
+        hard_cut = LipsyncPipeline._source_frame_scene_cut_score(black, white)
+        self.assertGreater(hard_cut, 0.95)
+
+        small_lighting_shift = LipsyncPipeline._source_frame_scene_cut_score(black, dim)
+        self.assertLess(small_lighting_shift, 0.45)
+
 
 if __name__ == "__main__":
     unittest.main()

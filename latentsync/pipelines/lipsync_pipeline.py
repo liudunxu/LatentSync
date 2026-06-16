@@ -575,6 +575,48 @@ class LipsyncPipeline(DiffusionPipeline):
         return max(0.0, min(1.0, 1.0 - intersection))
 
     @staticmethod
+    def _source_frame_scene_cut_score(
+        prev_frame: np.ndarray,
+        curr_frame: np.ndarray,
+        bins: int = 16,
+        resize_to: int = 64,
+    ) -> float:
+        """Cheap hard-cut score for adjacent source frames.
+
+        Direction: 0.0 = visually identical, 1.0 = very different. The
+        score combines low-resolution BGR histogram distance with grayscale
+        mean absolute difference. Histogram catches palette/lighting changes;
+        luma difference catches same-palette shot changes where histograms
+        alone can look deceptively similar.
+        """
+        if (
+            prev_frame is None
+            or curr_frame is None
+            or prev_frame.size == 0
+            or curr_frame.size == 0
+            or resize_to <= 0
+        ):
+            return 0.0
+        try:
+            a = cv2.resize(prev_frame, (resize_to, resize_to), interpolation=cv2.INTER_AREA)
+            b = cv2.resize(curr_frame, (resize_to, resize_to), interpolation=cv2.INTER_AREA)
+            if a.ndim != 3 or b.ndim != 3 or a.shape[2] != 3 or b.shape[2] != 3:
+                return 0.0
+
+            a_hist = cv2.calcHist([a], [0, 1, 2], None, [bins] * 3, [0, 256] * 3)
+            b_hist = cv2.calcHist([b], [0, 1, 2], None, [bins] * 3, [0, 256] * 3)
+            cv2.normalize(a_hist, a_hist, 1.0, 0.0, cv2.NORM_L1)
+            cv2.normalize(b_hist, b_hist, 1.0, 0.0, cv2.NORM_L1)
+            hist_distance = 1.0 - float(cv2.compareHist(a_hist, b_hist, cv2.HISTCMP_INTERSECT))
+
+            gray_a = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            gray_b = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            luma_diff = float(np.mean(np.abs(gray_a - gray_b)) / 255.0)
+            return float(np.clip(max(hist_distance, luma_diff), 0.0, 1.0))
+        except Exception:
+            return 0.0
+
+    @staticmethod
     def _tensor_face_to_bgr_uint8(face: torch.Tensor) -> Optional[np.ndarray]:
         """Convert an aligned face tensor (3, H, W) in [-1, 1] to a BGR
         uint8 ndarray (H, W, 3) for histogram-based helpers. Returns
@@ -1835,6 +1877,8 @@ class LipsyncPipeline(DiffusionPipeline):
         segment_consistency_hard_cut_distance_threshold: float = 0.65,
         segment_consistency_track_aware: bool = True,
         min_merged_lipsync_seconds: float = 1.5,
+        scene_cut_break_enabled: bool = True,
+        scene_cut_break_threshold: float = 0.45,
         identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 3,
@@ -1869,6 +1913,8 @@ class LipsyncPipeline(DiffusionPipeline):
             f"lipsync_continuity_max_center_shift={lipsync_continuity_max_center_shift}, "
             f"lipsync_continuity_max_scale_change={lipsync_continuity_max_scale_change}, "
             f"lipsync_mouth_diff_break_threshold={lipsync_mouth_diff_break_threshold}, "
+            f"scene_cut_break_enabled={scene_cut_break_enabled}, "
+            f"scene_cut_break_threshold={scene_cut_break_threshold}, "
             f"identity_similarity_threshold={identity_similarity_threshold}, "
             f"apply_identity_filter={apply_identity_filter}, "
             f"side_face_episode_pre_pad={side_face_episode_pre_pad}, "
@@ -1925,6 +1971,7 @@ class LipsyncPipeline(DiffusionPipeline):
         temporal_identity_break_count = 0
         temporal_geometry_break_count = 0
         temporal_diff_break_count = 0
+        scene_cut_break_count = 0
         identity_skip_count = 0
         detect_fail_count = 0
         identity_similarities: List[float] = []
@@ -1938,6 +1985,19 @@ class LipsyncPipeline(DiffusionPipeline):
         continuity_break_mask = []
         print(f"Affine transforming {len(video_frames)} faces...")
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
+            scene_cut_break = False
+            if scene_cut_break_enabled and scene_cut_break_threshold > 0 and idx > 0:
+                scene_cut_score = self._source_frame_scene_cut_score(video_frames[idx - 1], frame)
+                if scene_cut_score > scene_cut_break_threshold:
+                    scene_cut_break = True
+                    scene_cut_break_count += 1
+                    self.image_processor.restorer.reset_p_bias()
+                    prev_yaw = None
+                    prev_motion_state = None
+                    prev_temporal_motion_state = None
+                    prev_temporal_embedding = None
+                    prev_temporal_face = None
+                    prev_mouth_info = None
             affine_result = self.image_processor.affine_transform_with_embedding(frame)
             if len(affine_result) == 5:
                 face, box, affine_matrix, face_emb, lmk = affine_result
@@ -2041,7 +2101,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 ):
                     should_skip = True
                     face_jump_skip_count += 1
-            continuity_break = False
+            continuity_break = scene_cut_break
             if not should_skip:
                 if face_emb is not None and prev_temporal_embedding is not None:
                     continuity_similarity = float(np.dot(face_emb, prev_temporal_embedding))
@@ -2171,7 +2231,8 @@ class LipsyncPipeline(DiffusionPipeline):
             f"face_jump_skip={face_jump_skip_count}, "
             f"temporal_identity_break={temporal_identity_break_count}, "
             f"temporal_geometry_break={temporal_geometry_break_count}, "
-            f"temporal_diff_break={temporal_diff_break_count}"
+            f"temporal_diff_break={temporal_diff_break_count}, "
+            f"scene_cut_break={scene_cut_break_count}"
         )
         if identity_similarities:
             logger.info(
@@ -2188,6 +2249,7 @@ class LipsyncPipeline(DiffusionPipeline):
         self._last_face_jump_skip_count = face_jump_skip_count
         self._last_identity_skip_count = identity_skip_count
         self._last_temporal_diff_break_count = temporal_diff_break_count
+        self._last_scene_cut_break_count = scene_cut_break_count
         self._last_identity_similarity_stats = {
             "min": float(min(identity_similarities)) if identity_similarities else 0.0,
             "median": float(statistics.median(identity_similarities)) if identity_similarities else 0.0,
@@ -2488,6 +2550,8 @@ class LipsyncPipeline(DiffusionPipeline):
         segment_consistency_hard_cut_distance_threshold: float = 0.65,
         segment_consistency_track_aware: bool = True,
         min_merged_lipsync_seconds: float = 1.5,
+        scene_cut_break_enabled: bool = True,
+        scene_cut_break_threshold: float = 0.45,
         identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 3,
@@ -2522,6 +2586,8 @@ class LipsyncPipeline(DiffusionPipeline):
             f"lipsync_continuity_max_center_shift={lipsync_continuity_max_center_shift}, "
             f"lipsync_continuity_max_scale_change={lipsync_continuity_max_scale_change}, "
             f"lipsync_mouth_diff_break_threshold={lipsync_mouth_diff_break_threshold}, "
+            f"scene_cut_break_enabled={scene_cut_break_enabled}, "
+            f"scene_cut_break_threshold={scene_cut_break_threshold}, "
             f"identity_similarity_threshold={identity_similarity_threshold}, "
             f"apply_identity_filter={apply_identity_filter}, "
             f"side_face_episode_pre_pad={side_face_episode_pre_pad}, "
@@ -2561,6 +2627,8 @@ class LipsyncPipeline(DiffusionPipeline):
                 segment_consistency_hard_cut_distance_threshold=segment_consistency_hard_cut_distance_threshold,
                 segment_consistency_track_aware=segment_consistency_track_aware,
                 min_merged_lipsync_seconds=min_merged_lipsync_seconds,
+                scene_cut_break_enabled=scene_cut_break_enabled,
+                scene_cut_break_threshold=scene_cut_break_threshold,
                 identity_similarity_threshold=identity_similarity_threshold,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
@@ -2673,6 +2741,8 @@ class LipsyncPipeline(DiffusionPipeline):
                 segment_consistency_hard_cut_distance_threshold=segment_consistency_hard_cut_distance_threshold,
                 segment_consistency_track_aware=segment_consistency_track_aware,
                 min_merged_lipsync_seconds=min_merged_lipsync_seconds,
+                scene_cut_break_enabled=scene_cut_break_enabled,
+                scene_cut_break_threshold=scene_cut_break_threshold,
                 identity_similarity_threshold=identity_similarity_threshold,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
@@ -2839,6 +2909,12 @@ class LipsyncPipeline(DiffusionPipeline):
         segment_consistency_hard_cut_distance_threshold: float = 0.65,
         segment_consistency_track_aware: bool = True,
         min_merged_lipsync_seconds: float = 1.5,
+        # Scene-cut guard: when adjacent source frames look like a hard cut,
+        # reset affine/temporal carry state before generating the new frame.
+        # This does not skip the frame; it only prevents the previous speaker
+        # or shot from leaking through EMA / mouth stabilization.
+        scene_cut_break_enabled: bool = True,
+        scene_cut_break_threshold: float = 0.45,
         # Audio-energy prefilter: skip sustained silent runs before diffusion.
         silent_skip_enabled: bool = False,
         silent_rms_threshold: float = 0.003,
@@ -2993,6 +3069,8 @@ class LipsyncPipeline(DiffusionPipeline):
             segment_consistency_hard_cut_distance_threshold=segment_consistency_hard_cut_distance_threshold,
             segment_consistency_track_aware=segment_consistency_track_aware,
             min_merged_lipsync_seconds=min_merged_lipsync_seconds,
+            scene_cut_break_enabled=scene_cut_break_enabled,
+            scene_cut_break_threshold=scene_cut_break_threshold,
             identity_similarity_threshold=identity_similarity_threshold,
             apply_identity_filter=apply_identity_filter,
             side_face_episode_pre_pad=side_face_episode_pre_pad,
@@ -3686,6 +3764,9 @@ class LipsyncPipeline(DiffusionPipeline):
             "lipsync_continuity_max_scale_change": lipsync_continuity_max_scale_change,
             "lipsync_mouth_diff_break_threshold": lipsync_mouth_diff_break_threshold,
             "temporal_diff_break_count": getattr(self, "_last_temporal_diff_break_count", 0),
+            "scene_cut_break_count": getattr(self, "_last_scene_cut_break_count", 0),
+            "scene_cut_break_enabled": scene_cut_break_enabled,
+            "scene_cut_break_threshold": scene_cut_break_threshold,
             "identity_similarity_threshold": identity_similarity_threshold,
             "identity_similarity": getattr(
                 self,
