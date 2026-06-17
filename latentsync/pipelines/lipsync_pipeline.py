@@ -2889,7 +2889,6 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         skip_mask=None,
-        active_speaker_filter_enabled: bool = False,
         # Source video frame rate. Forwarded to
         # ``affine_transform_video`` for the time-based segment
         # consistency gates.
@@ -2977,17 +2976,14 @@ class LipsyncPipeline(DiffusionPipeline):
             f"side_face_blend_fade_frames={side_face_blend_fade_frames}"
         )
         auto_reference_embedding = False
-        if reference_embedding is None and face_embedder is not None:
+        if apply_identity_filter and reference_embedding is None and face_embedder is not None:
             reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
             auto_reference_embedding = reference_embedding is not None
             logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
-        effective_apply_identity_filter = bool(
-            apply_identity_filter
-            or (auto_reference_embedding and active_speaker_filter_enabled)
-        )
+        effective_apply_identity_filter = bool(apply_identity_filter and reference_embedding is not None)
         if auto_reference_embedding:
             stats = getattr(self, "_last_active_speaker_stats", {}) or {}
-            stats["filter_enabled"] = bool(active_speaker_filter_enabled)
+            stats["filter_enabled"] = bool(apply_identity_filter)
             stats["identity_filter_applied"] = bool(effective_apply_identity_filter)
             self._last_active_speaker_stats = stats
         if len(whisper_chunks) > len(video_frames):
@@ -3186,7 +3182,7 @@ class LipsyncPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         reference_embedding=None,
         face_embedder=None,
-        active_speaker_filter_enabled: bool = False,
+        apply_identity_filter: bool = False,
         identity_similarity_threshold: float = 0.5,
         # --- quality / temporal gating (added 2026-06) ---
         temporal_smoothing_enabled: bool = True,
@@ -3434,14 +3430,12 @@ class LipsyncPipeline(DiffusionPipeline):
         video_frames = read_video(video_path, use_decord=False)
         logger.info(f"[LipSync] video_frames shape={video_frames.shape}")
 
-        # Only apply identity filtering when the user explicitly provided an
-        # avatar (reference_embedding). When the user didn't supply one,
-        # loop_video will auto-detect a "main speaker" — that detection is
-        # not reliable enough to reject other frames (false positives on
-        # busy/occluded faces), so we keep all detected faces.
-        apply_identity_filter = reference_embedding is not None
+        # Identity filtering is controlled by the apply_identity_filter flag.
+        # When enabled and no avatar is provided, loop_video will auto-detect a
+        # "main speaker" and filter to that face. When disabled, all detected
+        # faces are candidates for lip-sync.
         self._last_active_speaker_stats = {
-            "enabled": reference_embedding is None and face_embedder is not None,
+            "enabled": apply_identity_filter and reference_embedding is None and face_embedder is not None,
             "selected": False,
             "reason": "reference_embedding_provided" if reference_embedding is not None else "not_run",
             "sampled_frames": 0,
@@ -3465,7 +3459,7 @@ class LipsyncPipeline(DiffusionPipeline):
             video_frames,
             reference_embedding=reference_embedding,
             face_embedder=face_embedder,
-            active_speaker_filter_enabled=active_speaker_filter_enabled,
+            apply_identity_filter=apply_identity_filter,
             video_fps=video_fps,
             yaw_skip_threshold=yaw_skip_threshold,
             yaw_rate_skip_threshold=yaw_rate_skip_threshold,
@@ -3486,7 +3480,6 @@ class LipsyncPipeline(DiffusionPipeline):
             scene_cut_break_threshold=scene_cut_break_threshold,
             lipsync_min_face_area_ratio=lipsync_min_face_area_ratio,
             identity_similarity_threshold=identity_similarity_threshold,
-            apply_identity_filter=apply_identity_filter,
             side_face_episode_pre_pad=side_face_episode_pre_pad,
             side_face_episode_post_pad=side_face_episode_post_pad,
             side_face_blend_fade_frames=side_face_blend_fade_frames,

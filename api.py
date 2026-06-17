@@ -223,7 +223,11 @@ class LipSyncRequest(BaseModel):
     require_face_embedding: bool = True
     active_speaker_filter_enabled: bool = Field(
         False,
-        description="When no avatar is provided, auto-select the active speaker and target that face instead of the largest face.",
+        description="Deprecated alias for apply_identity_filter. When no avatar is provided, auto-select the active speaker and target that face instead of the largest face.",
+    )
+    apply_identity_filter: bool = Field(
+        False,
+        description="Enable identity filtering. When True, uses avatar if provided; otherwise auto-detects the main speaker and filters to that face.",
     )
     allow_crop_embedding_fallback: bool = True
     crop_embedding_min_detection_score: float = Field(0.0, ge=0.0, le=1.0)
@@ -1606,9 +1610,19 @@ class LatentSyncApiRuntime:
             else:
                 torch.seed()
 
+            effective_apply_identity_filter = bool(
+                payload.apply_identity_filter or payload.active_speaker_filter_enabled
+            )
+            if payload.active_speaker_filter_enabled and not payload.apply_identity_filter:
+                logger.warning(
+                    "[LipSync] active_speaker_filter_enabled is deprecated; "
+                    "use apply_identity_filter instead."
+                )
+
             logger.info(f"[LipSync] Starting pipeline: video={video_path}, audio={audio_path}, "
                          f"guidance_scale={effective_guidance_scale}, steps={effective_inference_steps}, "
                          f"seed={effective_seed}, has_reference_embedding={reference_embedding is not None}, "
+                         f"apply_identity_filter={effective_apply_identity_filter}, "
                          f"target_language={target_language or 'none'}, "
                          f"codeformer_enabled={payload.codeformer_enabled}, "
                          f"codeformer_loaded={codeformer_restorer is not None and codeformer_restorer.is_loaded}, "
@@ -1629,7 +1643,7 @@ class LatentSyncApiRuntime:
                 temp_dir=str(job_output_dir / "temp"),
                 reference_embedding=reference_embedding,
                 face_embedder=runtime.face_embedder,
-                active_speaker_filter_enabled=payload.active_speaker_filter_enabled,
+                apply_identity_filter=effective_apply_identity_filter,
                 identity_similarity_threshold=payload.similarity_threshold,
                 quality_gate_enabled=payload.quality_gate_enabled,
                 quality_min_laplacian=payload.quality_min_laplacian,
@@ -1865,6 +1879,7 @@ class LatentSyncApiRuntime:
                 "identity_similarity_threshold": float(run_stats.get("identity_similarity_threshold", payload.similarity_threshold)),
                 "active_speaker": dict(active_speaker_stats),
                 "active_speaker_filter_enabled": bool(payload.active_speaker_filter_enabled),
+                "apply_identity_filter": bool(effective_apply_identity_filter),
                 "target_identity_similarity": 0.0,
                 "target_identity_count": 0,
                 "target_identity_coverage": 0.0,
