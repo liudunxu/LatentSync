@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import json
 import logging
 import math
@@ -44,12 +45,13 @@ from omegaconf import OmegaConf
 RESULT_ROOT = PROJECT_DIR / "results" / "api"
 INPUT_ROOT = RESULT_ROOT / "inputs"
 OUTPUT_ROOT = RESULT_ROOT / "outputs"
+AUDIO_EMBEDS_CACHE_ROOT = RESULT_ROOT / "audio_embeds_cache"
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".flv", ".webm"}
 AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-for directory in (INPUT_ROOT, OUTPUT_ROOT):
+for directory in (INPUT_ROOT, OUTPUT_ROOT, AUDIO_EMBEDS_CACHE_ROOT):
     directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -1063,6 +1065,9 @@ class LatentSyncApiRuntime:
         self.dtype = None
         self.face_embedder = None
         self.face_embedding_error = ""
+        # Cache avatar embeddings by URL to avoid re-extracting the same
+        # reference face on repeated requests.
+        self.avatar_embedding_cache: Dict[str, np.ndarray] = {}
         # CodeFormer restorer is built lazily on first use to avoid
         # ~1 GB of GPU memory when the feature is never requested.
         self.codeformer_restorer = None
@@ -1140,6 +1145,7 @@ class LatentSyncApiRuntime:
                 device="cuda",
                 num_frames=self.config.data.num_frames,
                 audio_feat_length=self.config.data.audio_feat_length,
+                audio_embeds_cache_dir=str(AUDIO_EMBEDS_CACHE_ROOT),
             )
 
             vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=self.dtype)
@@ -2007,7 +2013,7 @@ def list_distinct_faces(payload: FaceListRequest, request: Request) -> Dict[str,
 
 
 @app.post("/api/lipsync")
-def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, object]:
+async def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, object]:
     if payload.parsing_mode not in {"jaw", "raw"}:
         raise HTTPException(status_code=400, detail="parsing_mode must be 'jaw' or 'raw'")
 
@@ -2018,15 +2024,44 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
     job_input_dir.mkdir(parents=True, exist_ok=True)
     job_output_dir.mkdir(parents=True, exist_ok=True)
 
-    video_path = _download_to_file(payload.video_url, job_input_dir, "video", VIDEO_SUFFIXES, ".mp4")
-    audio_path = _download_to_file(payload.audio_url, job_input_dir, "audio", AUDIO_SUFFIXES, ".wav")
+    # Download video and audio (and avatar if provided) in parallel to reduce
+    # request startup latency.
+    async def _download_avatar():
+        if not payload.avatar_url:
+            return None
+        return await asyncio.to_thread(
+            _download_to_file,
+            payload.avatar_url,
+            job_input_dir,
+            "avatar",
+            IMAGE_SUFFIXES,
+            ".jpg",
+        )
+
+    video_path, audio_path, avatar_downloaded = await asyncio.gather(
+        asyncio.to_thread(
+            _download_to_file, payload.video_url, job_input_dir, "video", VIDEO_SUFFIXES, ".mp4"
+        ),
+        asyncio.to_thread(
+            _download_to_file, payload.audio_url, job_input_dir, "audio", AUDIO_SUFFIXES, ".wav"
+        ),
+        _download_avatar(),
+    )
     try:
         input_paths = {"video": video_path, "audio": audio_path}
         reference_embedding = None
-        if payload.avatar_url:
-            avatar_downloaded = _download_to_file(payload.avatar_url, job_input_dir, "avatar", IMAGE_SUFFIXES, ".jpg")
+        if avatar_downloaded is not None:
             runtime.load_detectors()
-            if runtime.face_embedder is not None:
+            avatar_url = payload.avatar_url or ""
+            cached = runtime.avatar_embedding_cache.get(avatar_url)
+            if cached is not None:
+                reference_embedding = cached
+                logger.info(
+                    "[LipSync] Using cached reference face embedding for avatar_url=%s, shape=%s",
+                    avatar_url,
+                    reference_embedding.shape,
+                )
+            elif runtime.face_embedder is not None:
                 import cv2
                 avatar_frame = cv2.imread(str(avatar_downloaded))
                 if avatar_frame is not None:
@@ -2045,10 +2080,11 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
                         if emb is not None:
                             import numpy as np
                             reference_embedding = np.asarray(emb, dtype=np.float32)
+                            runtime.avatar_embedding_cache[avatar_url] = reference_embedding
                             selected_bbox = getattr(selected_face, "bbox", None)
                             selected_score = float(getattr(selected_face, "det_score", 0.0))
                             logger.info(
-                                "[LipSync] Loaded reference face embedding, faces=%d, selected_score=%.3f, selected_bbox=%s, shape=%s",
+                                "[LipSync] Loaded and cached reference face embedding, faces=%d, selected_score=%.3f, selected_bbox=%s, shape=%s",
                                 len(faces),
                                 selected_score,
                                 selected_bbox,

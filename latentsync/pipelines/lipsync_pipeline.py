@@ -4633,7 +4633,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 pad = torch.zeros(offset_samples, dtype=audio_samples.dtype, device=audio_samples.device)
                 audio_samples = torch.cat([audio_samples[offset_samples:], pad], dim=0)
 
-        video_frames = read_video(video_path, use_decord=False)
+        video_frames = read_video(video_path, use_decord=True, target_fps=float(video_fps))
         input_duration_seconds = float(video_frames.shape[0]) / max(float(video_fps), 1e-6)
         logger.info(
             f"[LipSync] video_frames shape={video_frames.shape}, "

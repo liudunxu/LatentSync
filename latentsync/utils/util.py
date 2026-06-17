@@ -43,17 +43,37 @@ def read_json(filepath: str):
     return json_dict
 
 
-def read_video(video_path: str, change_fps=True, use_decord=True):
+def _probe_video_fps(video_path: str) -> float:
+    """Probe video fps using cv2; return 0.0 on failure."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return 0.0
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        return float(fps) if fps and fps > 0 else 0.0
+    finally:
+        cap.release()
+
+
+def read_video(video_path: str, change_fps=True, use_decord=True, target_fps: float = 25.0):
     if change_fps:
-        temp_dir = "temp"
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-        os.makedirs(temp_dir, exist_ok=True)
-        command = (
-            f"ffmpeg -loglevel error -y -nostdin -i {video_path} -r 25 -crf 18 {os.path.join(temp_dir, 'video.mp4')}"
-        )
-        subprocess.run(command, shell=True)
-        target_video_path = os.path.join(temp_dir, "video.mp4")
+        source_fps = _probe_video_fps(video_path)
+        # Only re-encode when the source fps differs meaningfully from the
+        # target. Many inputs are already 25 fps, and the ffmpeg pass is a
+        # noticeable startup overhead we can skip.
+        if source_fps > 0 and abs(source_fps - target_fps) < 0.1:
+            target_video_path = video_path
+        else:
+            temp_dir = "temp"
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            os.makedirs(temp_dir, exist_ok=True)
+            command = (
+                f"ffmpeg -loglevel error -y -nostdin -i {video_path} -r {target_fps} -crf 18 "
+                f"{os.path.join(temp_dir, 'video.mp4')}"
+            )
+            subprocess.run(command, shell=True)
+            target_video_path = os.path.join(temp_dir, "video.mp4")
     else:
         target_video_path = video_path
 
