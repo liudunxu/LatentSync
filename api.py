@@ -226,7 +226,7 @@ class LipSyncRequest(BaseModel):
         description="Enable identity filtering. When True, uses avatar if provided; otherwise auto-detects the main speaker and filters to that face.",
     )
     scene_split_enabled: bool = Field(
-        False,
+        True,
         description="Split the video by detected scenes and run lip-sync on each scene independently, then concatenate the results.",
     )
     scene_split_threshold: float = Field(

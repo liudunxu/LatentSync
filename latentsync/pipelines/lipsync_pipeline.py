@@ -4544,7 +4544,7 @@ class LipsyncPipeline(DiffusionPipeline):
         shot_passthrough_min_bad_frames: int = 3,
         # Scene-level split: detect scene boundaries and process each scene
         # as an independent clip with clean temporal state, then concatenate.
-        scene_split_enabled: bool = False,
+        scene_split_enabled: bool = True,
         scene_split_threshold: float = 0.45,
         # Audio-energy prefilter: skip sustained silent runs before diffusion.
         silent_skip_enabled: bool = False,
