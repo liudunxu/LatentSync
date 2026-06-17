@@ -142,7 +142,7 @@ LANGUAGE_LIPSYNC_PRESETS = {
         "guidance_scale": 1.45,
         "mouth_temporal_stabilization_strength": 0.15,
         "mouth_audio_motion_min_scale": 0.85,
-        "mouth_audio_motion_max_scale": 1.45,
+        "mouth_audio_motion_max_scale": 1.60,
     },
     "indonesian": {
         "guidance_scale": 1.50,
