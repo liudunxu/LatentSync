@@ -225,6 +225,16 @@ class LipSyncRequest(BaseModel):
         False,
         description="Enable identity filtering. When True, uses avatar if provided; otherwise auto-detects the main speaker and filters to that face.",
     )
+    scene_split_enabled: bool = Field(
+        False,
+        description="Split the video by detected scenes and run lip-sync on each scene independently, then concatenate the results.",
+    )
+    scene_split_threshold: float = Field(
+        0.45,
+        ge=0.0,
+        le=1.0,
+        description="Threshold for detecting scene boundaries when scene_split_enabled=True.",
+    )
     allow_crop_embedding_fallback: bool = True
     crop_embedding_min_detection_score: float = Field(0.0, ge=0.0, le=1.0)
     temporal_tracking_weight: float = Field(0.08, ge=0.0, le=0.5)
@@ -1612,6 +1622,8 @@ class LatentSyncApiRuntime:
                          f"guidance_scale={effective_guidance_scale}, steps={effective_inference_steps}, "
                          f"seed={effective_seed}, has_reference_embedding={reference_embedding is not None}, "
                          f"apply_identity_filter={effective_apply_identity_filter}, "
+                         f"scene_split_enabled={payload.scene_split_enabled}, "
+                         f"scene_split_threshold={payload.scene_split_threshold}, "
                          f"target_language={target_language or 'none'}, "
                          f"codeformer_enabled={payload.codeformer_enabled}, "
                          f"codeformer_loaded={codeformer_restorer is not None and codeformer_restorer.is_loaded}, "
@@ -1668,6 +1680,8 @@ class LatentSyncApiRuntime:
                 shot_passthrough_skip_ratio_threshold=payload.shot_passthrough_skip_ratio_threshold,
                 shot_passthrough_min_frames=payload.shot_passthrough_min_frames,
                 shot_passthrough_min_bad_frames=payload.shot_passthrough_min_bad_frames,
+                scene_split_enabled=payload.scene_split_enabled,
+                scene_split_threshold=payload.scene_split_threshold,
                 silent_skip_enabled=payload.speech_gate_enabled,
                 silent_rms_threshold=payload.speech_gate_min_rms,
                 silent_min_run_frames=max(
@@ -1825,6 +1839,10 @@ class LatentSyncApiRuntime:
                 "scene_cut_break_enabled": bool(run_stats.get("scene_cut_break_enabled", payload.scene_cut_break_enabled)),
                 "scene_cut_break_threshold": float(run_stats.get("scene_cut_break_threshold", payload.scene_cut_break_threshold)),
                 "scene_cut_break_count": scene_cut_break_count,
+                "scene_split_enabled": bool(run_stats.get("scene_split_enabled", payload.scene_split_enabled)),
+                "scene_split_threshold": float(run_stats.get("scene_split_threshold", payload.scene_split_threshold)),
+                "scene_count": int(run_stats.get("scene_count", 1)),
+                "scene_split_frames": list(run_stats.get("scene_split_frames", [])),
                 "shot_passthrough_enabled": bool(run_stats.get("shot_passthrough_enabled", payload.shot_passthrough_enabled)),
                 "shot_passthrough_skip_ratio_threshold": float(
                     run_stats.get("shot_passthrough_skip_ratio_threshold", payload.shot_passthrough_skip_ratio_threshold)

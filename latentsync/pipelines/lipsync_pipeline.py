@@ -633,6 +633,22 @@ class LipsyncPipeline(DiffusionPipeline):
         return cuts
 
     @staticmethod
+    def _split_scenes_from_cuts(
+        source_scene_cut_after: List[bool],
+    ) -> List[Tuple[int, int]]:
+        """Convert per-frame cut flags into a list of (start, end) scene ranges."""
+        if not source_scene_cut_after:
+            return [(0, len(source_scene_cut_after) + 1)]
+        scenes = []
+        start = 0
+        for idx, is_cut in enumerate(source_scene_cut_after):
+            if is_cut:
+                scenes.append((start, idx + 1))
+                start = idx + 1
+        scenes.append((start, len(source_scene_cut_after) + 1))
+        return scenes
+
+    @staticmethod
     def _is_scene_boundary_between_source_indices(
         prev_source_idx: int,
         curr_source_idx: int,
@@ -3156,6 +3172,197 @@ class LipsyncPipeline(DiffusionPipeline):
         # to the source frame for restore / blend operations.
         return video_frames, faces, boxes, affine_matrices, skip_mask, continuity_break_mask, aligned_mouth_info, blend_mask, track_ids, source_indices, yaws, identity_sims
 
+    def _reset_temporal_state(self) -> None:
+        """Reset cross-frame temporal state so the next clip starts fresh."""
+        if (
+            self.image_processor is not None
+            and getattr(self.image_processor, "restorer", None) is not None
+        ):
+            self.image_processor.restorer.reset_p_bias()
+        # Clear any cached per-clip stats so they don't leak into the next scene.
+        for attr in list(vars(self).keys()):
+            if attr.startswith("_last_") and attr != "_last_run_stats":
+                setattr(self, attr, {})
+
+    @staticmethod
+    def _aggregate_scene_stats(scene_stats_list: List[Dict[str, object]]) -> Dict[str, object]:
+        """Merge per-scene run stats into a single summary for the full video."""
+        if not scene_stats_list:
+            return {}
+        if len(scene_stats_list) == 1:
+            return dict(scene_stats_list[0])
+
+        aggregated: Dict[str, object] = {"scene_count": len(scene_stats_list)}
+
+        # Simple sums for scalar counters.
+        sum_keys = {
+            "effective_skip_frames",
+            "effective_generated_frames",
+            "pre_skip_frames",
+            "quality_fallback_frames",
+            "adaptive_quality_fallback_frames",
+            "silent_skip_frames",
+            "skipped_inference_batches",
+            "skipped_inference_frames",
+            "yaw_skip_count",
+            "yaw_rate_skip_count",
+            "mouth_occlusion_skip_count",
+            "motion_blur_skip_count",
+            "face_jump_skip_count",
+            "small_face_skip_count",
+            "side_face_episode_extra_skip_count",
+            "side_face_warn_run_skip_count",
+            "identity_skip_count",
+            "scene_cut_break_count",
+            "shot_passthrough_frames",
+        }
+        for key in sum_keys:
+            aggregated[key] = sum(int(s.get(key, 0)) for s in scene_stats_list)
+
+        # Generation summary: sum counters and recompute ratios.
+        generation_summary = {
+            "total_frames": 0,
+            "latentsync_generated_frames": 0,
+            "passthrough_frames": 0,
+            "prefilter_passthrough_frames": 0,
+            "small_face_passthrough_frames": 0,
+            "shot_passthrough_frames": 0,
+            "shot_passthrough_shots": 0,
+            "quality_passthrough_frames": 0,
+            "adaptive_quality_passthrough_frames": 0,
+            "silent_passthrough_frames": 0,
+            "skipped_inference_batches": 0,
+            "skipped_inference_frames": 0,
+            "route": "latentsync_or_passthrough",
+        }
+        for s in scene_stats_list:
+            gs = s.get("generation_summary") or {}
+            for key in generation_summary:
+                if key == "route":
+                    continue
+                generation_summary[key] += int(gs.get(key, 0))
+        total = max(1, generation_summary["total_frames"])
+        generation_summary["passthrough_ratio"] = float(generation_summary["passthrough_frames"]) / total
+        aggregated["generation_summary"] = generation_summary
+
+        # Shot summary: sum counts and concatenate shots, shifting frame indices.
+        shot_summary = {"shots_total": 0, "latentsync_shots": 0, "passthrough_shots": 0, "mixed_shots": 0, "shots": []}
+        frame_offset = 0
+        for s in scene_stats_list:
+            ss = s.get("shot_summary") or {}
+            shot_summary["shots_total"] += int(ss.get("shots_total", 0))
+            shot_summary["latentsync_shots"] += int(ss.get("latentsync_shots", 0))
+            shot_summary["passthrough_shots"] += int(ss.get("passthrough_shots", 0))
+            shot_summary["mixed_shots"] += int(ss.get("mixed_shots", 0))
+            for shot in list(ss.get("shots", [])):
+                shifted = dict(shot)
+                for k in ("start_frame", "end_frame"):
+                    shifted[k] = int(shifted.get(k, 0)) + frame_offset
+                for k in ("start_seconds", "end_seconds"):
+                    shifted[k] = float(shifted.get(k, 0.0)) + (frame_offset / max(1, float(s.get("source_fps", 25.0))))
+                shot_summary["shots"].append(shifted)
+            frame_offset += int(s.get("source_frame_count", 0))
+        aggregated["shot_summary"] = shot_summary
+
+        # Routing manifest: concatenate shots and shift indices.
+        routing_manifest = []
+        frame_offset = 0
+        shot_index_offset = 0
+        for s in scene_stats_list:
+            rm = s.get("routing_manifest") or []
+            for shot in list(rm):
+                shifted = dict(shot)
+                shifted["shot_index"] = int(shifted.get("shot_index", 0)) + shot_index_offset
+                for k in ("start_frame", "end_frame"):
+                    shifted[k] = int(shifted.get(k, 0)) + frame_offset
+                for k in ("start_seconds", "end_seconds"):
+                    shifted[k] = float(shifted.get(k, 0.0)) + (frame_offset / max(1, float(s.get("source_fps", 25.0))))
+                routing_manifest.append(shifted)
+            frame_offset += int(s.get("source_frame_count", 0))
+            shot_index_offset += len(rm)
+        aggregated["routing_manifest"] = routing_manifest
+
+        # Preserve the first scene's config values.
+        first = scene_stats_list[0]
+        for key in ("scene_cut_break_enabled", "scene_cut_break_threshold", "shot_passthrough_enabled",
+                    "shot_passthrough_skip_ratio_threshold", "shot_passthrough_min_frames",
+                    "shot_passthrough_min_bad_frames", "adaptive_quality_fallback_enabled",
+                    "adaptive_quality_fallback_threshold", "adaptive_quality_fallback_max_ratio",
+                    "adaptive_quality_fallback_hysteresis_frames", "identity_similarity_threshold",
+                    "apply_identity_filter", "audio_sync_offset_seconds"):
+            if key in first:
+                aggregated[key] = first[key]
+
+        # Recompute passthrough ratio over the full video.
+        total = max(1, aggregated.get("effective_skip_frames", 0) + aggregated.get("effective_generated_frames", 0))
+        aggregated["passthrough_ratio"] = float(aggregated.get("effective_skip_frames", 0)) / total
+
+        # Identity similarity stats: use the first scene that has real values.
+        for s in scene_stats_list:
+            stats = s.get("identity_similarity")
+            if stats and any(v != 0.0 for v in (stats.get("min", 0.0), stats.get("median", 0.0), stats.get("max", 0.0))):
+                aggregated["identity_similarity"] = dict(stats)
+                break
+        else:
+            aggregated["identity_similarity"] = {"min": 0.0, "median": 0.0, "max": 0.0}
+
+        # Active speaker stats: preserve the first scene that ran detection.
+        for s in scene_stats_list:
+            stats = s.get("active_speaker")
+            if stats and bool(stats.get("selected", False)):
+                aggregated["active_speaker"] = dict(stats)
+                break
+        else:
+            aggregated["active_speaker"] = scene_stats_list[0].get("active_speaker", {})
+
+        # Mouth temporal stats: aggregate across scenes.
+        mouth_temporal = {
+            "delta_min": float("inf"),
+            "delta_median": [],
+            "delta_max": 0.0,
+            "delta_skip_frames": 0,
+            "stabilized_frames": 0,
+            "audio_motion_min_scale": float("inf"),
+            "audio_motion_median_scale": [],
+            "audio_motion_max_scale": 0.0,
+        }
+        for s in scene_stats_list:
+            mt = s.get("mouth_temporal") or {}
+            mouth_temporal["delta_min"] = min(mouth_temporal["delta_min"], float(mt.get("delta_min", 0.0)))
+            mouth_temporal["delta_median"].append(float(mt.get("delta_median", 0.0)))
+            mouth_temporal["delta_max"] = max(mouth_temporal["delta_max"], float(mt.get("delta_max", 0.0)))
+            mouth_temporal["delta_skip_frames"] += int(mt.get("delta_skip_frames", 0))
+            mouth_temporal["stabilized_frames"] += int(mt.get("stabilized_frames", 0))
+            mouth_temporal["audio_motion_min_scale"] = min(mouth_temporal["audio_motion_min_scale"], float(mt.get("audio_motion_min_scale", 1.0)))
+            mouth_temporal["audio_motion_median_scale"].append(float(mt.get("audio_motion_median_scale", 1.0)))
+            mouth_temporal["audio_motion_max_scale"] = max(mouth_temporal["audio_motion_max_scale"], float(mt.get("audio_motion_max_scale", 1.0)))
+        if mouth_temporal["delta_median"]:
+            mouth_temporal["delta_median"] = float(statistics.median(mouth_temporal["delta_median"]))
+            mouth_temporal["audio_motion_median_scale"] = float(statistics.median(mouth_temporal["audio_motion_median_scale"]))
+        else:
+            mouth_temporal["delta_median"] = 0.0
+            mouth_temporal["audio_motion_median_scale"] = 1.0
+        mouth_temporal["delta_min"] = 0.0 if mouth_temporal["delta_min"] == float("inf") else float(mouth_temporal["delta_min"])
+        mouth_temporal["audio_motion_min_scale"] = 1.0 if mouth_temporal["audio_motion_min_scale"] == float("inf") else float(mouth_temporal["audio_motion_min_scale"])
+        aggregated["mouth_temporal"] = mouth_temporal
+
+        # CodeFormer stats: aggregate across scenes.
+        codeformer = {
+            "frames_total": 0,
+            "frames_enhanced": 0,
+            "frames_fallback": 0,
+            "frames_skipped_by_pipeline": 0,
+            "elapsed_seconds": 0.0,
+        }
+        for s in scene_stats_list:
+            cf = s.get("codeformer") or {}
+            for key in codeformer:
+                if key in cf:
+                    codeformer[key] += float(cf[key])
+        aggregated["codeformer"] = codeformer
+
+        return aggregated
+
     @torch.no_grad()
     def __call__(
         self,
@@ -3316,6 +3523,10 @@ class LipsyncPipeline(DiffusionPipeline):
         shot_passthrough_skip_ratio_threshold: float = 0.45,
         shot_passthrough_min_frames: int = 8,
         shot_passthrough_min_bad_frames: int = 3,
+        # Scene-level split: detect scene boundaries and process each scene
+        # as an independent clip with clean temporal state, then concatenate.
+        scene_split_enabled: bool = False,
+        scene_split_threshold: float = 0.45,
         # Audio-energy prefilter: skip sustained silent runs before diffusion.
         silent_skip_enabled: bool = False,
         silent_rms_threshold: float = 0.003,
@@ -3370,6 +3581,14 @@ class LipsyncPipeline(DiffusionPipeline):
         codeformer_post_ema_track_aware: bool = True,
         **kwargs,
     ):
+        # Capture kwargs for potential per-scene recursive calls. Must be done
+        # before any new locals are introduced.
+        _recursion_excluded = {
+            "self", "video_path", "audio_path", "video_out_path", "scene_split_enabled", "kwargs"
+        }
+        _pipeline_kwargs = {k: v for k, v in locals().items() if k not in _recursion_excluded}
+        _extra_kwargs = dict(kwargs)
+
         is_train = self.unet.training
         self.unet.eval()
 
@@ -3429,6 +3648,77 @@ class LipsyncPipeline(DiffusionPipeline):
 
         video_frames = read_video(video_path, use_decord=False)
         logger.info(f"[LipSync] video_frames shape={video_frames.shape}")
+
+        # Scene-level split: process each detected scene as an independent clip
+        # so temporal state (mouth EMA, yaw smoothing, affine bias, etc.) never
+        # leaks across scenes.
+        if scene_split_enabled and scene_split_threshold > 0.0 and len(video_frames) > 1:
+            source_scene_cut_after = self._compute_source_scene_cut_after(
+                video_frames, scene_split_threshold
+            )
+            scenes = self._split_scenes_from_cuts(source_scene_cut_after)
+            if len(scenes) > 1:
+                logger.info(
+                    f"[LipSync] scene_split enabled: detected {len(scenes)} scenes, "
+                    f"threshold={scene_split_threshold}"
+                )
+                scene_temp_dir = os.path.join(temp_dir, "scene_split")
+                os.makedirs(scene_temp_dir, exist_ok=True)
+
+                scene_stats_list = []
+                scene_output_paths = []
+                for scene_idx, (start_frame, end_frame) in enumerate(scenes):
+                    scene_video_path = os.path.join(scene_temp_dir, f"scene_{scene_idx:04d}_video.mp4")
+                    scene_audio_path = os.path.join(scene_temp_dir, f"scene_{scene_idx:04d}_audio.wav")
+                    scene_output_path = os.path.join(scene_temp_dir, f"scene_{scene_idx:04d}_output.mp4")
+                    scene_work_dir = os.path.join(scene_temp_dir, f"scene_{scene_idx:04d}_work")
+                    os.makedirs(scene_work_dir, exist_ok=True)
+
+                    scene_frames = video_frames[start_frame:end_frame]
+                    start_sample = int(round(start_frame * audio_sample_rate / video_fps))
+                    end_sample = int(round(end_frame * audio_sample_rate / video_fps))
+                    scene_audio = audio_samples[start_sample:end_sample]
+
+                    write_video(scene_video_path, scene_frames, fps=video_fps)
+                    sf.write(scene_audio_path, scene_audio.cpu().numpy(), audio_sample_rate)
+
+                    logger.info(
+                        f"[LipSync] processing scene {scene_idx + 1}/{len(scenes)}: "
+                        f"frames={start_frame}-{end_frame}, samples={start_sample}-{end_sample}"
+                    )
+                    self._reset_temporal_state()
+                    self.__call__(
+                        video_path=scene_video_path,
+                        audio_path=scene_audio_path,
+                        video_out_path=scene_output_path,
+                        scene_split_enabled=False,
+                        audio_sync_offset_seconds=0.0,
+                        temp_dir=scene_work_dir,
+                        **_pipeline_kwargs,
+                        **_extra_kwargs,
+                    )
+                    scene_output_paths.append(scene_output_path)
+                    scene_stats_list.append(getattr(self, "_last_run_stats", {}) or {})
+
+                # Concatenate per-scene outputs with ffmpeg concat demuxer.
+                concat_list_path = os.path.join(scene_temp_dir, "concat_list.txt")
+                with open(concat_list_path, "w") as f:
+                    for p in scene_output_paths:
+                        f.write(f"file '{os.path.abspath(p)}'\n")
+                concat_command = (
+                    f"ffmpeg -y -loglevel error -nostdin -f concat -safe 0 -i {concat_list_path} "
+                    f"-c copy {video_out_path}"
+                )
+                subprocess.run(concat_command, shell=True, check=True)
+
+                aggregated_stats = self._aggregate_scene_stats(scene_stats_list)
+                aggregated_stats["scene_split_enabled"] = True
+                aggregated_stats["scene_split_threshold"] = scene_split_threshold
+                aggregated_stats["scene_count"] = len(scenes)
+                aggregated_stats["scene_split_frames"] = [int(end) for _, end in scenes]
+                self._last_run_stats = aggregated_stats
+                logger.info(f"[LipSync] scene_split completed: output={video_out_path}")
+                return
 
         # Identity filtering is controlled by the apply_identity_filter flag.
         # When enabled and no avatar is provided, loop_video will auto-detect a
@@ -4201,6 +4491,8 @@ class LipsyncPipeline(DiffusionPipeline):
 
         # Stash stats for the API layer to read (synthesize() consumes this).
         self._last_run_stats = {
+            "source_frame_count": int(len(effective_skip_mask)),
+            "source_fps": float(video_fps),
             "generation_summary": {
                 "total_frames": int(len(effective_skip_mask)),
                 "latentsync_generated_frames": int(effective_generated),
@@ -4314,6 +4606,10 @@ class LipsyncPipeline(DiffusionPipeline):
             "segment_consistency_hard_cut_distance_threshold": segment_consistency_hard_cut_distance_threshold,
             "segment_consistency_track_aware": segment_consistency_track_aware,
             "min_merged_lipsync_seconds": min_merged_lipsync_seconds,
+            "scene_split_enabled": False,
+            "scene_split_threshold": scene_split_threshold,
+            "scene_count": 1,
+            "scene_split_frames": [],
         }
 
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
