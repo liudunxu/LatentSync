@@ -241,7 +241,7 @@ class LipSyncRequest(BaseModel):
         description="Split the video by detected scenes and run lip-sync on each scene independently, then concatenate the results.",
     )
     scene_split_threshold: float = Field(
-        0.45,
+        0.55,
         ge=0.0,
         le=1.0,
         description="Threshold for detecting scene boundaries when scene_split_enabled=True.",
