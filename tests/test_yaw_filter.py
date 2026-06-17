@@ -25,6 +25,8 @@ import sys
 import unittest
 from typing import List, Optional
 
+import numpy as np
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
@@ -597,6 +599,86 @@ class TestComputeBlendZone(_FilterHelperBase):
         )
         self.assertAlmostEqual(out2[0], 0.5 * 9/10, places=6)
         self.assertLess(out2[0], 0.5)
+
+
+class TestShotPassthroughGuard(_FilterHelperBase):
+    """Shot-level guard upgrades high-risk shots to source passthrough."""
+
+    def _two_shot_frames(self):
+        first = np.zeros((6, 16, 16, 3), dtype=np.uint8)
+        second = np.full((6, 16, 16, 3), 255, dtype=np.uint8)
+        return np.concatenate([first, second], axis=0)
+
+    def test_high_bad_ratio_forces_only_that_shot(self):
+        LipsyncPipeline = self._import()
+        frames = self._two_shot_frames()
+        skip_mask = [
+            True, True, True, False, False, False,
+            False, False, True, False, False, False,
+        ]
+        continuity = [False] * len(skip_mask)
+
+        stats = LipsyncPipeline._apply_shot_passthrough_guard(
+            skip_mask,
+            continuity,
+            frames,
+            list(range(len(skip_mask))),
+            scene_cut_threshold=0.45,
+            skip_ratio_threshold=0.45,
+            min_shot_frames=4,
+            min_bad_frames=2,
+        )
+
+        self.assertEqual(stats, {"shots": 1, "frames": 3})
+        self.assertEqual(skip_mask[:6], [True] * 6)
+        self.assertEqual(skip_mask[6:], [False, False, True, False, False, False])
+        self.assertEqual(continuity[:6], [True] * 6)
+        self.assertEqual(continuity[6:], [False] * 6)
+
+    def test_low_bad_ratio_is_kept(self):
+        LipsyncPipeline = self._import()
+        frames = self._two_shot_frames()
+        skip_mask = [
+            True, False, False, False, False, False,
+            False, True, False, False, False, False,
+        ]
+        continuity = [False] * len(skip_mask)
+        original = skip_mask[:]
+
+        stats = LipsyncPipeline._apply_shot_passthrough_guard(
+            skip_mask,
+            continuity,
+            frames,
+            list(range(len(skip_mask))),
+            scene_cut_threshold=0.45,
+            skip_ratio_threshold=0.45,
+            min_shot_frames=4,
+            min_bad_frames=2,
+        )
+
+        self.assertEqual(stats, {"shots": 0, "frames": 0})
+        self.assertEqual(skip_mask, original)
+        self.assertEqual(continuity, [False] * len(skip_mask))
+
+    def test_short_shot_is_kept(self):
+        LipsyncPipeline = self._import()
+        frames = np.zeros((3, 16, 16, 3), dtype=np.uint8)
+        skip_mask = [True, True, False]
+        continuity = [False] * len(skip_mask)
+
+        stats = LipsyncPipeline._apply_shot_passthrough_guard(
+            skip_mask,
+            continuity,
+            frames,
+            list(range(len(skip_mask))),
+            scene_cut_threshold=0.45,
+            skip_ratio_threshold=0.45,
+            min_shot_frames=4,
+            min_bad_frames=2,
+        )
+
+        self.assertEqual(stats, {"shots": 0, "frames": 0})
+        self.assertEqual(skip_mask, [True, True, False])
 
 
 

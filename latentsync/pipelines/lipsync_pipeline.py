@@ -617,6 +617,86 @@ class LipsyncPipeline(DiffusionPipeline):
             return 0.0
 
     @staticmethod
+    def _apply_shot_passthrough_guard(
+        skip_mask: List[bool],
+        continuity_break_mask: List[bool],
+        source_frames: np.ndarray,
+        source_indices: List[int],
+        scene_cut_threshold: float,
+        skip_ratio_threshold: float,
+        min_shot_frames: int,
+        min_bad_frames: int,
+    ) -> Dict[str, int]:
+        """Force a whole shot to passthrough when too many frames are bad.
+
+        This is the production-oriented "screen the shot, not just the
+        frame" guard: side-face / blur / occlusion filters can otherwise
+        produce a patchwork shot where generated and original frames alternate.
+        If a shot already has enough bad frames, keeping the entire shot as
+        source video is usually less visible than intermittent inpaint.
+
+        Mutates ``skip_mask`` and ``continuity_break_mask`` in place.
+        Returns counters for logging / API stats.
+        """
+        stats = {"shots": 0, "frames": 0}
+        n = len(skip_mask)
+        if (
+            n == 0
+            or source_frames is None
+            or len(source_frames) == 0
+            or scene_cut_threshold <= 0.0
+            or skip_ratio_threshold <= 0.0
+            or min_shot_frames <= 0
+        ):
+            return stats
+
+        if not source_indices:
+            source_indices = list(range(n))
+        if len(source_indices) < n:
+            source_indices = source_indices + list(range(len(source_indices), n))
+
+        def source_frame_at(output_idx: int):
+            try:
+                src_idx = int(source_indices[output_idx])
+            except Exception:
+                src_idx = output_idx
+            if src_idx < 0 or src_idx >= len(source_frames):
+                return None
+            return source_frames[src_idx]
+
+        shot_starts = [0]
+        prev = source_frame_at(0)
+        for idx in range(1, n):
+            curr = source_frame_at(idx)
+            if prev is not None and curr is not None:
+                score = LipsyncPipeline._source_frame_scene_cut_score(prev, curr)
+                if score > scene_cut_threshold:
+                    shot_starts.append(idx)
+            prev = curr
+        shot_starts.append(n)
+
+        min_bad_frames = max(1, int(min_bad_frames))
+        for start, end in zip(shot_starts, shot_starts[1:]):
+            shot_len = end - start
+            if shot_len < min_shot_frames:
+                continue
+            bad = sum(1 for k in range(start, end) if skip_mask[k])
+            if bad < min_bad_frames:
+                continue
+            if bad / max(shot_len, 1) < skip_ratio_threshold:
+                continue
+            newly_skipped = 0
+            for k in range(start, end):
+                if not skip_mask[k]:
+                    skip_mask[k] = True
+                    newly_skipped += 1
+                continuity_break_mask[k] = True
+            if newly_skipped:
+                stats["shots"] += 1
+                stats["frames"] += newly_skipped
+        return stats
+
+    @staticmethod
     def _tensor_face_to_bgr_uint8(face: torch.Tensor) -> Optional[np.ndarray]:
         """Convert an aligned face tensor (3, H, W) in [-1, 1] to a BGR
         uint8 ndarray (H, W, 3) for histogram-based helpers. Returns
@@ -2915,6 +2995,14 @@ class LipsyncPipeline(DiffusionPipeline):
         # or shot from leaking through EMA / mouth stabilization.
         scene_cut_break_enabled: bool = True,
         scene_cut_break_threshold: float = 0.45,
+        # Shot-level passthrough guard: when enabled, any shot whose prefilter
+        # skip ratio is too high is kept entirely as source video. This avoids
+        # alternating generated/source frames inside side-face or fast-turn
+        # shots. Default off to preserve existing behavior.
+        shot_passthrough_enabled: bool = False,
+        shot_passthrough_skip_ratio_threshold: float = 0.45,
+        shot_passthrough_min_frames: int = 8,
+        shot_passthrough_min_bad_frames: int = 3,
         # Audio-energy prefilter: skip sustained silent runs before diffusion.
         silent_skip_enabled: bool = False,
         silent_rms_threshold: float = 0.003,
@@ -3081,6 +3169,27 @@ class LipsyncPipeline(DiffusionPipeline):
             side_face_warn_min_run_seconds=side_face_warn_min_run_seconds,
             aligned_mouth_ema_alpha=aligned_mouth_ema_alpha,
         )
+        shot_passthrough_stats = {"shots": 0, "frames": 0}
+        if shot_passthrough_enabled:
+            shot_passthrough_stats = self._apply_shot_passthrough_guard(
+                skip_mask,
+                continuity_break_mask,
+                source_video_frames,
+                source_indices,
+                scene_cut_threshold=scene_cut_break_threshold,
+                skip_ratio_threshold=shot_passthrough_skip_ratio_threshold,
+                min_shot_frames=shot_passthrough_min_frames,
+                min_bad_frames=shot_passthrough_min_bad_frames,
+            )
+            logger.info(
+                f"[ShotGuard] passthrough={shot_passthrough_stats['shots']} shots / "
+                f"{shot_passthrough_stats['frames']} frames "
+                f"(enabled={shot_passthrough_enabled}, "
+                f"skip_ratio_threshold={shot_passthrough_skip_ratio_threshold}, "
+                f"min_frames={shot_passthrough_min_frames}, "
+                f"min_bad_frames={shot_passthrough_min_bad_frames}, "
+                f"scene_cut_threshold={scene_cut_break_threshold})"
+            )
         silent_skip_mask = [False] * len(skip_mask)
         if silent_skip_enabled:
             silent_skip_mask = self._silent_frame_mask(
@@ -3767,6 +3876,12 @@ class LipsyncPipeline(DiffusionPipeline):
             "scene_cut_break_count": getattr(self, "_last_scene_cut_break_count", 0),
             "scene_cut_break_enabled": scene_cut_break_enabled,
             "scene_cut_break_threshold": scene_cut_break_threshold,
+            "shot_passthrough_enabled": shot_passthrough_enabled,
+            "shot_passthrough_skip_ratio_threshold": shot_passthrough_skip_ratio_threshold,
+            "shot_passthrough_min_frames": shot_passthrough_min_frames,
+            "shot_passthrough_min_bad_frames": shot_passthrough_min_bad_frames,
+            "shot_passthrough_shots": int(shot_passthrough_stats.get("shots", 0)),
+            "shot_passthrough_frames": int(shot_passthrough_stats.get("frames", 0)),
             "identity_similarity_threshold": identity_similarity_threshold,
             "identity_similarity": getattr(
                 self,

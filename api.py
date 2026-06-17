@@ -249,6 +249,29 @@ class LipSyncRequest(BaseModel):
         le=1.0,
         description="Adjacent source-frame scene-cut score above this value resets temporal carry state; 0 disables.",
     )
+    # Shot-level passthrough guard for short-drama production. Frame-level
+    # filters can produce visible generated/source flicker inside a side-face
+    # or fast-turn shot. When enabled, any shot whose prefilter skip ratio
+    # crosses the threshold is kept entirely as source video.
+    shot_passthrough_enabled: bool = False
+    shot_passthrough_skip_ratio_threshold: float = Field(
+        0.45,
+        ge=0.0,
+        le=1.0,
+        description="When shot passthrough is enabled, force a shot to source if this fraction of its frames are already prefilter-skipped.",
+    )
+    shot_passthrough_min_frames: int = Field(
+        8,
+        ge=1,
+        le=300,
+        description="Minimum shot length eligible for shot-level passthrough.",
+    )
+    shot_passthrough_min_bad_frames: int = Field(
+        3,
+        ge=1,
+        le=300,
+        description="Minimum already-skipped frames required before forcing a whole shot to passthrough.",
+    )
     lipsync_min_face_area_ratio: float = Field(0.015, ge=0.0, le=1.0)
     bbox_shift: int = 0
     extra_margin: int = Field(10, ge=0, le=100)
@@ -1527,6 +1550,10 @@ class LatentSyncApiRuntime:
                 min_merged_lipsync_seconds=payload.min_merged_lipsync_seconds,
                 scene_cut_break_enabled=payload.scene_cut_break_enabled,
                 scene_cut_break_threshold=payload.scene_cut_break_threshold,
+                shot_passthrough_enabled=payload.shot_passthrough_enabled,
+                shot_passthrough_skip_ratio_threshold=payload.shot_passthrough_skip_ratio_threshold,
+                shot_passthrough_min_frames=payload.shot_passthrough_min_frames,
+                shot_passthrough_min_bad_frames=payload.shot_passthrough_min_bad_frames,
                 silent_skip_enabled=payload.speech_gate_enabled,
                 silent_rms_threshold=payload.speech_gate_min_rms,
                 silent_min_run_frames=max(
@@ -1626,6 +1653,8 @@ class LatentSyncApiRuntime:
             mouth_temporal_stats = run_stats.get("mouth_temporal") or {}
             segment_consistency_reasons = run_stats.get("segment_consistency") or {}
             scene_cut_break_count = int(run_stats.get("scene_cut_break_count", 0))
+            shot_passthrough_shots = int(run_stats.get("shot_passthrough_shots", 0))
+            shot_passthrough_frames = int(run_stats.get("shot_passthrough_frames", 0))
 
             return {
                 "output_path": output_path,
@@ -1654,6 +1683,16 @@ class LatentSyncApiRuntime:
                 "scene_cut_break_enabled": bool(run_stats.get("scene_cut_break_enabled", payload.scene_cut_break_enabled)),
                 "scene_cut_break_threshold": float(run_stats.get("scene_cut_break_threshold", payload.scene_cut_break_threshold)),
                 "scene_cut_break_count": scene_cut_break_count,
+                "shot_passthrough_enabled": bool(run_stats.get("shot_passthrough_enabled", payload.shot_passthrough_enabled)),
+                "shot_passthrough_skip_ratio_threshold": float(
+                    run_stats.get("shot_passthrough_skip_ratio_threshold", payload.shot_passthrough_skip_ratio_threshold)
+                ),
+                "shot_passthrough_min_frames": int(run_stats.get("shot_passthrough_min_frames", payload.shot_passthrough_min_frames)),
+                "shot_passthrough_min_bad_frames": int(
+                    run_stats.get("shot_passthrough_min_bad_frames", payload.shot_passthrough_min_bad_frames)
+                ),
+                "shot_passthrough_shots": shot_passthrough_shots,
+                "shot_passthrough_frames": shot_passthrough_frames,
                 "smoothed_source_frames": 0,
                 "matched_or_filled_source_frames": source_frame_count,
                 "eligible_source_frames": source_frame_count,
