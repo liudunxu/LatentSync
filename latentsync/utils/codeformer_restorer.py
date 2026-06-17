@@ -820,7 +820,10 @@ class CodeFormerRestorer:
             batch = faces.index_select(0, idx_t)
             # Move to model device (only the slice, not the whole T).
             batch_dev = batch.to(device=device, dtype=param_dtype)
-            restored, _logits, _lq = net(batch_dev, w=w, adain=adain_enabled)
+            with torch.amp.autocast(
+                device_type=device.type, enabled=device.type == "cuda"
+            ):
+                restored, _logits, _lq = net(batch_dev, w=w, adain=adain_enabled)
             restored = restored.to(device=faces.device, dtype=faces.dtype)
             restored = restored.clamp(-1.0, 1.0)
 

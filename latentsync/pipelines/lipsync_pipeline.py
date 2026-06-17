@@ -1960,9 +1960,9 @@ class LipsyncPipeline(DiffusionPipeline):
         sharp on its own but the high-frequency detail can flicker across
         consecutive frames because the model doesn't have access to
         previous outputs. This helper applies an EMA between consecutive
-        *non-skipped* output frames, so the restored crop blends toward
-        the previous restored crop (in [0, 255] uint8 space) and per-frame
-        flicker is dampened.
+        *non-skipped* output frames directly on the input tensor, so the
+        restored crop blends toward the previous restored crop and
+        per-frame flicker is dampened without a costly CPU round-trip.
 
         Two guards refuse the blend:
 
@@ -2011,18 +2011,11 @@ class LipsyncPipeline(DiffusionPipeline):
         if len(track_ids) < T:
             track_ids = list(track_ids) + [None] * (T - len(track_ids))
 
-        # Work in float32 on CPU in [0, 1] for cv2.addWeighted (which
-        # expects single-channel float or uint8). We convert back to the
-        # input dtype/range at the end.
-        out = all_faces.detach().clone()
-        out_cpu = out.detach().to(device="cpu", dtype=torch.float32)
-        # [-1, 1] -> [0, 1]
-        out_cpu = (out_cpu + 1.0) / 2.0
-        out_cpu = out_cpu.clamp(0.0, 1.0).numpy()  # (T, 3, 512, 512) RGB
+        out = all_faces.detach().clone().clamp(-1.0, 1.0)
 
         ema_chain_breaks = 0
         ema_resets_on_track_switch = 0
-        prev_restored: Optional[np.ndarray] = None
+        prev_restored: Optional[torch.Tensor] = None
         prev_idx: Optional[int] = None
         prev_track_id: Optional[int] = None
 
@@ -2041,45 +2034,31 @@ class LipsyncPipeline(DiffusionPipeline):
                 or cur_track_id is None
                 or prev_track_id == cur_track_id
             )
-            face_out = out_cpu[idx]  # (3, 512, 512) in [0, 1] RGB
 
             blended = (
                 0.0 < alpha < 1.0
                 and prev_restored is not None
                 and prev_idx is not None
                 and idx - prev_idx == 1
-                and prev_restored.shape == face_out.shape
+                and prev_restored.shape == out[idx].shape
                 and tracks_match
             )
             if blended:
-                # cv2.addWeighted expects HWC; transpose once.
-                cur_hwc = np.transpose(face_out, (1, 2, 0))
-                prev_hwc = np.transpose(prev_restored, (1, 2, 0))
-                blended_hwc = cv2.addWeighted(
-                    cur_hwc,
-                    1.0 - alpha,
-                    prev_hwc,
-                    alpha,
-                    0.0,
-                )
-                face_out = np.transpose(blended_hwc, (2, 0, 1))
+                # Linear blend in [-1, 1] is equivalent to blending in
+                # [0, 1] then rescaling, and avoids a CPU/numpy round-trip.
+                out[idx] = ((1.0 - alpha) * out[idx] + alpha * prev_restored).clamp(-1.0, 1.0)
             elif prev_restored is not None:
                 # Real chain break (first frame is bootstrap, not counted).
                 ema_chain_breaks += 1
                 if not tracks_match and cur_track_id is not None:
                     ema_resets_on_track_switch += 1
 
-            out_cpu[idx] = face_out
-            prev_restored = face_out
+            prev_restored = out[idx]
             prev_idx = idx
             prev_track_id = cur_track_id
 
-        # [0, 1] -> [-1, 1], back to the input dtype
-        out_cpu = out_cpu * 2.0 - 1.0
-        out_cpu = np.clip(out_cpu, -1.0, 1.0)
-        out_tensor = torch.from_numpy(out_cpu).to(dtype=out.dtype, device=out.device)
-        out.copy_(out_tensor)
-        return out, {
+        all_faces.copy_(out)
+        return all_faces, {
             "breaks": ema_chain_breaks,
             "track_switch": ema_resets_on_track_switch,
         }

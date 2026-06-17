@@ -168,6 +168,12 @@ LANGUAGE_LIPSYNC_PRESETS = {
         "mouth_audio_motion_min_scale": 0.70,
         "mouth_audio_motion_max_scale": 1.35,
     },
+    "thai": {
+        "guidance_scale": 1.38,
+        "mouth_temporal_stabilization_strength": 0.15,
+        "mouth_audio_motion_min_scale": 0.72,
+        "mouth_audio_motion_max_scale": 1.40,
+    },
 }
 
 LANGUAGE_ALIASES = {
@@ -188,6 +194,9 @@ LANGUAGE_ALIASES = {
     "vi": "vietnamese",
     "vie": "vietnamese",
     "vietnamese": "vietnamese",
+    "th": "thai",
+    "tha": "thai",
+    "thai": "thai",
 }
 
 
