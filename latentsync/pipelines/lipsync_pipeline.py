@@ -3438,6 +3438,7 @@ class LipsyncPipeline(DiffusionPipeline):
         min_merged_lipsync_seconds = kwargs.get("min_merged_lipsync_seconds", 1.5)
         scene_cut_break_enabled = kwargs.get("scene_cut_break_enabled", True)
         scene_cut_break_threshold = kwargs.get("scene_cut_break_threshold", 0.45)
+        scene_split_threshold = kwargs.get("scene_split_threshold", 0.45)
         lipsync_min_face_area_ratio = kwargs.get("lipsync_min_face_area_ratio", 0.015)
         shot_passthrough_enabled = kwargs.get("shot_passthrough_enabled", False)
         shot_passthrough_skip_ratio_threshold = kwargs.get("shot_passthrough_skip_ratio_threshold", 0.45)
