@@ -135,6 +135,75 @@ settings = Settings()
 logger = logging.getLogger("latentsync.api")
 
 
+LANGUAGE_LIPSYNC_PRESETS = {
+    "english": {
+        "guidance_scale": 1.45,
+        "mouth_temporal_stabilization_strength": 0.15,
+        "mouth_audio_motion_min_scale": 0.75,
+        "mouth_audio_motion_max_scale": 1.45,
+    },
+    "indonesian": {
+        "guidance_scale": 1.50,
+        "mouth_temporal_stabilization_strength": 0.14,
+        "mouth_audio_motion_min_scale": 0.80,
+        "mouth_audio_motion_max_scale": 1.60,
+    },
+    "filipino": {
+        "guidance_scale": 1.45,
+        "mouth_temporal_stabilization_strength": 0.14,
+        "mouth_audio_motion_min_scale": 0.80,
+        "mouth_audio_motion_max_scale": 1.55,
+    },
+    "malay": {
+        "guidance_scale": 1.50,
+        "mouth_temporal_stabilization_strength": 0.14,
+        "mouth_audio_motion_min_scale": 0.80,
+        "mouth_audio_motion_max_scale": 1.60,
+    },
+    "vietnamese": {
+        "guidance_scale": 1.35,
+        "mouth_temporal_stabilization_strength": 0.16,
+        "mouth_audio_motion_min_scale": 0.70,
+        "mouth_audio_motion_max_scale": 1.35,
+    },
+}
+
+LANGUAGE_ALIASES = {
+    "en": "english",
+    "eng": "english",
+    "english": "english",
+    "id": "indonesian",
+    "indonesian": "indonesian",
+    "bahasa indonesia": "indonesian",
+    "fil": "filipino",
+    "filipino": "filipino",
+    "philippines": "filipino",
+    "tagalog": "filipino",
+    "tl": "filipino",
+    "ms": "malay",
+    "malay": "malay",
+    "bahasa melayu": "malay",
+    "vi": "vietnamese",
+    "vie": "vietnamese",
+    "vietnamese": "vietnamese",
+}
+
+
+def _normalize_target_language(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    key = value.strip().lower().replace("_", " ").replace("-", " ")
+    key = " ".join(key.split())
+    return LANGUAGE_ALIASES.get(key, "")
+
+
+def _payload_field_was_set(payload: BaseModel, field_name: str) -> bool:
+    fields_set = getattr(payload, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = getattr(payload, "__fields_set__", set())
+    return field_name in fields_set
+
+
 # ---------------------------------------------------------------------------
 # Pydantic models – kept identical to MuseTalk api.py for compatibility
 # ---------------------------------------------------------------------------
@@ -143,11 +212,19 @@ class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     avatar_url: Optional[str] = Field(None, description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
+    target_language: Optional[str] = Field(
+        None,
+        description="Optional dubbing target language preset: English, Indonesian, Filipino, Malay, Vietnamese.",
+    )
     similarity_threshold: float = Field(0.5, ge=0.0, le=1.0)
     identity_margin: float = Field(0.05, ge=0.0, le=1.0)
     identity_cluster_threshold: float = Field(0.78, ge=0.0, le=1.0)
     default_identity_min_coverage: float = Field(0.5, ge=0.0, le=1.0)
     require_face_embedding: bool = True
+    active_speaker_filter_enabled: bool = Field(
+        True,
+        description="When no avatar is provided, auto-select the active speaker and target that face instead of the largest face.",
+    )
     allow_crop_embedding_fallback: bool = True
     crop_embedding_min_detection_score: float = Field(0.0, ge=0.0, le=1.0)
     temporal_tracking_weight: float = Field(0.08, ge=0.0, le=0.5)
@@ -1452,12 +1529,19 @@ class LatentSyncApiRuntime:
             audio_path = paths["audio"]
             output_path = job_output_dir / "result.mp4"
 
+            target_language = _normalize_target_language(payload.target_language)
+            language_preset = (
+                LANGUAGE_LIPSYNC_PRESETS.get(target_language, {})
+                if target_language
+                else {}
+            )
+
             # Resolve per-request overrides for inference quality. None = use
             # the server-side default loaded from env vars at startup.
             effective_guidance_scale = (
                 payload.guidance_scale_override
                 if payload.guidance_scale_override is not None
-                else settings.guidance_scale
+                else language_preset.get("guidance_scale", settings.guidance_scale)
             )
             effective_inference_steps = (
                 payload.inference_steps_override
@@ -1468,6 +1552,30 @@ class LatentSyncApiRuntime:
                 payload.seed_override
                 if payload.seed_override is not None
                 else settings.seed
+            )
+            effective_mouth_temporal_stabilization_strength = (
+                payload.mouth_temporal_stabilization_strength
+                if _payload_field_was_set(payload, "mouth_temporal_stabilization_strength")
+                else language_preset.get(
+                    "mouth_temporal_stabilization_strength",
+                    payload.mouth_temporal_stabilization_strength,
+                )
+            )
+            effective_mouth_audio_motion_min_scale = (
+                payload.mouth_audio_motion_min_scale
+                if _payload_field_was_set(payload, "mouth_audio_motion_min_scale")
+                else language_preset.get(
+                    "mouth_audio_motion_min_scale",
+                    payload.mouth_audio_motion_min_scale,
+                )
+            )
+            effective_mouth_audio_motion_max_scale = (
+                payload.mouth_audio_motion_max_scale
+                if _payload_field_was_set(payload, "mouth_audio_motion_max_scale")
+                else language_preset.get(
+                    "mouth_audio_motion_max_scale",
+                    payload.mouth_audio_motion_max_scale,
+                )
             )
             if payload.enable_deepcache_override is not None and payload.enable_deepcache_override != settings.enable_deepcache:
                 logger.warning(
@@ -1501,6 +1609,7 @@ class LatentSyncApiRuntime:
             logger.info(f"[LipSync] Starting pipeline: video={video_path}, audio={audio_path}, "
                          f"guidance_scale={effective_guidance_scale}, steps={effective_inference_steps}, "
                          f"seed={effective_seed}, has_reference_embedding={reference_embedding is not None}, "
+                         f"target_language={target_language or 'none'}, "
                          f"codeformer_enabled={payload.codeformer_enabled}, "
                          f"codeformer_loaded={codeformer_restorer is not None and codeformer_restorer.is_loaded}, "
                          f"codeformer_fidelity_weight={payload.codeformer_fidelity_weight}, "
@@ -1520,6 +1629,7 @@ class LatentSyncApiRuntime:
                 temp_dir=str(job_output_dir / "temp"),
                 reference_embedding=reference_embedding,
                 face_embedder=runtime.face_embedder,
+                active_speaker_filter_enabled=payload.active_speaker_filter_enabled,
                 identity_similarity_threshold=payload.similarity_threshold,
                 quality_gate_enabled=payload.quality_gate_enabled,
                 quality_min_laplacian=payload.quality_min_laplacian,
@@ -1565,11 +1675,11 @@ class LatentSyncApiRuntime:
                 color_match_strength=payload.color_match_strength,
                 mouth_detail_strength=payload.mouth_detail_strength,
                 mouth_sharpen_strength=payload.mouth_sharpen_strength,
-                mouth_temporal_stabilization_strength=payload.mouth_temporal_stabilization_strength,
+                mouth_temporal_stabilization_strength=effective_mouth_temporal_stabilization_strength,
                 mouth_temporal_stabilization_max_delta=payload.mouth_temporal_stabilization_max_delta,
                 mouth_audio_adaptive_motion_enabled=payload.mouth_audio_adaptive_motion_enabled,
-                mouth_audio_motion_min_scale=payload.mouth_audio_motion_min_scale,
-                mouth_audio_motion_max_scale=payload.mouth_audio_motion_max_scale,
+                mouth_audio_motion_min_scale=effective_mouth_audio_motion_min_scale,
+                mouth_audio_motion_max_scale=effective_mouth_audio_motion_max_scale,
                 # CodeFormer postprocess. ``codeformer_enabled`` is honoured
                 # only when ``codeformer_restorer`` actually loaded; when
                 # it didn't (e.g. checkpoint missing and not required) the
@@ -1651,6 +1761,7 @@ class LatentSyncApiRuntime:
             skipped_inference_frames = int(run_stats.get("skipped_inference_frames", 0))
             identity_similarity_stats = run_stats.get("identity_similarity") or {}
             identity_skip_count = int(run_stats.get("identity_skip_count", 0))
+            active_speaker_stats = run_stats.get("active_speaker") or {}
             codeformer_stats = run_stats.get("codeformer") or {}
             mouth_temporal_stats = run_stats.get("mouth_temporal") or {}
             segment_consistency_reasons = run_stats.get("segment_consistency") or {}
@@ -1687,6 +1798,12 @@ class LatentSyncApiRuntime:
                 "effective_guidance_scale": effective_guidance_scale,
                 "effective_inference_steps": effective_inference_steps,
                 "effective_seed": effective_seed,
+                "language_preset": {
+                    "requested": payload.target_language or "",
+                    "resolved": target_language,
+                    "applied": bool(language_preset),
+                    "values": dict(language_preset),
+                },
                 "generation_summary": dict(generation_summary),
                 "retry_recommendation": dict(run_stats.get("retry_recommendation") or {}),
                 "shot_summary": dict(run_stats.get("shot_summary") or {}),
@@ -1746,6 +1863,8 @@ class LatentSyncApiRuntime:
                 "identity_similarity_median": float(identity_similarity_stats.get("median", 0.0)),
                 "identity_similarity_max": float(identity_similarity_stats.get("max", 0.0)),
                 "identity_similarity_threshold": float(run_stats.get("identity_similarity_threshold", payload.similarity_threshold)),
+                "active_speaker": dict(active_speaker_stats),
+                "active_speaker_filter_enabled": bool(payload.active_speaker_filter_enabled),
                 "target_identity_similarity": 0.0,
                 "target_identity_count": 0,
                 "target_identity_coverage": 0.0,
@@ -1757,7 +1876,7 @@ class LatentSyncApiRuntime:
                     "silent_frames": silent_skip_frames,
                 },
                 "mouth_temporal": {
-                    "stabilization_strength": float(payload.mouth_temporal_stabilization_strength),
+                    "stabilization_strength": float(effective_mouth_temporal_stabilization_strength),
                     "stabilization_max_delta": float(payload.mouth_temporal_stabilization_max_delta),
                     "delta_min": float(mouth_temporal_stats.get("delta_min", 0.0)),
                     "delta_median": float(mouth_temporal_stats.get("delta_median", 0.0)),

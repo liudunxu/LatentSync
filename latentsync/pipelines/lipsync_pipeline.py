@@ -2027,31 +2027,164 @@ class LipsyncPipeline(DiffusionPipeline):
 
     def detect_main_speaker_embedding(self, video_frames: np.ndarray, face_embedder) -> Optional[np.ndarray]:
         if face_embedder is None or len(video_frames) == 0:
+            self._last_active_speaker_stats = {
+                "enabled": face_embedder is not None,
+                "selected": False,
+                "reason": "missing_face_embedder_or_empty_video",
+                "sampled_frames": 0,
+                "clusters": 0,
+            }
             return None
-        best_frame_idx = None
-        best_ratio = -1.0
-        best_emb = None
-        sample_indices = list(range(0, len(video_frames), max(1, len(video_frames) // 10)))[:20]
+        clusters: List[Dict[str, object]] = []
+        sample_indices = list(range(0, len(video_frames), max(1, len(video_frames) // 24)))[:48]
         for idx in sample_indices:
             frame = video_frames[idx]
-            bbox, lmk = self.image_processor.face_detector(frame)
-            if bbox is None:
+            try:
+                detected_faces = face_embedder.get(frame.astype(np.uint8))
+            except Exception:
                 continue
-            x1, y1, x2, y2 = bbox
-            face_size = max(x2 - x1, y2 - y1)
-            mouth_ratio = self._mouth_open_ratio(lmk, face_size)
-            if mouth_ratio > best_ratio:
-                best_ratio = mouth_ratio
-                best_frame_idx = idx
-        if best_frame_idx is None:
+            frame_h, frame_w = frame.shape[:2]
+            for face in detected_faces:
+                bbox = getattr(face, "bbox", None)
+                emb = getattr(face, "normed_embedding", None)
+                if bbox is None or emb is None:
+                    continue
+                emb = np.asarray(emb, dtype=np.float32)
+                norm = float(np.linalg.norm(emb))
+                if norm <= 1e-6:
+                    continue
+                emb = emb / norm
+                x1, y1, x2, y2 = [float(v) for v in bbox]
+                face_w = max(0.0, x2 - x1)
+                face_h = max(0.0, y2 - y1)
+                if face_w < 8 or face_h < 8:
+                    continue
+                face_size = max(face_w, face_h)
+                lmk = getattr(face, "landmark_2d_106", None)
+                mouth_ratio = self._mouth_open_ratio(lmk, face_size)
+                area_ratio = float((face_w * face_h) / max(1.0, frame_w * frame_h))
+                center_x = (x1 + x2) * 0.5 / max(1.0, frame_w)
+                center_y = (y1 + y2) * 0.5 / max(1.0, frame_h)
+                center_dist = math.sqrt((center_x - 0.5) ** 2 + (center_y - 0.5) ** 2)
+                center_score = float(np.clip(1.0 - center_dist / 0.7072, 0.0, 1.0))
+                yaw = abs(self._estimate_yaw_degrees(lmk)) if lmk is not None else 0.0
+
+                best_cluster = None
+                best_score = -1.0
+                for cluster_idx, cluster in enumerate(clusters):
+                    cluster_emb = cluster.get("embedding")
+                    if cluster_emb is None:
+                        continue
+                    score = float(np.dot(emb, cluster_emb))
+                    if score > best_score:
+                        best_score = score
+                        best_cluster = cluster_idx
+
+                if best_cluster is not None and best_score >= 0.72:
+                    cluster = clusters[best_cluster]
+                    count = int(cluster["count"]) + 1
+                    cluster["count"] = count
+                    merged_embedding = (
+                        np.asarray(cluster["embedding"], dtype=np.float32) * (count - 1) + emb
+                    ) / count
+                    merged_norm = float(np.linalg.norm(merged_embedding))
+                    if merged_norm > 1e-6:
+                        merged_embedding = merged_embedding / merged_norm
+                    cluster["embedding"] = merged_embedding
+                    cluster["mouth_values"].append(float(mouth_ratio))
+                    cluster["area_values"].append(float(area_ratio))
+                    cluster["center_values"].append(float(center_score))
+                    cluster["yaw_values"].append(float(yaw))
+                    if mouth_ratio > float(cluster.get("best_mouth_ratio", 0.0)):
+                        cluster["best_frame_index"] = idx
+                        cluster["best_mouth_ratio"] = float(mouth_ratio)
+                else:
+                    clusters.append({
+                        "embedding": emb,
+                        "count": 1,
+                        "mouth_values": [float(mouth_ratio)],
+                        "area_values": [float(area_ratio)],
+                        "center_values": [float(center_score)],
+                        "yaw_values": [float(yaw)],
+                        "best_frame_index": idx,
+                        "best_mouth_ratio": float(mouth_ratio),
+                    })
+
+        if not clusters:
+            self._last_active_speaker_stats = {
+                "enabled": True,
+                "selected": False,
+                "reason": "no_face_embedding_clusters",
+                "sampled_frames": len(sample_indices),
+                "clusters": 0,
+            }
             return None
-        frame = video_frames[best_frame_idx]
-        faces = face_embedder.get(frame.astype(np.uint8))
-        if faces:
-            emb = getattr(faces[0], "normed_embedding", None)
-            if emb is not None:
-                best_emb = np.asarray(emb, dtype=np.float32)
-        logger.info(f"[LipSync] Main speaker from frame {best_frame_idx} with mouth_ratio={best_ratio:.4f}")
+
+        best_cluster = None
+        best_score = -1.0
+        ranked = []
+        for cluster_idx, cluster in enumerate(clusters):
+            mouth_values = cluster["mouth_values"]
+            area_values = cluster["area_values"]
+            center_values = cluster["center_values"]
+            yaw_values = cluster["yaw_values"]
+            count = int(cluster["count"])
+            coverage_score = min(1.0, count / max(1.0, len(sample_indices) * 0.35))
+            mouth_max = max(mouth_values) if mouth_values else 0.0
+            mouth_motion = (max(mouth_values) - min(mouth_values)) if len(mouth_values) >= 2 else mouth_max
+            mouth_max_score = float(np.clip(mouth_max / 0.08, 0.0, 1.0))
+            mouth_motion_score = float(np.clip(mouth_motion / 0.04, 0.0, 1.0))
+            area_score = float(np.clip(statistics.median(area_values) / 0.12, 0.0, 1.0)) if area_values else 0.0
+            center_score = float(statistics.median(center_values)) if center_values else 0.0
+            yaw_penalty = float(np.clip((statistics.median(yaw_values) if yaw_values else 0.0) / 45.0, 0.0, 1.0))
+            score = (
+                0.40 * mouth_motion_score
+                + 0.25 * mouth_max_score
+                + 0.15 * coverage_score
+                + 0.12 * area_score
+                + 0.08 * center_score
+                - 0.10 * yaw_penalty
+            )
+            ranked.append({
+                "cluster_index": cluster_idx,
+                "score": float(score),
+                "count": count,
+                "mouth_max": float(mouth_max),
+                "mouth_motion": float(mouth_motion),
+                "area_median": float(statistics.median(area_values)) if area_values else 0.0,
+                "center_median": center_score,
+                "yaw_median": float(statistics.median(yaw_values)) if yaw_values else 0.0,
+                "best_frame_index": int(cluster.get("best_frame_index", 0)),
+            })
+            if score > best_score:
+                best_score = score
+                best_cluster = cluster
+
+        ranked.sort(key=lambda item: item["score"], reverse=True)
+        selected = ranked[0] if ranked else {}
+        self._last_active_speaker_stats = {
+            "enabled": True,
+            "selected": best_cluster is not None,
+            "sampled_frames": len(sample_indices),
+            "clusters": len(clusters),
+            "selected_cluster": selected,
+            "top_clusters": ranked[:3],
+        }
+        if best_cluster is None:
+            return None
+
+        best_emb = np.asarray(best_cluster["embedding"], dtype=np.float32)
+        norm = float(np.linalg.norm(best_emb))
+        if norm > 1e-6:
+            best_emb = best_emb / norm
+        logger.info(
+            "[LipSync] Active speaker selected: frame=%s score=%.3f mouth_max=%.4f mouth_motion=%.4f clusters=%d",
+            selected.get("best_frame_index", -1),
+            float(selected.get("score", 0.0)),
+            float(selected.get("mouth_max", 0.0)),
+            float(selected.get("mouth_motion", 0.0)),
+            len(clusters),
+        )
         return best_emb
 
     def affine_transform_video(
@@ -2226,7 +2359,10 @@ class LipsyncPipeline(DiffusionPipeline):
                     prev_temporal_embedding = None
                     prev_temporal_face = None
                     prev_mouth_info = None
-            affine_result = self.image_processor.affine_transform_with_embedding(frame)
+            affine_result = self.image_processor.affine_transform_with_embedding(
+                frame,
+                target_embedding=reference_embedding if apply_identity_filter else None,
+            )
             if len(affine_result) == 5:
                 face, box, affine_matrix, face_emb, lmk = affine_result
             else:
@@ -2260,7 +2396,8 @@ class LipsyncPipeline(DiffusionPipeline):
             if lipsync_min_face_area_ratio > 0:
                 try:
                     frame_h, frame_w = frame.shape[:2]
-                    x1, y1, x2, y2 = box
+                    source_box = getattr(self.image_processor, "last_source_bbox", None) or box
+                    x1, y1, x2, y2 = source_box
                     face_area = max(0.0, float(x2 - x1)) * max(0.0, float(y2 - y1))
                     frame_area = max(1.0, float(frame_h * frame_w))
                     if face_area / frame_area < lipsync_min_face_area_ratio:
@@ -2752,6 +2889,7 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         skip_mask=None,
+        active_speaker_filter_enabled: bool = True,
         # Source video frame rate. Forwarded to
         # ``affine_transform_video`` for the time-based segment
         # consistency gates.
@@ -2838,9 +2976,20 @@ class LipsyncPipeline(DiffusionPipeline):
             f"side_face_episode_post_pad={side_face_episode_post_pad}, "
             f"side_face_blend_fade_frames={side_face_blend_fade_frames}"
         )
+        auto_reference_embedding = False
         if reference_embedding is None and face_embedder is not None:
             reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
+            auto_reference_embedding = reference_embedding is not None
             logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
+        effective_apply_identity_filter = bool(
+            apply_identity_filter
+            or (auto_reference_embedding and active_speaker_filter_enabled)
+        )
+        if auto_reference_embedding:
+            stats = getattr(self, "_last_active_speaker_stats", {}) or {}
+            stats["filter_enabled"] = bool(active_speaker_filter_enabled)
+            stats["identity_filter_applied"] = bool(effective_apply_identity_filter)
+            self._last_active_speaker_stats = stats
         if len(whisper_chunks) > len(video_frames):
             (
                 faces,
@@ -2875,7 +3024,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 scene_cut_break_threshold=scene_cut_break_threshold,
                 lipsync_min_face_area_ratio=lipsync_min_face_area_ratio,
                 identity_similarity_threshold=identity_similarity_threshold,
-                apply_identity_filter=apply_identity_filter,
+                apply_identity_filter=effective_apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
                 side_face_blend_fade_frames=side_face_blend_fade_frames,
@@ -2990,7 +3139,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 scene_cut_break_threshold=scene_cut_break_threshold,
                 lipsync_min_face_area_ratio=lipsync_min_face_area_ratio,
                 identity_similarity_threshold=identity_similarity_threshold,
-                apply_identity_filter=apply_identity_filter,
+                apply_identity_filter=effective_apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
                 side_face_blend_fade_frames=side_face_blend_fade_frames,
@@ -3037,6 +3186,7 @@ class LipsyncPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         reference_embedding=None,
         face_embedder=None,
+        active_speaker_filter_enabled: bool = True,
         identity_similarity_threshold: float = 0.5,
         # --- quality / temporal gating (added 2026-06) ---
         temporal_smoothing_enabled: bool = True,
@@ -3290,6 +3440,13 @@ class LipsyncPipeline(DiffusionPipeline):
         # not reliable enough to reject other frames (false positives on
         # busy/occluded faces), so we keep all detected faces.
         apply_identity_filter = reference_embedding is not None
+        self._last_active_speaker_stats = {
+            "enabled": reference_embedding is None and face_embedder is not None,
+            "selected": False,
+            "reason": "reference_embedding_provided" if reference_embedding is not None else "not_run",
+            "sampled_frames": 0,
+            "clusters": 0,
+        }
         (
             source_video_frames,
             faces,
@@ -3308,6 +3465,7 @@ class LipsyncPipeline(DiffusionPipeline):
             video_frames,
             reference_embedding=reference_embedding,
             face_embedder=face_embedder,
+            active_speaker_filter_enabled=active_speaker_filter_enabled,
             video_fps=video_fps,
             yaw_skip_threshold=yaw_skip_threshold,
             yaw_rate_skip_threshold=yaw_rate_skip_threshold,
@@ -4133,6 +4291,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 "_last_identity_similarity_stats",
                 {"min": 0.0, "median": 0.0, "max": 0.0},
             ),
+            "active_speaker": getattr(self, "_last_active_speaker_stats", {}),
             "temporal_smoothing_enabled": temporal_smoothing_enabled,
             "mouth_motion_preserve_strength": mouth_motion_preserve_strength,
             "mouth_temporal_stabilization_strength": mouth_temporal_stabilization_strength,

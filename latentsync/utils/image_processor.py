@@ -58,6 +58,7 @@ class ImageProcessor:
             # pipeline can only count it as a generic detect failure.
             self.face_detector = FaceDetector(device=device, skip_side_face_threshold=None)
             self.face_embedder = None
+        self.last_source_bbox = None
 
     def set_face_embedder(self, embedder):
         self.face_embedder = embedder
@@ -100,12 +101,49 @@ class ImageProcessor:
         face = rearrange(torch.from_numpy(face), "h w c -> c h w")
         return face, box, affine_matrix
 
-    def affine_transform_with_embedding(self, image: torch.Tensor):
+    def affine_transform_with_embedding(self, image: torch.Tensor, target_embedding=None):
         if self.face_detector is None:
             raise NotImplementedError("Using the CPU for face detection is not supported")
-        source_bbox, landmark_2d_106 = self.face_detector(image)
+        self.face_detector.last_pose_yaw = None
+        source_bbox = None
+        landmark_2d_106 = None
+        selected_embedding = None
+        if target_embedding is not None and self.face_embedder is not None:
+            target = np.asarray(target_embedding, dtype=np.float32)
+            target_norm = float(np.linalg.norm(target))
+            if target_norm > 1e-6:
+                target = target / target_norm
+                detected_faces = self.face_embedder.get(image.astype(np.uint8) if image.dtype != np.uint8 else image)
+                best_face = None
+                best_score = -1.0
+                for detected_face in detected_faces:
+                    emb = getattr(detected_face, "normed_embedding", None)
+                    bbox = getattr(detected_face, "bbox", None)
+                    lmk = getattr(detected_face, "landmark_2d_106", None)
+                    if emb is None or bbox is None or lmk is None:
+                        continue
+                    emb = np.asarray(emb, dtype=np.float32)
+                    emb_norm = float(np.linalg.norm(emb))
+                    if emb_norm <= 1e-6:
+                        continue
+                    emb = emb / emb_norm
+                    score = float(np.dot(emb, target))
+                    if score > best_score:
+                        best_score = score
+                        best_face = detected_face
+                        selected_embedding = emb
+                if best_face is not None:
+                    source_bbox = np.asarray(best_face.bbox).astype(np.int_).tolist()
+                    landmark_2d_106 = best_face.landmark_2d_106
+                    pose = getattr(best_face, "pose", None)
+                    if pose is not None and self.face_detector is not None:
+                        self.face_detector.last_pose_yaw = float(abs(pose[1]))
+        if source_bbox is None or landmark_2d_106 is None:
+            source_bbox, landmark_2d_106 = self.face_detector(image)
         if source_bbox is None:
+            self.last_source_bbox = None
             return None, None, None, None
+        self.last_source_bbox = source_bbox
 
         pt_left_eye = np.mean(landmark_2d_106[[43, 48, 49, 51, 50]], axis=0)
         pt_right_eye = np.mean(landmark_2d_106[101:106], axis=0)
@@ -120,7 +158,7 @@ class ImageProcessor:
         face = cv2.resize(face, (self.resolution, self.resolution), interpolation=cv2.INTER_LANCZOS4)
         face = rearrange(torch.from_numpy(face), "h w c -> c h w")
 
-        embedding = None
+        embedding = selected_embedding
         if self.face_embedder is not None:
             detected_faces = self.face_embedder.get(image.astype(np.uint8) if image.dtype != np.uint8 else image)
             best_face = None
