@@ -2889,7 +2889,7 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         skip_mask=None,
-        active_speaker_filter_enabled: bool = True,
+        active_speaker_filter_enabled: bool = False,
         # Source video frame rate. Forwarded to
         # ``affine_transform_video`` for the time-based segment
         # consistency gates.
@@ -3186,7 +3186,7 @@ class LipsyncPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         reference_embedding=None,
         face_embedder=None,
-        active_speaker_filter_enabled: bool = True,
+        active_speaker_filter_enabled: bool = False,
         identity_similarity_threshold: float = 0.5,
         # --- quality / temporal gating (added 2026-06) ---
         temporal_smoothing_enabled: bool = True,

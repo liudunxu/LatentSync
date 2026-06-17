@@ -222,7 +222,7 @@ class LipSyncRequest(BaseModel):
     default_identity_min_coverage: float = Field(0.5, ge=0.0, le=1.0)
     require_face_embedding: bool = True
     active_speaker_filter_enabled: bool = Field(
-        True,
+        False,
         description="When no avatar is provided, auto-select the active speaker and target that face instead of the largest face.",
     )
     allow_crop_embedding_fallback: bool = True
