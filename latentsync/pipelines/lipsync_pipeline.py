@@ -3477,6 +3477,8 @@ class LipsyncPipeline(DiffusionPipeline):
                 logger.info(f"[LipSync] Set face_embedder on ImageProcessor for face matching")
         self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
+        device = self._execution_device
+
         # 2. Check inputs
         self.check_inputs(height, width, callback_steps)
 
