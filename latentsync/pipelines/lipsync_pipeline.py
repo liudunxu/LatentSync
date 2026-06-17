@@ -2235,7 +2235,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # the legacy frame-only logic).
         video_fps: float = 25.0,
         yaw_skip_threshold: float = 40.0,
-        yaw_rate_skip_threshold: float = 28.0,
+        yaw_rate_skip_threshold: float = 10.0,
         # Aggressive side-face passthrough. When > 0 and < yaw_skip_threshold,
         # frames with abs(yaw) in the band (passthrough_threshold, yaw_skip_threshold)
         # are also marked as passthrough -- i.e. the diffusion inpainter is
@@ -2294,7 +2294,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # default; bump toward 0.85-1.0 to fix individual frames whose
         # inpaint region drifts off the mouth. Mirrors
         # ``LipSyncRequest.aligned_mouth_ema_alpha``.
-        aligned_mouth_ema_alpha: float = 0.7,
+        aligned_mouth_ema_alpha: float = 0.85,
     ):
         logger.info(
             f"[FaceMatch] Starting: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
@@ -2932,7 +2932,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # consistency gates.
         video_fps: float = 25.0,
         yaw_skip_threshold: float = 40.0,
-        yaw_rate_skip_threshold: float = 28.0,
+        yaw_rate_skip_threshold: float = 10.0,
         # Aggressive side-face passthrough. When > 0 and < yaw_skip_threshold,
         # frames with abs(yaw) in the band (passthrough_threshold, yaw_skip_threshold)
         # are also marked as passthrough -- i.e. the diffusion inpainter is
@@ -2991,7 +2991,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # default; bump toward 0.85-1.0 to fix individual frames whose
         # inpaint region drifts off the mouth. Mirrors
         # ``LipSyncRequest.aligned_mouth_ema_alpha``.
-        aligned_mouth_ema_alpha: float = 0.7,
+        aligned_mouth_ema_alpha: float = 0.85,
     ):
         logger.info(
             f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
@@ -3426,8 +3426,8 @@ class LipsyncPipeline(DiffusionPipeline):
         mouth_temporal_stabilization_strength = kwargs.get("mouth_temporal_stabilization_strength", 0.15)
         mouth_temporal_stabilization_max_delta = kwargs.get("mouth_temporal_stabilization_max_delta", 0.12)
         mouth_audio_adaptive_motion_enabled = kwargs.get("mouth_audio_adaptive_motion_enabled", True)
-        mouth_audio_motion_min_scale = kwargs.get("mouth_audio_motion_min_scale", 0.75)
-        mouth_audio_motion_max_scale = kwargs.get("mouth_audio_motion_max_scale", 1.20)
+        mouth_audio_motion_min_scale = kwargs.get("mouth_audio_motion_min_scale", 0.85)
+        mouth_audio_motion_max_scale = kwargs.get("mouth_audio_motion_max_scale", 1.60)
         quality_gate_enabled = kwargs.get("quality_gate_enabled", False)
         quality_min_laplacian = kwargs.get("quality_min_laplacian", 0.04)
         quality_min_sharpness_ratio = kwargs.get("quality_min_sharpness_ratio", 0.05)
@@ -3438,7 +3438,7 @@ class LipsyncPipeline(DiffusionPipeline):
         adaptive_quality_fallback_max_ratio = kwargs.get("adaptive_quality_fallback_max_ratio", 0.35)
         adaptive_quality_fallback_hysteresis_frames = kwargs.get("adaptive_quality_fallback_hysteresis_frames", 2)
         yaw_skip_threshold = kwargs.get("yaw_skip_threshold", 40.0)
-        yaw_rate_skip_threshold = kwargs.get("yaw_rate_skip_threshold", 28.0)
+        yaw_rate_skip_threshold = kwargs.get("yaw_rate_skip_threshold", 10.0)
         side_face_passthrough_yaw_threshold = kwargs.get("side_face_passthrough_yaw_threshold", 0.0)
         side_face_episode_pre_pad = kwargs.get("side_face_episode_pre_pad", 3)
         side_face_episode_post_pad = kwargs.get("side_face_episode_post_pad", 3)
@@ -3446,7 +3446,7 @@ class LipsyncPipeline(DiffusionPipeline):
         yaw_warn_threshold_ratio = kwargs.get("yaw_warn_threshold_ratio", 0.75)
         side_face_warn_min_run_frames = kwargs.get("side_face_warn_min_run_frames", 0)
         side_face_warn_min_run_seconds = kwargs.get("side_face_warn_min_run_seconds", 0.0)
-        aligned_mouth_ema_alpha = kwargs.get("aligned_mouth_ema_alpha", 0.7)
+        aligned_mouth_ema_alpha = kwargs.get("aligned_mouth_ema_alpha", 0.85)
         mouth_occlusion_skip_threshold = kwargs.get("mouth_occlusion_skip_threshold", 1.0)
         motion_blur_skip_threshold = kwargs.get("motion_blur_skip_threshold", 0.08)
         face_jump_center_threshold = kwargs.get("face_jump_center_threshold", 0.0)
@@ -4449,8 +4449,8 @@ class LipsyncPipeline(DiffusionPipeline):
         # Audio-adaptive mouth motion: preserve more current generated mouth
         # motion on high-energy speech frames and less on weak/silent frames.
         mouth_audio_adaptive_motion_enabled: bool = True,
-        mouth_audio_motion_min_scale: float = 0.75,
-        mouth_audio_motion_max_scale: float = 1.20,
+        mouth_audio_motion_min_scale: float = 0.85,
+        mouth_audio_motion_max_scale: float = 1.60,
         # Postfilter: skip frames where the generated mouth ROI is clearly
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
@@ -4469,7 +4469,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # Yaw-based prefilters for side faces / fast head turns. Defaults are
         # intentionally permissive so clear frontal faces are not filtered out.
         yaw_skip_threshold: float = 40.0,
-        yaw_rate_skip_threshold: float = 28.0,
+        yaw_rate_skip_threshold: float = 10.0,
         # Aggressive side-face passthrough. When > 0 and < yaw_skip_threshold,
         # frames with abs(yaw) in the band (passthrough_threshold, yaw_skip_threshold)
         # are also marked as passthrough -- i.e. the diffusion inpainter is
@@ -4502,7 +4502,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # default; bump toward 0.85-1.0 to fix individual frames whose
         # inpaint region drifts off the mouth. Mirrors
         # ``LipSyncRequest.aligned_mouth_ema_alpha``.
-        aligned_mouth_ema_alpha: float = 0.7,
+        aligned_mouth_ema_alpha: float = 0.85,
         # Mouth-occlusion prefilter: skip frames where the mouth is covered
         # by a hand, microphone, phone, mask, etc. Score 0..1; above the
         # threshold the frame is treated as not-lip-syncable and the original

@@ -107,7 +107,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - `LATENTSYNC_INFERENCE_STEPS=40` (env), 35 frontend
 - `LATENTSYNC_ENABLE_DEEPCACHE=1`
 - `mouth_temporal_stabilization_strength=0.15` (default)
-- `mouth_audio_motion_min_scale=0.75` (default)
+- `mouth_audio_motion_min_scale=0.85` (default)
 - See commits `dc8d869` and `37afbc7` for the trade-off reasoning.
   Adjusting these has visible quality vs. speed trade-offs; ask first.
 

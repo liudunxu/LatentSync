@@ -141,7 +141,7 @@ LANGUAGE_LIPSYNC_PRESETS = {
     "english": {
         "guidance_scale": 1.45,
         "mouth_temporal_stabilization_strength": 0.15,
-        "mouth_audio_motion_min_scale": 0.75,
+        "mouth_audio_motion_min_scale": 0.85,
         "mouth_audio_motion_max_scale": 1.45,
     },
     "indonesian": {
@@ -278,7 +278,7 @@ class LipSyncRequest(BaseModel):
     # position jumps). 0.7 is the legacy default; bump toward 0.85-1.0
     # when individual frames show the inpaint region drifting off the
     # mouth onto the cheek / chin.
-    aligned_mouth_ema_alpha: float = Field(0.7, ge=0.0, le=1.0)
+    aligned_mouth_ema_alpha: float = Field(0.85, ge=0.0, le=1.0)
     # Mouth-region pixel diff break: complementary to the embedding
     # similarity check. When the mouth region mean abs diff between
     # consecutive aligned face crops exceeds this fraction, treat the
@@ -401,7 +401,7 @@ class LipSyncRequest(BaseModel):
     # Adaptive motion: preserve more current generated mouth motion,
     # especially on high-energy speech, so open-mouth frames are not pulled
     # back toward the smoothed/previous-frame mouth too aggressively.
-    mouth_audio_motion_min_scale: float = Field(0.75, ge=0.0, le=2.0)
+    mouth_audio_motion_min_scale: float = Field(0.85, ge=0.0, le=2.0)
     mouth_audio_motion_max_scale: float = Field(1.60, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default
     # (self.config.data.mask_image_path, usually latentsync/utils/mask.png).
@@ -436,7 +436,7 @@ class LipSyncRequest(BaseModel):
     # side profiles and motion-blur turns. yaw_rate is in degrees/frame, not
     # per second (28°/frame at 25fps ≈ 700°/sec).
     yaw_skip_threshold: float = Field(40.0, ge=0.0, le=90.0)
-    yaw_rate_skip_threshold: float = Field(28.0, ge=0.0, le=45.0)
+    yaw_rate_skip_threshold: float = Field(10.0, ge=0.0, le=45.0)
     # Aggressive side-face passthrough. When > 0, frames with abs(yaw) in
     # the band (side_face_passthrough_yaw_threshold, yaw_skip_threshold)
     # are also marked as passthrough -- i.e. the diffusion inpainter is
