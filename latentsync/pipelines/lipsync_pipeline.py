@@ -2234,7 +2234,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # into frames. 0 disables the time-based gates (falls back to
         # the legacy frame-only logic).
         video_fps: float = 25.0,
-        yaw_skip_threshold: float = 30.0,
+        yaw_skip_threshold: float = 40.0,
         yaw_rate_skip_threshold: float = 28.0,
         # Aggressive side-face passthrough. When > 0 and < yaw_skip_threshold,
         # frames with abs(yaw) in the band (passthrough_threshold, yaw_skip_threshold)
@@ -2242,7 +2242,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # bypassed and the original frame is kept. Useful when "side-face residue
         # ghost" artifacts dominate the output: setting 22.5 in effect says
         # "don't try to inpaint any non-frontal face". 0 disables. Default 0
-        # preserves the historical "30° absolute only" behavior.
+        # preserves the historical "40° absolute only" behavior.
         side_face_passthrough_yaw_threshold: float = 0.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.08,
@@ -2931,7 +2931,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # ``affine_transform_video`` for the time-based segment
         # consistency gates.
         video_fps: float = 25.0,
-        yaw_skip_threshold: float = 30.0,
+        yaw_skip_threshold: float = 40.0,
         yaw_rate_skip_threshold: float = 28.0,
         # Aggressive side-face passthrough. When > 0 and < yaw_skip_threshold,
         # frames with abs(yaw) in the band (passthrough_threshold, yaw_skip_threshold)
@@ -2939,7 +2939,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # bypassed and the original frame is kept. Useful when "side-face residue
         # ghost" artifacts dominate the output: setting 22.5 in effect says
         # "don't try to inpaint any non-frontal face". 0 disables. Default 0
-        # preserves the historical "30° absolute only" behavior.
+        # preserves the historical "40° absolute only" behavior.
         side_face_passthrough_yaw_threshold: float = 0.0,
         mouth_occlusion_skip_threshold: float = 1.0,
         motion_blur_skip_threshold: float = 0.08,
@@ -3437,7 +3437,7 @@ class LipsyncPipeline(DiffusionPipeline):
         adaptive_quality_fallback_threshold = kwargs.get("adaptive_quality_fallback_threshold", 0.35)
         adaptive_quality_fallback_max_ratio = kwargs.get("adaptive_quality_fallback_max_ratio", 0.35)
         adaptive_quality_fallback_hysteresis_frames = kwargs.get("adaptive_quality_fallback_hysteresis_frames", 2)
-        yaw_skip_threshold = kwargs.get("yaw_skip_threshold", 30.0)
+        yaw_skip_threshold = kwargs.get("yaw_skip_threshold", 40.0)
         yaw_rate_skip_threshold = kwargs.get("yaw_rate_skip_threshold", 28.0)
         side_face_passthrough_yaw_threshold = kwargs.get("side_face_passthrough_yaw_threshold", 0.0)
         side_face_episode_pre_pad = kwargs.get("side_face_episode_pre_pad", 3)
@@ -4468,7 +4468,7 @@ class LipsyncPipeline(DiffusionPipeline):
         adaptive_quality_fallback_hysteresis_frames: int = 2,
         # Yaw-based prefilters for side faces / fast head turns. Defaults are
         # intentionally permissive so clear frontal faces are not filtered out.
-        yaw_skip_threshold: float = 30.0,
+        yaw_skip_threshold: float = 40.0,
         yaw_rate_skip_threshold: float = 28.0,
         # Aggressive side-face passthrough. When > 0 and < yaw_skip_threshold,
         # frames with abs(yaw) in the band (passthrough_threshold, yaw_skip_threshold)
@@ -4476,7 +4476,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # bypassed and the original frame is kept. Useful when "side-face residue
         # ghost" artifacts dominate the output: setting 22.5 in effect says
         # "don't try to inpaint any non-frontal face". 0 disables. Default 0
-        # preserves the historical "30° absolute only" behavior.
+        # preserves the historical "40° absolute only" behavior.
         side_face_passthrough_yaw_threshold: float = 0.0,
         # Episode-level side-face filter: when contiguous frames exceed
         # yaw_skip_threshold, also skip pre_pad/post_pad transition frames
