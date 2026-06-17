@@ -271,11 +271,11 @@ class LipSyncRequest(BaseModel):
     mouth_temporal_stabilization_strength: float = Field(0.10, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     mouth_audio_adaptive_motion_enabled: bool = True
-    # Adaptive motion: preserve a little more current generated mouth motion,
+    # Adaptive motion: preserve more current generated mouth motion,
     # especially on high-energy speech, so open-mouth frames are not pulled
     # back toward the smoothed/previous-frame mouth too aggressively.
-    mouth_audio_motion_min_scale: float = Field(0.85, ge=0.0, le=2.0)
-    mouth_audio_motion_max_scale: float = Field(1.35, ge=0.0, le=2.0)
+    mouth_audio_motion_min_scale: float = Field(1.00, ge=0.0, le=2.0)
+    mouth_audio_motion_max_scale: float = Field(1.60, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default
     # (self.config.data.mask_image_path, usually latentsync/utils/mask.png).
     # Set to "latentsync/utils/mask5.png" to use the tight mouth-only mask,
