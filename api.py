@@ -237,6 +237,12 @@ class LipSyncRequest(BaseModel):
         le=1.0,
         description="Threshold for detecting scene boundaries when scene_split_enabled=True.",
     )
+    min_scene_duration_seconds: float = Field(
+        0.0,
+        ge=0.0,
+        le=60.0,
+        description="Merge detected scenes shorter than this duration (seconds) with adjacent scenes. 0 disables merging.",
+    )
     allow_crop_embedding_fallback: bool = True
     crop_embedding_min_detection_score: float = Field(0.0, ge=0.0, le=1.0)
     temporal_tracking_weight: float = Field(0.08, ge=0.0, le=0.5)
@@ -1688,6 +1694,7 @@ class LatentSyncApiRuntime:
                 shot_passthrough_min_bad_frames=payload.shot_passthrough_min_bad_frames,
                 scene_split_enabled=payload.scene_split_enabled,
                 scene_split_threshold=payload.scene_split_threshold,
+                min_scene_duration_seconds=payload.min_scene_duration_seconds,
                 silent_skip_enabled=payload.speech_gate_enabled,
                 silent_rms_threshold=payload.speech_gate_min_rms,
                 silent_min_run_frames=max(

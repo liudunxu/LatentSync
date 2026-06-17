@@ -650,6 +650,48 @@ class LipsyncPipeline(DiffusionPipeline):
         return scenes
 
     @staticmethod
+    def _merge_short_scenes(
+        scenes: List[Tuple[int, int]],
+        video_fps: float,
+        min_scene_duration_seconds: float,
+    ) -> List[Tuple[int, int]]:
+        """Merge scenes shorter than ``min_scene_duration_seconds`` with neighbors.
+
+        Tiny scenes add pipeline overhead (per-scene face detector setup,
+        temporal state reset) without quality benefit. We merge them into an
+        adjacent scene to keep the count reasonable while still respecting
+        real shot boundaries.
+        """
+        if min_scene_duration_seconds <= 0.0 or len(scenes) <= 1:
+            return scenes
+
+        def _duration(start: int, end: int) -> float:
+            return float(end - start) / max(float(video_fps), 1e-6)
+
+        # First pass: if the very first scene is too short, merge it forward
+        # into the second scene so it doesn't remain an orphan.
+        merged: List[Tuple[int, int]] = []
+        idx = 0
+        if len(scenes) >= 2 and _duration(*scenes[0]) < min_scene_duration_seconds:
+            merged.append((scenes[0][0], scenes[1][1]))
+            idx = 2
+        else:
+            merged.append(scenes[0])
+            idx = 1
+
+        # Merge remaining short scenes backward into the previous scene.
+        while idx < len(scenes):
+            start, end = scenes[idx]
+            if _duration(start, end) < min_scene_duration_seconds and merged:
+                prev_start, prev_end = merged[-1]
+                merged[-1] = (prev_start, end)
+            else:
+                merged.append((start, end))
+            idx += 1
+
+        return merged
+
+    @staticmethod
     def _is_scene_boundary_between_source_indices(
         prev_source_idx: int,
         curr_source_idx: int,
@@ -3441,6 +3483,7 @@ class LipsyncPipeline(DiffusionPipeline):
         scene_cut_break_enabled = kwargs.get("scene_cut_break_enabled", True)
         scene_cut_break_threshold = kwargs.get("scene_cut_break_threshold", 0.45)
         scene_split_threshold = kwargs.get("scene_split_threshold", 0.45)
+        min_scene_duration_seconds = kwargs.get("min_scene_duration_seconds", 0.0)
         lipsync_min_face_area_ratio = kwargs.get("lipsync_min_face_area_ratio", 0.015)
         shot_passthrough_enabled = kwargs.get("shot_passthrough_enabled", False)
         shot_passthrough_skip_ratio_threshold = kwargs.get("shot_passthrough_skip_ratio_threshold", 0.45)
@@ -4536,6 +4579,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # as an independent clip with clean temporal state, then concatenate.
         scene_split_enabled: bool = True,
         scene_split_threshold: float = 0.45,
+        min_scene_duration_seconds: float = 0.0,
         # Audio-energy prefilter: skip sustained silent runs before diffusion.
         silent_skip_enabled: bool = False,
         silent_rms_threshold: float = 0.003,
@@ -4643,8 +4687,9 @@ class LipsyncPipeline(DiffusionPipeline):
         # Build kwargs dict for _process_clip from current locals.
         _process_clip_kwargs = {k: v for k, v in locals().items() if k not in {
             "self", "video_path", "audio_path", "video_out_path", "scene_split_enabled",
-            "scene_split_threshold", "temp_dir", "video_frames", "audio_samples",
-            "whisper_chunks", "whisper_feature", "is_train", "kwargs"
+            "scene_split_threshold", "min_scene_duration_seconds", "temp_dir",
+            "video_frames", "audio_samples", "whisper_chunks", "whisper_feature",
+            "is_train", "kwargs"
         }}
         _process_clip_kwargs.update(kwargs)
 
@@ -4653,6 +4698,10 @@ class LipsyncPipeline(DiffusionPipeline):
                 video_frames, scene_split_threshold
             )
             scenes = self._split_scenes_from_cuts(source_scene_cut_after)
+            if min_scene_duration_seconds > 0.0:
+                scenes = self._merge_short_scenes(
+                    scenes, float(video_fps), min_scene_duration_seconds
+                )
             if len(scenes) > 1:
                 scene_durations = [
                     float(end_frame - start_frame) / max(float(video_fps), 1e-6)
