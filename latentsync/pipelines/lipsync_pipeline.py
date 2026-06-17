@@ -3363,236 +3363,105 @@ class LipsyncPipeline(DiffusionPipeline):
 
         return aggregated
 
-    @torch.no_grad()
-    def __call__(
+    def _process_clip(
         self,
-        video_path: str,
-        audio_path: str,
+        video_frames: np.ndarray,
+        audio_samples: torch.Tensor,
+        whisper_chunks: list,
         video_out_path: str,
-        num_frames: int = 16,
-        video_fps: int = 25,
-        audio_sample_rate: int = 16000,
-        # Audio sync offset: positive means the provided audio is ahead of the
-        # video. We use earlier audio features to drive each frame, and delay
-        # the output audio by padding zeros at the start.
-        audio_sync_offset_seconds: float = 0.0,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        num_inference_steps: int = 40,
-        guidance_scale: float = 1.5,
-        weight_dtype: Optional[torch.dtype] = torch.float16,
-        eta: float = 0.0,
-        mask_image_path: str = "latentsync/utils/mask.png",
-        temp_dir: str = "temp",
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
-        callback_steps: Optional[int] = 1,
-        reference_embedding=None,
-        face_embedder=None,
-        apply_identity_filter: bool = False,
-        identity_similarity_threshold: float = 0.5,
-        # --- quality / temporal gating (added 2026-06) ---
-        temporal_smoothing_enabled: bool = True,
-        # Preserve current-frame mouth-core motion after temporal smoothing.
-        # 0 = fully smoothed mouth, 1 = keep generated current-frame mouth.
-        mouth_motion_preserve_strength: float = 0.45,
-        # Lightly stabilize mouth-core color/detail between consecutive valid
-        # generated frames to reduce flicker without freezing lip motion.
-        mouth_temporal_stabilization_strength: float = 0.15,
-        # If the current mouth core differs too much from the previous
-        # stabilized mouth, clear carry state instead of blending. This keeps
-        # stabilization from borrowing lips across speaker/shot changes that
-        # were not caught by geometry or identity continuity breaks.
-        mouth_temporal_stabilization_max_delta: float = 0.12,
-        # Audio-adaptive mouth motion: preserve more current generated mouth
-        # motion on high-energy speech frames and less on weak/silent frames.
-        mouth_audio_adaptive_motion_enabled: bool = True,
-        mouth_audio_motion_min_scale: float = 0.75,
-        mouth_audio_motion_max_scale: float = 1.20,
-        # Postfilter: skip frames where the generated mouth ROI is clearly
-        # blurrier than the original mouth ROI. Checked after paste/detail
-        # recovery, and conservative enough to keep closed/low-texture mouths.
-        quality_gate_enabled: bool = False,
-        quality_min_laplacian: float = 0.04,
-        quality_min_sharpness_ratio: float = 0.05,
-        quality_ref_min_laplacian: float = 1.00,
-        quality_max_fallback_ratio: float = 0.80,
-        # Adaptive composite quality fallback: after diffusion/post-processing,
-        # evaluate a per-frame quality score and fallback to the source frame
-        # when it is too low. Default off to preserve existing behavior.
-        adaptive_quality_fallback_enabled: bool = False,
-        adaptive_quality_fallback_threshold: float = 0.35,
-        adaptive_quality_fallback_max_ratio: float = 0.35,
-        adaptive_quality_fallback_hysteresis_frames: int = 2,
-        # Yaw-based prefilters for side faces / fast head turns. Defaults are
-        # intentionally permissive so clear frontal faces are not filtered out.
-        yaw_skip_threshold: float = 30.0,
-        yaw_rate_skip_threshold: float = 28.0,
-        # Aggressive side-face passthrough. When > 0 and < yaw_skip_threshold,
-        # frames with abs(yaw) in the band (passthrough_threshold, yaw_skip_threshold)
-        # are also marked as passthrough -- i.e. the diffusion inpainter is
-        # bypassed and the original frame is kept. Useful when "side-face residue
-        # ghost" artifacts dominate the output: setting 22.5 in effect says
-        # "don't try to inpaint any non-frontal face". 0 disables. Default 0
-        # preserves the historical "30° absolute only" behavior.
-        side_face_passthrough_yaw_threshold: float = 0.0,
-        # Episode-level side-face filter: when contiguous frames exceed
-        # yaw_skip_threshold, also skip pre_pad/post_pad transition frames
-        # around the episode (whose yaw is in the warn band between
-        # yaw_skip_threshold * yaw_warn_threshold_ratio and yaw_skip_threshold).
-        # Set pre_pad/post_pad to 0 to disable the padding.
-        side_face_episode_pre_pad: int = 3,
-        side_face_episode_post_pad: int = 3,
-        side_face_blend_fade_frames: int = 3,
-        yaw_warn_threshold_ratio: float = 0.75,
-        side_face_warn_min_run_frames: int = 0,
-        # Time-based alternative to ``side_face_warn_min_run_frames``.
-        # When > 0, a run of frames in the yaw warn band that lasts
-        # longer than this many seconds is marked as passthrough
-        # (the diffusion inpainter is bypassed, original frame is
-        # kept). Useful for "sustained side face -> don't try to
-        # inpaint" -- the operator picks a wall-clock duration
-        # instead of a frame count. 0 disables (the run-skip still
-        # respects ``min_run_frames``).
-        side_face_warn_min_run_seconds: float = 0.0,
-        # EMA alpha for the per-frame mouth_info (center + half-extents)
-        # used to draw the dynamic inpaint mask. 0.7 is the legacy
-        # default; bump toward 0.85-1.0 to fix individual frames whose
-        # inpaint region drifts off the mouth. Mirrors
-        # ``LipSyncRequest.aligned_mouth_ema_alpha``.
-        aligned_mouth_ema_alpha: float = 0.7,
-        # Mouth-occlusion prefilter: skip frames where the mouth is covered
-        # by a hand, microphone, phone, mask, etc. Score 0..1; above the
-        # threshold the frame is treated as not-lip-syncable and the original
-        # frame is used. Default 1.0 disables this heuristic because it was
-        # too sensitive on side/profile shots and could eat most frames.
-        mouth_occlusion_skip_threshold: float = 1.0,
-        # Motion-blur input filter: skip frames whose aligned face is too
-        # smeared to inpaint cleanly. Default 0.08 (Laplacian variance in
-        # the [-1, 1] face space; a sharp face scores ~5-20, a motion-blurred
-        # one <1.0). Set to 0 to disable.
-        motion_blur_skip_threshold: float = 0.08,
-        # Face-jump input filter: skip frames where landmark center/scale
-        # changes abruptly, which usually means detection/alignment jumped.
-        face_jump_center_threshold: float = 0.0,
-        face_jump_scale_threshold: float = 0.0,
-        # Temporal continuity break: clear EMA/mouth stabilization state
-        # across large landmark jumps without necessarily skipping the frame.
-        lipsync_continuity_max_center_shift: float = 0.35,
-        lipsync_continuity_max_scale_change: float = 0.35,
-        # Mouth-region pixel diff break: complementary to the embedding
-        # similarity check above. When the mouth region mean abs diff
-        # between consecutive aligned face crops exceeds this fraction,
-        # treat the next frame as a continuity break -- this catches
-        # face switches the embedding check misses (similar-looking
-        # people, side faces). 0 disables. Default 0.10 is well above
-        # same-person expression/pose diff (~0.02-0.05) and well below
-        # cross-person diff (~0.10-0.30).
-        lipsync_mouth_diff_break_threshold: float = 0.10,
-        # Minimum valid-run length (in source frames) used as the
-        # time-window merge radius for segment consistency. After
-        # the merge, two adjacent valid runs separated by a gap
-        # of <= this many frames are joined. Activates the
-        # previously dead ``LipSyncRequest.lipsync_min_segment_frames``
-        # field.
-        lipsync_min_segment_frames: int = 5,
-        # --- HeyGen-like segment consistency (MuseTalk 4b4987a) ---
-        # Refuse the time-window merge when a hard cut is detected
-        # in the gap, or when the track_id of the two valid runs
-        # disagrees (a speaker switch is never bridged by a short
-        # passthrough). After the merge, force any valid run shorter
-        # than ``min_merged_lipsync_seconds`` back to passthrough so
-        # the diffusion side never spends a few frames generating a
-        # face that immediately reverts to source.
-        segment_consistency_hard_cut_enabled: bool = True,
-        segment_consistency_hard_cut_distance_threshold: float = 0.65,
-        segment_consistency_track_aware: bool = True,
-        min_merged_lipsync_seconds: float = 1.5,
-        # Scene-cut guard: when adjacent source frames look like a hard cut,
-        # reset affine/temporal carry state before generating the new frame.
-        # This does not skip the frame; it only prevents the previous speaker
-        # or shot from leaking through EMA / mouth stabilization.
-        scene_cut_break_enabled: bool = True,
-        scene_cut_break_threshold: float = 0.45,
-        lipsync_min_face_area_ratio: float = 0.015,
-        # Shot-level passthrough guard: when enabled, any shot whose prefilter
-        # skip ratio is too high is kept entirely as source video. This avoids
-        # alternating generated/source frames inside side-face or fast-turn
-        # shots. Default off to preserve existing behavior.
-        shot_passthrough_enabled: bool = False,
-        shot_passthrough_skip_ratio_threshold: float = 0.45,
-        shot_passthrough_min_frames: int = 8,
-        shot_passthrough_min_bad_frames: int = 3,
-        # Scene-level split: detect scene boundaries and process each scene
-        # as an independent clip with clean temporal state, then concatenate.
-        scene_split_enabled: bool = False,
-        scene_split_threshold: float = 0.45,
-        # Audio-energy prefilter: skip sustained silent runs before diffusion.
-        silent_skip_enabled: bool = False,
-        silent_rms_threshold: float = 0.003,
-        silent_min_run_frames: int = 8,
-        silent_pad_frames: int = 0,
-        # Per-frame color transfer from generated to original (inside the
-        # mask). 0 = off, 1 = full mean+std match. Default 0.60.
-        color_match_strength: float = 0.60,
-        # Unsharp-mask amount applied to the generated mouth region.
-        # 0 = off, 1 = strong sharpen. Default 0.0.
-        mouth_sharpen_strength: float = 0.30,
-        # Original-detail restoration outside the central mouth-motion core.
-        # 0 = off, 1 = strong reference detail. Default 0.65.
-        mouth_detail_strength: float = 0.65,
-        # --- CodeFormer face-restoration postprocess (added 2026-06) ---
-        # When ``codeformer_restorer`` is provided and ``codeformer_enabled``
-        # is True, the pipeline runs the released CodeFormer model on every
-        # non-skipped aligned face crop right before pasting back to the
-        # full video. This sharpens the synthesized mouth and helps recover
-        # identity/edge detail that the diffusion inpainter tends to soften.
-        # Set ``codeformer_enabled=False`` to skip entirely; pass a
-        # :class:`CodeFormerRestorer` instance to actually invoke the model.
-        # Default fidelity_weight 0.7 (was 0.5): the README's 0.5 is
-        # balanced for real-degraded faces, but the inpainter's output
-        # is *generated* content -- at w=0.5 the codebook path tends
-        # to overwrite the lipsync result with a "more typical" face.
-        # 0.7 keeps more of the input, at a small cost in sharpness.
-        # The Tier 1/2/3 toggles below default to False here; the
-        # restorer reads them as per-call overrides of its own
-        # instance-level config. ``api.py`` is responsible for
-        # combining the per-request short-drama master switch with
-        # the per-tier toggles before passing them down.
-        codeformer_enabled: bool = False,
-        codeformer_fidelity_weight: float = 0.7,
-        codeformer_adain: bool = True,
-        codeformer_adaptive_w_enabled: bool = False,
-        codeformer_retry_enabled: bool = False,
-        codeformer_mouth_only_paste_enabled: bool = False,
-        codeformer_restorer=None,
-        # Post-CodeFormer cross-frame 1-order EMA on the restored face
-        # crops. CodeFormer itself is stateless per-frame, so a
-        # high-frequency flicker can persist across consecutive valid
-        # frames. This EMA dampens that flicker by blending each
-        # restored crop toward the previous one. Mirrors MuseTalk
-        # commit ce7b684 (``codeformer_temporal_alpha``). 0 disables.
-        # Track-aware mode (default True) refuses the mix across
-        # speaker/identity boundaries -- a track switch with EMA on
-        # would otherwise smear the old face onto the new identity for
-        # one frame. Falls back to adjacency-only when track_id is
-        # missing on either side.
-        codeformer_post_ema_alpha: float = 0.8,
-        codeformer_post_ema_track_aware: bool = True,
+        temp_dir: str,
         **kwargs,
-    ):
-        # Capture kwargs for potential per-scene recursive calls. Must be done
-        # before any new locals are introduced.
-        _recursion_excluded = {
-            "self", "video_path", "audio_path", "video_out_path", "scene_split_enabled", "kwargs"
-        }
-        _pipeline_kwargs = {k: v for k, v in locals().items() if k not in _recursion_excluded}
-        _extra_kwargs = dict(kwargs)
+    ) -> np.ndarray:
+        """Run the core lip-sync pipeline on an in-memory clip.
+
+        ``video_frames`` and ``audio_samples`` must cover the same time range.
+        ``whisper_chunks`` must be aligned to ``video_frames``. The method
+        returns the restored output frames and stashes per-clip stats in
+        ``self._last_run_stats``.
+        """
+        # Unpack kwargs with the same defaults as __call__.
+        num_frames = kwargs.get("num_frames", 16)
+        video_fps = kwargs.get("video_fps", 25)
+        audio_sample_rate = kwargs.get("audio_sample_rate", 16000)
+        audio_sync_offset_seconds = kwargs.get("audio_sync_offset_seconds", 0.0)
+        height = kwargs.get("height")
+        width = kwargs.get("width")
+        num_inference_steps = kwargs.get("num_inference_steps", 40)
+        guidance_scale = kwargs.get("guidance_scale", 1.5)
+        weight_dtype = kwargs.get("weight_dtype", torch.float16)
+        eta = kwargs.get("eta", 0.0)
+        mask_image_path = kwargs.get("mask_image_path", "latentsync/utils/mask.png")
+        generator = kwargs.get("generator")
+        callback = kwargs.get("callback")
+        callback_steps = kwargs.get("callback_steps", 1)
+        reference_embedding = kwargs.get("reference_embedding")
+        face_embedder = kwargs.get("face_embedder")
+        apply_identity_filter = kwargs.get("apply_identity_filter", False)
+        identity_similarity_threshold = kwargs.get("identity_similarity_threshold", 0.5)
+        temporal_smoothing_enabled = kwargs.get("temporal_smoothing_enabled", True)
+        mouth_motion_preserve_strength = kwargs.get("mouth_motion_preserve_strength", 0.45)
+        mouth_temporal_stabilization_strength = kwargs.get("mouth_temporal_stabilization_strength", 0.15)
+        mouth_temporal_stabilization_max_delta = kwargs.get("mouth_temporal_stabilization_max_delta", 0.12)
+        mouth_audio_adaptive_motion_enabled = kwargs.get("mouth_audio_adaptive_motion_enabled", True)
+        mouth_audio_motion_min_scale = kwargs.get("mouth_audio_motion_min_scale", 0.75)
+        mouth_audio_motion_max_scale = kwargs.get("mouth_audio_motion_max_scale", 1.20)
+        quality_gate_enabled = kwargs.get("quality_gate_enabled", False)
+        quality_min_laplacian = kwargs.get("quality_min_laplacian", 0.04)
+        quality_min_sharpness_ratio = kwargs.get("quality_min_sharpness_ratio", 0.05)
+        quality_ref_min_laplacian = kwargs.get("quality_ref_min_laplacian", 1.00)
+        quality_max_fallback_ratio = kwargs.get("quality_max_fallback_ratio", 0.80)
+        adaptive_quality_fallback_enabled = kwargs.get("adaptive_quality_fallback_enabled", False)
+        adaptive_quality_fallback_threshold = kwargs.get("adaptive_quality_fallback_threshold", 0.35)
+        adaptive_quality_fallback_max_ratio = kwargs.get("adaptive_quality_fallback_max_ratio", 0.35)
+        adaptive_quality_fallback_hysteresis_frames = kwargs.get("adaptive_quality_fallback_hysteresis_frames", 2)
+        yaw_skip_threshold = kwargs.get("yaw_skip_threshold", 30.0)
+        yaw_rate_skip_threshold = kwargs.get("yaw_rate_skip_threshold", 28.0)
+        side_face_passthrough_yaw_threshold = kwargs.get("side_face_passthrough_yaw_threshold", 0.0)
+        side_face_episode_pre_pad = kwargs.get("side_face_episode_pre_pad", 3)
+        side_face_episode_post_pad = kwargs.get("side_face_episode_post_pad", 3)
+        side_face_blend_fade_frames = kwargs.get("side_face_blend_fade_frames", 3)
+        yaw_warn_threshold_ratio = kwargs.get("yaw_warn_threshold_ratio", 0.75)
+        side_face_warn_min_run_frames = kwargs.get("side_face_warn_min_run_frames", 0)
+        side_face_warn_min_run_seconds = kwargs.get("side_face_warn_min_run_seconds", 0.0)
+        aligned_mouth_ema_alpha = kwargs.get("aligned_mouth_ema_alpha", 0.7)
+        mouth_occlusion_skip_threshold = kwargs.get("mouth_occlusion_skip_threshold", 1.0)
+        motion_blur_skip_threshold = kwargs.get("motion_blur_skip_threshold", 0.08)
+        face_jump_center_threshold = kwargs.get("face_jump_center_threshold", 0.0)
+        face_jump_scale_threshold = kwargs.get("face_jump_scale_threshold", 0.0)
+        lipsync_continuity_max_center_shift = kwargs.get("lipsync_continuity_max_center_shift", 0.35)
+        lipsync_continuity_max_scale_change = kwargs.get("lipsync_continuity_max_scale_change", 0.35)
+        lipsync_mouth_diff_break_threshold = kwargs.get("lipsync_mouth_diff_break_threshold", 0.10)
+        lipsync_min_segment_frames = kwargs.get("lipsync_min_segment_frames", 5)
+        segment_consistency_hard_cut_enabled = kwargs.get("segment_consistency_hard_cut_enabled", True)
+        segment_consistency_hard_cut_distance_threshold = kwargs.get("segment_consistency_hard_cut_distance_threshold", 0.65)
+        segment_consistency_track_aware = kwargs.get("segment_consistency_track_aware", True)
+        min_merged_lipsync_seconds = kwargs.get("min_merged_lipsync_seconds", 1.5)
+        scene_cut_break_enabled = kwargs.get("scene_cut_break_enabled", True)
+        scene_cut_break_threshold = kwargs.get("scene_cut_break_threshold", 0.45)
+        lipsync_min_face_area_ratio = kwargs.get("lipsync_min_face_area_ratio", 0.015)
+        shot_passthrough_enabled = kwargs.get("shot_passthrough_enabled", False)
+        shot_passthrough_skip_ratio_threshold = kwargs.get("shot_passthrough_skip_ratio_threshold", 0.45)
+        shot_passthrough_min_frames = kwargs.get("shot_passthrough_min_frames", 8)
+        shot_passthrough_min_bad_frames = kwargs.get("shot_passthrough_min_bad_frames", 3)
+        silent_skip_enabled = kwargs.get("silent_skip_enabled", False)
+        silent_rms_threshold = kwargs.get("silent_rms_threshold", 0.003)
+        silent_min_run_frames = kwargs.get("silent_min_run_frames", 8)
+        silent_pad_frames = kwargs.get("silent_pad_frames", 0)
+        color_match_strength = kwargs.get("color_match_strength", 0.60)
+        mouth_detail_strength = kwargs.get("mouth_detail_strength", 0.65)
+        mouth_sharpen_strength = kwargs.get("mouth_sharpen_strength", 0.30)
+        codeformer_enabled = kwargs.get("codeformer_enabled", False)
+        codeformer_fidelity_weight = kwargs.get("codeformer_fidelity_weight", 0.5)
+        codeformer_adain = kwargs.get("codeformer_adain", True)
+        codeformer_adaptive_w_enabled = kwargs.get("codeformer_adaptive_w_enabled", False)
+        codeformer_retry_enabled = kwargs.get("codeformer_retry_enabled", False)
+        codeformer_mouth_only_paste_enabled = kwargs.get("codeformer_mouth_only_paste_enabled", False)
+        codeformer_post_ema_alpha = kwargs.get("codeformer_post_ema_alpha", 0.8)
+        codeformer_post_ema_track_aware = kwargs.get("codeformer_post_ema_track_aware", True)
+        codeformer_restorer = kwargs.get("codeformer_restorer")
 
         is_train = self.unet.training
         self.unet.eval()
-
-        check_ffmpeg_installed()
 
         # 0. Define call parameters
         device = self._execution_device
@@ -3610,9 +3479,6 @@ class LipsyncPipeline(DiffusionPipeline):
         # 2. Check inputs
         self.check_inputs(height, width, callback_steps)
 
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. set timesteps
@@ -3621,104 +3487,6 @@ class LipsyncPipeline(DiffusionPipeline):
 
         # 4. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-
-        whisper_feature = self.audio_encoder.audio2feat(audio_path)
-        whisper_chunks = self.audio_encoder.feature2chunks(
-            feature_array=whisper_feature,
-            fps=video_fps,
-            offset_seconds=audio_sync_offset_seconds,
-        )
-        logger.info(
-            f"[LipSync] audio: whisper_chunks={len(whisper_chunks)}, video_fps={video_fps}, "
-            f"audio_sync_offset_seconds={audio_sync_offset_seconds}"
-        )
-
-        audio_samples = read_audio(audio_path)
-        # Shift output audio so the muxed result is actually in sync.
-        # Positive offset -> audio is ahead -> delay it by padding zeros at start.
-        if abs(audio_sync_offset_seconds) > 1e-6:
-            offset_samples = int(round(audio_sync_offset_seconds * audio_sample_rate))
-            if offset_samples > 0:
-                pad = torch.zeros(offset_samples, dtype=audio_samples.dtype, device=audio_samples.device)
-                audio_samples = torch.cat([pad, audio_samples[: -offset_samples]], dim=0)
-            elif offset_samples < 0:
-                offset_samples = -offset_samples
-                pad = torch.zeros(offset_samples, dtype=audio_samples.dtype, device=audio_samples.device)
-                audio_samples = torch.cat([audio_samples[offset_samples:], pad], dim=0)
-
-        video_frames = read_video(video_path, use_decord=False)
-        logger.info(f"[LipSync] video_frames shape={video_frames.shape}")
-
-        # Scene-level split: process each detected scene as an independent clip
-        # so temporal state (mouth EMA, yaw smoothing, affine bias, etc.) never
-        # leaks across scenes.
-        if scene_split_enabled and scene_split_threshold > 0.0 and len(video_frames) > 1:
-            source_scene_cut_after = self._compute_source_scene_cut_after(
-                video_frames, scene_split_threshold
-            )
-            scenes = self._split_scenes_from_cuts(source_scene_cut_after)
-            if len(scenes) > 1:
-                logger.info(
-                    f"[LipSync] scene_split enabled: detected {len(scenes)} scenes, "
-                    f"threshold={scene_split_threshold}"
-                )
-                scene_temp_dir = os.path.join(temp_dir, "scene_split")
-                os.makedirs(scene_temp_dir, exist_ok=True)
-
-                scene_stats_list = []
-                scene_output_paths = []
-                for scene_idx, (start_frame, end_frame) in enumerate(scenes):
-                    scene_video_path = os.path.join(scene_temp_dir, f"scene_{scene_idx:04d}_video.mp4")
-                    scene_audio_path = os.path.join(scene_temp_dir, f"scene_{scene_idx:04d}_audio.wav")
-                    scene_output_path = os.path.join(scene_temp_dir, f"scene_{scene_idx:04d}_output.mp4")
-                    scene_work_dir = os.path.join(scene_temp_dir, f"scene_{scene_idx:04d}_work")
-                    os.makedirs(scene_work_dir, exist_ok=True)
-
-                    scene_frames = video_frames[start_frame:end_frame]
-                    start_sample = int(round(start_frame * audio_sample_rate / video_fps))
-                    end_sample = int(round(end_frame * audio_sample_rate / video_fps))
-                    scene_audio = audio_samples[start_sample:end_sample]
-
-                    write_video(scene_video_path, scene_frames, fps=video_fps)
-                    sf.write(scene_audio_path, scene_audio.cpu().numpy(), audio_sample_rate)
-
-                    logger.info(
-                        f"[LipSync] processing scene {scene_idx + 1}/{len(scenes)}: "
-                        f"frames={start_frame}-{end_frame}, samples={start_sample}-{end_sample}"
-                    )
-                    self._reset_temporal_state()
-                    self.__call__(
-                        video_path=scene_video_path,
-                        audio_path=scene_audio_path,
-                        video_out_path=scene_output_path,
-                        scene_split_enabled=False,
-                        audio_sync_offset_seconds=0.0,
-                        temp_dir=scene_work_dir,
-                        **_pipeline_kwargs,
-                        **_extra_kwargs,
-                    )
-                    scene_output_paths.append(scene_output_path)
-                    scene_stats_list.append(getattr(self, "_last_run_stats", {}) or {})
-
-                # Concatenate per-scene outputs with ffmpeg concat demuxer.
-                concat_list_path = os.path.join(scene_temp_dir, "concat_list.txt")
-                with open(concat_list_path, "w") as f:
-                    for p in scene_output_paths:
-                        f.write(f"file '{os.path.abspath(p)}'\n")
-                concat_command = (
-                    f"ffmpeg -y -loglevel error -nostdin -f concat -safe 0 -i {concat_list_path} "
-                    f"-c copy {video_out_path}"
-                )
-                subprocess.run(concat_command, shell=True, check=True)
-
-                aggregated_stats = self._aggregate_scene_stats(scene_stats_list)
-                aggregated_stats["scene_split_enabled"] = True
-                aggregated_stats["scene_split_threshold"] = scene_split_threshold
-                aggregated_stats["scene_count"] = len(scenes)
-                aggregated_stats["scene_split_frames"] = [int(end) for _, end in scenes]
-                self._last_run_stats = aggregated_stats
-                logger.info(f"[LipSync] scene_split completed: output={video_out_path}")
-                return
 
         # Identity filtering is controlled by the apply_identity_filter flag.
         # When enabled and no avatar is provided, loop_video will auto-detect a
@@ -4611,6 +4379,379 @@ class LipsyncPipeline(DiffusionPipeline):
             "scene_count": 1,
             "scene_split_frames": [],
         }
+
+        return synced_video_frames
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        video_path: str,
+        audio_path: str,
+        video_out_path: str,
+        num_frames: int = 16,
+        video_fps: int = 25,
+        audio_sample_rate: int = 16000,
+        # Audio sync offset: positive means the provided audio is ahead of the
+        # video. We use earlier audio features to drive each frame, and delay
+        # the output audio by padding zeros at the start.
+        audio_sync_offset_seconds: float = 0.0,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 40,
+        guidance_scale: float = 1.5,
+        weight_dtype: Optional[torch.dtype] = torch.float16,
+        eta: float = 0.0,
+        mask_image_path: str = "latentsync/utils/mask.png",
+        temp_dir: str = "temp",
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: Optional[int] = 1,
+        reference_embedding=None,
+        face_embedder=None,
+        apply_identity_filter: bool = False,
+        identity_similarity_threshold: float = 0.5,
+        # --- quality / temporal gating (added 2026-06) ---
+        temporal_smoothing_enabled: bool = True,
+        # Preserve current-frame mouth-core motion after temporal smoothing.
+        # 0 = fully smoothed mouth, 1 = keep generated current-frame mouth.
+        mouth_motion_preserve_strength: float = 0.45,
+        # Lightly stabilize mouth-core color/detail between consecutive valid
+        # generated frames to reduce flicker without freezing lip motion.
+        mouth_temporal_stabilization_strength: float = 0.15,
+        # If the current mouth core differs too much from the previous
+        # stabilized mouth, clear carry state instead of blending. This keeps
+        # stabilization from borrowing lips across speaker/shot changes that
+        # were not caught by geometry or identity continuity breaks.
+        mouth_temporal_stabilization_max_delta: float = 0.12,
+        # Audio-adaptive mouth motion: preserve more current generated mouth
+        # motion on high-energy speech frames and less on weak/silent frames.
+        mouth_audio_adaptive_motion_enabled: bool = True,
+        mouth_audio_motion_min_scale: float = 0.75,
+        mouth_audio_motion_max_scale: float = 1.20,
+        # Postfilter: skip frames where the generated mouth ROI is clearly
+        # blurrier than the original mouth ROI. Checked after paste/detail
+        # recovery, and conservative enough to keep closed/low-texture mouths.
+        quality_gate_enabled: bool = False,
+        quality_min_laplacian: float = 0.04,
+        quality_min_sharpness_ratio: float = 0.05,
+        quality_ref_min_laplacian: float = 1.00,
+        quality_max_fallback_ratio: float = 0.80,
+        # Adaptive composite quality fallback: after diffusion/post-processing,
+        # evaluate a per-frame quality score and fallback to the source frame
+        # when it is too low. Default off to preserve existing behavior.
+        adaptive_quality_fallback_enabled: bool = False,
+        adaptive_quality_fallback_threshold: float = 0.35,
+        adaptive_quality_fallback_max_ratio: float = 0.35,
+        adaptive_quality_fallback_hysteresis_frames: int = 2,
+        # Yaw-based prefilters for side faces / fast head turns. Defaults are
+        # intentionally permissive so clear frontal faces are not filtered out.
+        yaw_skip_threshold: float = 30.0,
+        yaw_rate_skip_threshold: float = 28.0,
+        # Aggressive side-face passthrough. When > 0 and < yaw_skip_threshold,
+        # frames with abs(yaw) in the band (passthrough_threshold, yaw_skip_threshold)
+        # are also marked as passthrough -- i.e. the diffusion inpainter is
+        # bypassed and the original frame is kept. Useful when "side-face residue
+        # ghost" artifacts dominate the output: setting 22.5 in effect says
+        # "don't try to inpaint any non-frontal face". 0 disables. Default 0
+        # preserves the historical "30° absolute only" behavior.
+        side_face_passthrough_yaw_threshold: float = 0.0,
+        # Episode-level side-face filter: when contiguous frames exceed
+        # yaw_skip_threshold, also skip pre_pad/post_pad transition frames
+        # around the episode (whose yaw is in the warn band between
+        # yaw_skip_threshold * yaw_warn_threshold_ratio and yaw_skip_threshold).
+        # Set pre_pad/post_pad to 0 to disable the padding.
+        side_face_episode_pre_pad: int = 3,
+        side_face_episode_post_pad: int = 3,
+        side_face_blend_fade_frames: int = 3,
+        yaw_warn_threshold_ratio: float = 0.75,
+        side_face_warn_min_run_frames: int = 0,
+        # Time-based alternative to ``side_face_warn_min_run_frames``.
+        # When > 0, a run of frames in the yaw warn band that lasts
+        # longer than this many seconds is marked as passthrough
+        # (the diffusion inpainter is bypassed, original frame is
+        # kept). Useful for "sustained side face -> don't try to
+        # inpaint" -- the operator picks a wall-clock duration
+        # instead of a frame count. 0 disables (the run-skip still
+        # respects ``min_run_frames``).
+        side_face_warn_min_run_seconds: float = 0.0,
+        # EMA alpha for the per-frame mouth_info (center + half-extents)
+        # used to draw the dynamic inpaint mask. 0.7 is the legacy
+        # default; bump toward 0.85-1.0 to fix individual frames whose
+        # inpaint region drifts off the mouth. Mirrors
+        # ``LipSyncRequest.aligned_mouth_ema_alpha``.
+        aligned_mouth_ema_alpha: float = 0.7,
+        # Mouth-occlusion prefilter: skip frames where the mouth is covered
+        # by a hand, microphone, phone, mask, etc. Score 0..1; above the
+        # threshold the frame is treated as not-lip-syncable and the original
+        # frame is used. Default 1.0 disables this heuristic because it was
+        # too sensitive on side/profile shots and could eat most frames.
+        mouth_occlusion_skip_threshold: float = 1.0,
+        # Motion-blur input filter: skip frames whose aligned face is too
+        # smeared to inpaint cleanly. Default 0.08 (Laplacian variance in
+        # the [-1, 1] face space; a sharp face scores ~5-20, a motion-blurred
+        # one <1.0). Set to 0 to disable.
+        motion_blur_skip_threshold: float = 0.08,
+        # Face-jump input filter: skip frames where landmark center/scale
+        # changes abruptly, which usually means detection/alignment jumped.
+        face_jump_center_threshold: float = 0.0,
+        face_jump_scale_threshold: float = 0.0,
+        # Temporal continuity break: clear EMA/mouth stabilization state
+        # across large landmark jumps without necessarily skipping the frame.
+        lipsync_continuity_max_center_shift: float = 0.35,
+        lipsync_continuity_max_scale_change: float = 0.35,
+        # Mouth-region pixel diff break: complementary to the embedding
+        # similarity check above. When the mouth region mean abs diff
+        # between consecutive aligned face crops exceeds this fraction,
+        # treat the next frame as a continuity break -- this catches
+        # face switches the embedding check misses (similar-looking
+        # people, side faces). 0 disables. Default 0.10 is well above
+        # same-person expression/pose diff (~0.02-0.05) and well below
+        # cross-person diff (~0.10-0.30).
+        lipsync_mouth_diff_break_threshold: float = 0.10,
+        # Minimum valid-run length (in source frames) used as the
+        # time-window merge radius for segment consistency. After
+        # the merge, two adjacent valid runs separated by a gap
+        # of <= this many frames are joined. Activates the
+        # previously dead ``LipSyncRequest.lipsync_min_segment_frames``
+        # field.
+        lipsync_min_segment_frames: int = 5,
+        # --- HeyGen-like segment consistency (MuseTalk 4b4987a) ---
+        # Refuse the time-window merge when a hard cut is detected
+        # in the gap, or when the track_id of the two valid runs
+        # disagrees (a speaker switch is never bridged by a short
+        # passthrough). After the merge, force any valid run shorter
+        # than ``min_merged_lipsync_seconds`` back to passthrough so
+        # the diffusion side never spends a few frames generating a
+        # face that immediately reverts to source.
+        segment_consistency_hard_cut_enabled: bool = True,
+        segment_consistency_hard_cut_distance_threshold: float = 0.65,
+        segment_consistency_track_aware: bool = True,
+        min_merged_lipsync_seconds: float = 1.5,
+        # Scene-cut guard: when adjacent source frames look like a hard cut,
+        # reset affine/temporal carry state before generating the new frame.
+        # This does not skip the frame; it only prevents the previous speaker
+        # or shot from leaking through EMA / mouth stabilization.
+        scene_cut_break_enabled: bool = True,
+        scene_cut_break_threshold: float = 0.45,
+        lipsync_min_face_area_ratio: float = 0.015,
+        # Shot-level passthrough guard: when enabled, any shot whose prefilter
+        # skip ratio is too high is kept entirely as source video. This avoids
+        # alternating generated/source frames inside side-face or fast-turn
+        # shots. Default off to preserve existing behavior.
+        shot_passthrough_enabled: bool = False,
+        shot_passthrough_skip_ratio_threshold: float = 0.45,
+        shot_passthrough_min_frames: int = 8,
+        shot_passthrough_min_bad_frames: int = 3,
+        # Scene-level split: detect scene boundaries and process each scene
+        # as an independent clip with clean temporal state, then concatenate.
+        scene_split_enabled: bool = False,
+        scene_split_threshold: float = 0.45,
+        # Audio-energy prefilter: skip sustained silent runs before diffusion.
+        silent_skip_enabled: bool = False,
+        silent_rms_threshold: float = 0.003,
+        silent_min_run_frames: int = 8,
+        silent_pad_frames: int = 0,
+        # Per-frame color transfer from generated to original (inside the
+        # mask). 0 = off, 1 = full mean+std match. Default 0.60.
+        color_match_strength: float = 0.60,
+        # Unsharp-mask amount applied to the generated mouth region.
+        # 0 = off, 1 = strong sharpen. Default 0.0.
+        mouth_sharpen_strength: float = 0.30,
+        # Original-detail restoration outside the central mouth-motion core.
+        # 0 = off, 1 = strong reference detail. Default 0.65.
+        mouth_detail_strength: float = 0.65,
+        # --- CodeFormer face-restoration postprocess (added 2026-06) ---
+        # When ``codeformer_restorer`` is provided and ``codeformer_enabled``
+        # is True, the pipeline runs the released CodeFormer model on every
+        # non-skipped aligned face crop right before pasting back to the
+        # full video. This sharpens the synthesized mouth and helps recover
+        # identity/edge detail that the diffusion inpainter tends to soften.
+        # Set ``codeformer_enabled=False`` to skip entirely; pass a
+        # :class:`CodeFormerRestorer` instance to actually invoke the model.
+        # Default fidelity_weight 0.7 (was 0.5): the README's 0.5 is
+        # balanced for real-degraded faces, but the inpainter's output
+        # is *generated* content -- at w=0.5 the codebook path tends
+        # to overwrite the lipsync result with a "more typical" face.
+        # 0.7 keeps more of the input, at a small cost in sharpness.
+        # The Tier 1/2/3 toggles below default to False here; the
+        # restorer reads them as per-call overrides of its own
+        # instance-level config. ``api.py`` is responsible for
+        # combining the per-request short-drama master switch with
+        # the per-tier toggles before passing them down.
+        codeformer_enabled: bool = False,
+        codeformer_fidelity_weight: float = 0.7,
+        codeformer_adain: bool = True,
+        codeformer_adaptive_w_enabled: bool = False,
+        codeformer_retry_enabled: bool = False,
+        codeformer_mouth_only_paste_enabled: bool = False,
+        codeformer_restorer=None,
+        # Post-CodeFormer cross-frame 1-order EMA on the restored face
+        # crops. CodeFormer itself is stateless per-frame, so a
+        # high-frequency flicker can persist across consecutive valid
+        # frames. This EMA dampens that flicker by blending each
+        # restored crop toward the previous one. Mirrors MuseTalk
+        # commit ce7b684 (``codeformer_temporal_alpha``). 0 disables.
+        # Track-aware mode (default True) refuses the mix across
+        # speaker/identity boundaries -- a track switch with EMA on
+        # would otherwise smear the old face onto the new identity for
+        # one frame. Falls back to adjacency-only when track_id is
+        # missing on either side.
+        codeformer_post_ema_alpha: float = 0.8,
+        codeformer_post_ema_track_aware: bool = True,
+        **kwargs,
+    ):
+        is_train = self.unet.training
+        self.unet.eval()
+
+        check_ffmpeg_installed()
+
+        # 0. Define call parameters
+        device = self._execution_device
+        mask_image = load_fixed_mask(height, mask_image_path)
+        self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
+        if face_embedder is not None:
+            self.image_processor.set_face_embedder(face_embedder)
+            logger.info(f"[LipSync] Set face_embedder on ImageProcessor for face matching")
+        self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
+
+        # 1. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        # 2. Check inputs
+        self.check_inputs(height, width, callback_steps)
+
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # 3. set timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        # 4. Prepare extra step kwargs.
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+        whisper_feature = self.audio_encoder.audio2feat(audio_path)
+        whisper_chunks = self.audio_encoder.feature2chunks(
+            feature_array=whisper_feature,
+            fps=video_fps,
+            offset_seconds=audio_sync_offset_seconds,
+        )
+        logger.info(
+            f"[LipSync] audio: whisper_chunks={len(whisper_chunks)}, video_fps={video_fps}, "
+            f"audio_sync_offset_seconds={audio_sync_offset_seconds}"
+        )
+
+        audio_samples = read_audio(audio_path)
+        # Shift output audio so the muxed result is actually in sync.
+        # Positive offset -> audio is ahead -> delay it by padding zeros at start.
+        if abs(audio_sync_offset_seconds) > 1e-6:
+            offset_samples = int(round(audio_sync_offset_seconds * audio_sample_rate))
+            if offset_samples > 0:
+                pad = torch.zeros(offset_samples, dtype=audio_samples.dtype, device=audio_samples.device)
+                audio_samples = torch.cat([pad, audio_samples[: -offset_samples]], dim=0)
+            elif offset_samples < 0:
+                offset_samples = -offset_samples
+                pad = torch.zeros(offset_samples, dtype=audio_samples.dtype, device=audio_samples.device)
+                audio_samples = torch.cat([audio_samples[offset_samples:], pad], dim=0)
+
+        video_frames = read_video(video_path, use_decord=False)
+        logger.info(f"[LipSync] video_frames shape={video_frames.shape}")
+
+        # Build kwargs dict for _process_clip from current locals.
+        _process_clip_kwargs = {k: v for k, v in locals().items() if k not in {
+            "self", "video_path", "audio_path", "video_out_path", "scene_split_enabled",
+            "scene_split_threshold", "temp_dir", "video_frames", "audio_samples",
+            "whisper_chunks", "whisper_feature", "is_train", "kwargs"
+        }}
+        _process_clip_kwargs.update(kwargs)
+
+        if scene_split_enabled and scene_split_threshold > 0.0 and len(video_frames) > 1:
+            source_scene_cut_after = self._compute_source_scene_cut_after(
+                video_frames, scene_split_threshold
+            )
+            scenes = self._split_scenes_from_cuts(source_scene_cut_after)
+            if len(scenes) > 1:
+                logger.info(
+                    f"[LipSync] scene_split enabled: detected {len(scenes)} scenes, "
+                    f"threshold={scene_split_threshold}"
+                )
+
+                scene_stats_list = []
+                scene_output_frames = []
+                for scene_idx, (start_frame, end_frame) in enumerate(scenes):
+                    scene_frames = video_frames[start_frame:end_frame]
+                    scene_chunks = whisper_chunks[start_frame:end_frame]
+                    scene_audio = audio_samples[
+                        int(round(start_frame * audio_sample_rate / video_fps)):
+                        int(round(end_frame * audio_sample_rate / video_fps))
+                    ]
+
+                    logger.info(
+                        f"[LipSync] processing scene {scene_idx + 1}/{len(scenes)}: "
+                        f"frames={start_frame}-{end_frame}"
+                    )
+                    self._reset_temporal_state()
+                    scene_output = self._process_clip(
+                        video_frames=scene_frames,
+                        audio_samples=scene_audio,
+                        whisper_chunks=scene_chunks,
+                        video_out_path=video_out_path,
+                        temp_dir=temp_dir,
+                        **_process_clip_kwargs,
+                    )
+                    scene_output_frames.append(scene_output)
+                    scene_stats_list.append(getattr(self, "_last_run_stats", {}) or {})
+
+                synced_video_frames = np.concatenate(scene_output_frames, axis=0)
+                aggregated_stats = self._aggregate_scene_stats(scene_stats_list)
+                aggregated_stats["scene_split_enabled"] = True
+                aggregated_stats["scene_split_threshold"] = scene_split_threshold
+                aggregated_stats["scene_count"] = len(scenes)
+                aggregated_stats["scene_split_frames"] = [int(end) for _, end in scenes]
+                self._last_run_stats = aggregated_stats
+                logger.info(f"[LipSync] scene_split completed: {len(scenes)} scenes concatenated")
+            else:
+                synced_video_frames = self._process_clip(
+                    video_frames=video_frames,
+                    audio_samples=audio_samples,
+                    whisper_chunks=whisper_chunks,
+                    video_out_path=video_out_path,
+                    temp_dir=temp_dir,
+                    **_process_clip_kwargs,
+                )
+                self._last_run_stats["scene_split_enabled"] = False
+                self._last_run_stats["scene_split_threshold"] = scene_split_threshold
+                self._last_run_stats["scene_count"] = 1
+                self._last_run_stats["scene_split_frames"] = []
+        else:
+            synced_video_frames = self._process_clip(
+                video_frames=video_frames,
+                audio_samples=audio_samples,
+                whisper_chunks=whisper_chunks,
+                video_out_path=video_out_path,
+                temp_dir=temp_dir,
+                **_process_clip_kwargs,
+            )
+            self._last_run_stats["scene_split_enabled"] = False
+            self._last_run_stats["scene_split_threshold"] = scene_split_threshold
+            self._last_run_stats["scene_count"] = 1
+            self._last_run_stats["scene_split_frames"] = []
+
+        output_frame_count = synced_video_frames.shape[0]
+        audio_samples_remain_length = int(output_frame_count / video_fps * audio_sample_rate)
+        audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
+
+        if is_train:
+            self.unet.train()
+
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
+
+        write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps)
 
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
