@@ -5,6 +5,7 @@ import math
 import os
 import shutil
 import statistics
+import time
 from typing import Callable, List, Optional, Union
 import subprocess
 
@@ -3174,11 +3175,14 @@ class LipsyncPipeline(DiffusionPipeline):
 
     def _reset_temporal_state(self) -> None:
         """Reset cross-frame temporal state so the next clip starts fresh."""
-        if (
-            self.image_processor is not None
-            and getattr(self.image_processor, "restorer", None) is not None
-        ):
-            self.image_processor.restorer.reset_p_bias()
+        if self.image_processor is not None:
+            if getattr(self.image_processor, "restorer", None) is not None:
+                self.image_processor.restorer.reset_p_bias()
+            # Cached bbox from the previous clip should not influence face
+            # detection/tracking in the next scene.
+            self.image_processor.last_source_bbox = None
+            if getattr(self.image_processor, "face_detector", None) is not None:
+                self.image_processor.face_detector.last_pose_yaw = None
         # Clear any cached per-clip stats so they don't leak into the next scene.
         for attr in list(vars(self).keys()):
             if attr.startswith("_last_") and attr != "_last_run_stats":
@@ -3368,8 +3372,6 @@ class LipsyncPipeline(DiffusionPipeline):
         video_frames: np.ndarray,
         audio_samples: torch.Tensor,
         whisper_chunks: list,
-        video_out_path: str,
-        temp_dir: str,
         **kwargs,
     ) -> np.ndarray:
         """Run the core lip-sync pipeline on an in-memory clip.
@@ -3461,21 +3463,19 @@ class LipsyncPipeline(DiffusionPipeline):
         codeformer_post_ema_track_aware = kwargs.get("codeformer_post_ema_track_aware", True)
         codeformer_restorer = kwargs.get("codeformer_restorer")
 
-        is_train = self.unet.training
-        self.unet.eval()
-
-        # 0. Define call parameters
-        device = self._execution_device
-        mask_image = load_fixed_mask(height, mask_image_path)
-        self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
-        if face_embedder is not None:
-            self.image_processor.set_face_embedder(face_embedder)
-            logger.info(f"[LipSync] Set face_embedder on ImageProcessor for face matching")
-        self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
-
-        # 1. Default height and width to unet
+        # 0/1/2. Resolve height/width and ensure ImageProcessor exists.
+        # When called from __call__ the processor is already created once and
+        # shared across scenes to avoid reloading the face detector each time.
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
+        current_processor = getattr(self, "image_processor", None)
+        if getattr(current_processor, "resolution", None) != height:
+            mask_image = load_fixed_mask(height, mask_image_path)
+            self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
+            if face_embedder is not None:
+                self.image_processor.set_face_embedder(face_embedder)
+                logger.info(f"[LipSync] Set face_embedder on ImageProcessor for face matching")
+        self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
         # 2. Check inputs
         self.check_inputs(height, width, callback_steps)
@@ -4245,19 +4245,6 @@ class LipsyncPipeline(DiffusionPipeline):
             )
             logger.info(f"[LipSync] restored video frames shape={synced_video_frames.shape}")
 
-        output_frame_count = len(source_indices) if source_indices else synced_video_frames.shape[0]
-        audio_samples_remain_length = int(output_frame_count / video_fps * audio_sample_rate)
-        audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
-
-        if is_train:
-            self.unet.train()
-
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-        os.makedirs(temp_dir, exist_ok=True)
-
-        write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps)
-
         # Stash stats for the API layer to read (synthesize() consumes this).
         self._last_run_stats = {
             "source_frame_count": int(len(effective_skip_mask)),
@@ -4604,35 +4591,21 @@ class LipsyncPipeline(DiffusionPipeline):
         is_train = self.unet.training
         self.unet.eval()
 
+        pipeline_start_time = time.perf_counter()
+
         check_ffmpeg_installed()
 
-        # 0. Define call parameters
-        device = self._execution_device
+        # Resolve height/width once and create a single ImageProcessor shared
+        # across all scenes. Re-creating it per scene would reload the face
+        # detector model repeatedly, which is expensive.
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
         mask_image = load_fixed_mask(height, mask_image_path)
         self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
         if face_embedder is not None:
             self.image_processor.set_face_embedder(face_embedder)
             logger.info(f"[LipSync] Set face_embedder on ImageProcessor for face matching")
         self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
-
-        # 1. Default height and width to unet
-        height = height or self.unet.config.sample_size * self.vae_scale_factor
-        width = width or self.unet.config.sample_size * self.vae_scale_factor
-
-        # 2. Check inputs
-        self.check_inputs(height, width, callback_steps)
-
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
-        do_classifier_free_guidance = guidance_scale > 1.0
-
-        # 3. set timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
-
-        # 4. Prepare extra step kwargs.
-        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         whisper_feature = self.audio_encoder.audio2feat(audio_path)
         whisper_chunks = self.audio_encoder.feature2chunks(
@@ -4659,7 +4632,11 @@ class LipsyncPipeline(DiffusionPipeline):
                 audio_samples = torch.cat([audio_samples[offset_samples:], pad], dim=0)
 
         video_frames = read_video(video_path, use_decord=False)
-        logger.info(f"[LipSync] video_frames shape={video_frames.shape}")
+        input_duration_seconds = float(video_frames.shape[0]) / max(float(video_fps), 1e-6)
+        logger.info(
+            f"[LipSync] video_frames shape={video_frames.shape}, "
+            f"input_duration={input_duration_seconds:.3f}s"
+        )
 
         # Build kwargs dict for _process_clip from current locals.
         _process_clip_kwargs = {k: v for k, v in locals().items() if k not in {
@@ -4690,6 +4667,7 @@ class LipsyncPipeline(DiffusionPipeline):
                         int(round(end_frame * audio_sample_rate / video_fps))
                     ]
 
+                    scene_start_time = time.perf_counter()
                     logger.info(
                         f"[LipSync] processing scene {scene_idx + 1}/{len(scenes)}: "
                         f"frames={start_frame}-{end_frame}"
@@ -4699,12 +4677,16 @@ class LipsyncPipeline(DiffusionPipeline):
                         video_frames=scene_frames,
                         audio_samples=scene_audio,
                         whisper_chunks=scene_chunks,
-                        video_out_path=video_out_path,
-                        temp_dir=temp_dir,
                         **_process_clip_kwargs,
                     )
+                    scene_duration = time.perf_counter() - scene_start_time
                     scene_output_frames.append(scene_output)
                     scene_stats_list.append(getattr(self, "_last_run_stats", {}) or {})
+                    logger.info(
+                        f"[LipSync] scene {scene_idx + 1}/{len(scenes)} done: "
+                        f"scene_duration={scene_duration:.3f}s, "
+                        f"scene_frames={scene_output.shape[0]}"
+                    )
 
                 synced_video_frames = np.concatenate(scene_output_frames, axis=0)
                 aggregated_stats = self._aggregate_scene_stats(scene_stats_list)
@@ -4719,8 +4701,6 @@ class LipsyncPipeline(DiffusionPipeline):
                     video_frames=video_frames,
                     audio_samples=audio_samples,
                     whisper_chunks=whisper_chunks,
-                    video_out_path=video_out_path,
-                    temp_dir=temp_dir,
                     **_process_clip_kwargs,
                 )
                 self._last_run_stats["scene_split_enabled"] = False
@@ -4732,8 +4712,6 @@ class LipsyncPipeline(DiffusionPipeline):
                 video_frames=video_frames,
                 audio_samples=audio_samples,
                 whisper_chunks=whisper_chunks,
-                video_out_path=video_out_path,
-                temp_dir=temp_dir,
                 **_process_clip_kwargs,
             )
             self._last_run_stats["scene_split_enabled"] = False
@@ -4758,3 +4736,11 @@ class LipsyncPipeline(DiffusionPipeline):
 
         command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
         subprocess.run(command, shell=True)
+
+        execution_duration_seconds = time.perf_counter() - pipeline_start_time
+        logger.info(
+            f"[LipSync] completed: input_duration={input_duration_seconds:.3f}s, "
+            f"execution_duration={execution_duration_seconds:.3f}s, "
+            f"realtime_factor={input_duration_seconds / max(execution_duration_seconds, 1e-6):.3f}x, "
+            f"output_path={video_out_path}"
+        )
