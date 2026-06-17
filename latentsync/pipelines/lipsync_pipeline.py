@@ -3506,6 +3506,17 @@ class LipsyncPipeline(DiffusionPipeline):
         codeformer_post_ema_track_aware = kwargs.get("codeformer_post_ema_track_aware", True)
         codeformer_restorer = kwargs.get("codeformer_restorer")
 
+        # Guard against empty clips. This can happen when scene splitting produces
+        # an out-of-bounds or zero-length scene (e.g. audio features shorter than
+        # video frames), and prevents the downstream torch.cat from crashing.
+        if video_frames is None or len(video_frames) == 0 or len(whisper_chunks) == 0:
+            logger.warning(
+                f"[LipSync] _process_clip received empty clip: "
+                f"video_frames={getattr(video_frames, 'shape', None)}, "
+                f"whisper_chunks={len(whisper_chunks)}; returning empty output"
+            )
+            return video_frames[:0] if video_frames is not None else np.array([])
+
         # 0/1/2. Resolve height/width and ensure ImageProcessor exists.
         # When called from __call__ the processor is already created once and
         # shared across scenes to avoid reloading the face detector each time.
@@ -4702,6 +4713,26 @@ class LipsyncPipeline(DiffusionPipeline):
                 scenes = self._merge_short_scenes(
                     scenes, float(video_fps), min_scene_duration_seconds
                 )
+
+            # Defensive: clamp scene ranges to the actual video/audio length and
+            # drop any empty scenes. This prevents _process_clip from receiving a
+            # zero-frame clip (which crashes on torch.cat) if the scene detector
+            # produces an out-of-bounds or zero-length range, or if audio features
+            # are shorter than the video frames.
+            total_frames = min(len(video_frames), len(whisper_chunks))
+            validated_scenes: List[Tuple[int, int]] = []
+            for start_frame, end_frame in scenes:
+                start_frame = max(0, min(start_frame, total_frames))
+                end_frame = max(start_frame, min(end_frame, total_frames))
+                if end_frame > start_frame:
+                    validated_scenes.append((start_frame, end_frame))
+                else:
+                    logger.warning(
+                        f"[LipSync] dropping empty/invalid scene after merge: "
+                        f"({start_frame}, {end_frame}) outside [0, {total_frames})"
+                    )
+            scenes = validated_scenes
+
             if len(scenes) > 1:
                 scene_durations = [
                     float(end_frame - start_frame) / max(float(video_fps), 1e-6)
@@ -4722,6 +4753,21 @@ class LipsyncPipeline(DiffusionPipeline):
                         int(round(start_frame * audio_sample_rate / video_fps)):
                         int(round(end_frame * audio_sample_rate / video_fps))
                     ]
+                    if scene_frames.size == 0:
+                        logger.warning(
+                            f"[LipSync] skipping empty scene {scene_idx + 1}/{len(scenes)}: "
+                            f"frames={start_frame}-{end_frame}, "
+                            f"scene_frames={scene_frames.shape}"
+                        )
+                        continue
+                    if len(scene_chunks) == 0:
+                        logger.warning(
+                            f"[LipSync] scene {scene_idx + 1}/{len(scenes)} has no audio features; "
+                            f"passing through original frames {start_frame}-{end_frame}"
+                        )
+                        scene_output_frames.append(scene_frames)
+                        scene_stats_list.append({})
+                        continue
 
                     scene_start_time = time.perf_counter()
                     logger.info(
