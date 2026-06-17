@@ -617,6 +617,41 @@ class LipsyncPipeline(DiffusionPipeline):
             return 0.0
 
     @staticmethod
+    def _compute_source_scene_cut_after(
+        source_frames: np.ndarray,
+        threshold: float,
+    ) -> List[bool]:
+        """Return flags for hard cuts between source frame k and k+1."""
+        if source_frames is None or len(source_frames) < 2 or threshold <= 0.0:
+            return [False] * max(0, 0 if source_frames is None else len(source_frames) - 1)
+        cuts: List[bool] = []
+        for idx in range(len(source_frames) - 1):
+            score = LipsyncPipeline._source_frame_scene_cut_score(
+                source_frames[idx], source_frames[idx + 1]
+            )
+            cuts.append(score > threshold)
+        return cuts
+
+    @staticmethod
+    def _is_scene_boundary_between_source_indices(
+        prev_source_idx: int,
+        curr_source_idx: int,
+        source_scene_cut_after: Optional[List[bool]],
+    ) -> bool:
+        """True when adjacent output frames cross a source scene boundary."""
+        if not source_scene_cut_after:
+            return False
+        try:
+            a = int(prev_source_idx)
+            b = int(curr_source_idx)
+        except Exception:
+            return False
+        if abs(a - b) != 1:
+            return False
+        cut_idx = min(a, b)
+        return 0 <= cut_idx < len(source_scene_cut_after) and bool(source_scene_cut_after[cut_idx])
+
+    @staticmethod
     def _apply_shot_passthrough_guard(
         skip_mask: List[bool],
         continuity_break_mask: List[bool],
@@ -626,6 +661,7 @@ class LipsyncPipeline(DiffusionPipeline):
         skip_ratio_threshold: float,
         min_shot_frames: int,
         min_bad_frames: int,
+        source_scene_cut_after: Optional[List[bool]] = None,
     ) -> Dict[str, int]:
         """Force a whole shot to passthrough when too many frames are bad.
 
@@ -664,14 +700,26 @@ class LipsyncPipeline(DiffusionPipeline):
                 return None
             return source_frames[src_idx]
 
+        if source_scene_cut_after is None:
+            source_scene_cut_after = LipsyncPipeline._compute_source_scene_cut_after(
+                source_frames, scene_cut_threshold,
+            )
+
         shot_starts = [0]
+        prev_source_idx = source_indices[0] if source_indices else 0
         prev = source_frame_at(0)
         for idx in range(1, n):
+            curr_source_idx = source_indices[idx] if idx < len(source_indices) else idx
             curr = source_frame_at(idx)
-            if prev is not None and curr is not None:
+            if LipsyncPipeline._is_scene_boundary_between_source_indices(
+                prev_source_idx, curr_source_idx, source_scene_cut_after,
+            ):
+                shot_starts.append(idx)
+            elif prev is not None and curr is not None and not source_scene_cut_after:
                 score = LipsyncPipeline._source_frame_scene_cut_score(prev, curr)
                 if score > scene_cut_threshold:
                     shot_starts.append(idx)
+            prev_source_idx = curr_source_idx
             prev = curr
         shot_starts.append(n)
 
@@ -695,6 +743,100 @@ class LipsyncPipeline(DiffusionPipeline):
                 stats["shots"] += 1
                 stats["frames"] += newly_skipped
         return stats
+
+    @staticmethod
+    def _build_shot_routing_manifest(
+        effective_skip_mask: List[bool],
+        source_indices: List[int],
+        source_scene_cut_after: Optional[List[bool]],
+        fps: float,
+        pre_skip_mask: Optional[List[bool]] = None,
+        quality_skip_mask: Optional[List[bool]] = None,
+        adaptive_quality_skip_mask: Optional[List[bool]] = None,
+        silent_skip_mask: Optional[List[bool]] = None,
+    ) -> Dict[str, object]:
+        """Summarize output shots for an upstream smart-routing orchestrator."""
+        n = len(effective_skip_mask)
+        if n == 0:
+            return {
+                "shots_total": 0,
+                "latentsync_shots": 0,
+                "passthrough_shots": 0,
+                "mixed_shots": 0,
+                "shots": [],
+            }
+        if not source_indices:
+            source_indices = list(range(n))
+        if len(source_indices) < n:
+            source_indices = source_indices + list(range(len(source_indices), n))
+
+        starts = [0]
+        prev_source_idx = source_indices[0]
+        for idx in range(1, n):
+            curr_source_idx = source_indices[idx]
+            if LipsyncPipeline._is_scene_boundary_between_source_indices(
+                prev_source_idx, curr_source_idx, source_scene_cut_after,
+            ):
+                starts.append(idx)
+            prev_source_idx = curr_source_idx
+        starts.append(n)
+
+        def _count(mask: Optional[List[bool]], start: int, end: int) -> int:
+            if not mask:
+                return 0
+            return sum(1 for k in range(start, min(end, len(mask))) if mask[k])
+
+        shots = []
+        latentsync_shots = 0
+        passthrough_shots = 0
+        mixed_shots = 0
+        for shot_index, (start, end) in enumerate(zip(starts, starts[1:]), start=1):
+            total = end - start
+            passthrough = sum(1 for k in range(start, end) if effective_skip_mask[k])
+            generated = total - passthrough
+            if generated == 0:
+                route = "passthrough"
+                passthrough_shots += 1
+            elif passthrough == 0:
+                route = "latentsync"
+                latentsync_shots += 1
+            else:
+                route = "mixed"
+                mixed_shots += 1
+
+            reason_counts = {
+                "prefilter": _count(pre_skip_mask, start, end),
+                "quality": _count(quality_skip_mask, start, end),
+                "adaptive_quality": _count(adaptive_quality_skip_mask, start, end),
+                "silent": _count(silent_skip_mask, start, end),
+            }
+            dominant_reason = "generated"
+            if passthrough:
+                dominant_reason = max(reason_counts.items(), key=lambda item: item[1])[0]
+                if reason_counts.get(dominant_reason, 0) <= 0:
+                    dominant_reason = "passthrough"
+            shots.append({
+                "shot_index": shot_index,
+                "start_frame": int(start),
+                "end_frame": int(end - 1),
+                "start_seconds": float(start / fps) if fps > 0 else 0.0,
+                "end_seconds": float(end / fps) if fps > 0 else 0.0,
+                "frame_count": int(total),
+                "route": route,
+                "dominant_reason": dominant_reason,
+                "generated_frames": int(generated),
+                "passthrough_frames": int(passthrough),
+                "passthrough_ratio": float(passthrough / max(1, total)),
+                "reason_counts": reason_counts,
+            })
+
+        return {
+            "shots_total": int(len(shots)),
+            "latentsync_shots": int(latentsync_shots),
+            "passthrough_shots": int(passthrough_shots),
+            "mixed_shots": int(mixed_shots),
+            "shots": shots,
+        }
 
     @staticmethod
     def _tensor_face_to_bgr_uint8(face: torch.Tensor) -> Optional[np.ndarray]:
@@ -1959,6 +2101,7 @@ class LipsyncPipeline(DiffusionPipeline):
         min_merged_lipsync_seconds: float = 1.5,
         scene_cut_break_enabled: bool = True,
         scene_cut_break_threshold: float = 0.45,
+        lipsync_min_face_area_ratio: float = 0.015,
         identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 3,
@@ -1995,6 +2138,7 @@ class LipsyncPipeline(DiffusionPipeline):
             f"lipsync_mouth_diff_break_threshold={lipsync_mouth_diff_break_threshold}, "
             f"scene_cut_break_enabled={scene_cut_break_enabled}, "
             f"scene_cut_break_threshold={scene_cut_break_threshold}, "
+            f"lipsync_min_face_area_ratio={lipsync_min_face_area_ratio}, "
             f"identity_similarity_threshold={identity_similarity_threshold}, "
             f"apply_identity_filter={apply_identity_filter}, "
             f"side_face_episode_pre_pad={side_face_episode_pre_pad}, "
@@ -2052,6 +2196,7 @@ class LipsyncPipeline(DiffusionPipeline):
         temporal_geometry_break_count = 0
         temporal_diff_break_count = 0
         scene_cut_break_count = 0
+        small_face_skip_count = 0
         identity_skip_count = 0
         detect_fail_count = 0
         identity_similarities: List[float] = []
@@ -2063,12 +2208,15 @@ class LipsyncPipeline(DiffusionPipeline):
         prev_mouth_info: Optional[Dict[str, float]] = None
         prev_track_id: Optional[int] = None
         continuity_break_mask = []
+        source_scene_cut_after = self._compute_source_scene_cut_after(
+            video_frames,
+            scene_cut_break_threshold if scene_cut_break_enabled else 0.0,
+        )
         print(f"Affine transforming {len(video_frames)} faces...")
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
             scene_cut_break = False
             if scene_cut_break_enabled and scene_cut_break_threshold > 0 and idx > 0:
-                scene_cut_score = self._source_frame_scene_cut_score(video_frames[idx - 1], frame)
-                if scene_cut_score > scene_cut_break_threshold:
+                if idx - 1 < len(source_scene_cut_after) and source_scene_cut_after[idx - 1]:
                     scene_cut_break = True
                     scene_cut_break_count += 1
                     self.image_processor.restorer.reset_p_bias()
@@ -2109,6 +2257,17 @@ class LipsyncPipeline(DiffusionPipeline):
                 continue
             should_skip = False
             frame_identity_sim = None
+            if lipsync_min_face_area_ratio > 0:
+                try:
+                    frame_h, frame_w = frame.shape[:2]
+                    x1, y1, x2, y2 = box
+                    face_area = max(0.0, float(x2 - x1)) * max(0.0, float(y2 - y1))
+                    frame_area = max(1.0, float(frame_h * frame_w))
+                    if face_area / frame_area < lipsync_min_face_area_ratio:
+                        should_skip = True
+                        small_face_skip_count += 1
+                except Exception:
+                    pass
             if apply_identity_filter and reference_embedding is not None and face_emb is not None:
                 frame_identity_sim = float(np.dot(face_emb, reference_embedding))
                 identity_similarities.append(frame_identity_sim)
@@ -2312,7 +2471,8 @@ class LipsyncPipeline(DiffusionPipeline):
             f"temporal_identity_break={temporal_identity_break_count}, "
             f"temporal_geometry_break={temporal_geometry_break_count}, "
             f"temporal_diff_break={temporal_diff_break_count}, "
-            f"scene_cut_break={scene_cut_break_count}"
+            f"scene_cut_break={scene_cut_break_count}, "
+            f"small_face_skip={small_face_skip_count}"
         )
         if identity_similarities:
             logger.info(
@@ -2330,6 +2490,8 @@ class LipsyncPipeline(DiffusionPipeline):
         self._last_identity_skip_count = identity_skip_count
         self._last_temporal_diff_break_count = temporal_diff_break_count
         self._last_scene_cut_break_count = scene_cut_break_count
+        self._last_source_scene_cut_after = source_scene_cut_after
+        self._last_small_face_skip_count = small_face_skip_count
         self._last_identity_similarity_stats = {
             "min": float(min(identity_similarities)) if identity_similarities else 0.0,
             "median": float(statistics.median(identity_similarities)) if identity_similarities else 0.0,
@@ -2632,6 +2794,7 @@ class LipsyncPipeline(DiffusionPipeline):
         min_merged_lipsync_seconds: float = 1.5,
         scene_cut_break_enabled: bool = True,
         scene_cut_break_threshold: float = 0.45,
+        lipsync_min_face_area_ratio: float = 0.015,
         identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = True,
         side_face_episode_pre_pad: int = 3,
@@ -2668,6 +2831,7 @@ class LipsyncPipeline(DiffusionPipeline):
             f"lipsync_mouth_diff_break_threshold={lipsync_mouth_diff_break_threshold}, "
             f"scene_cut_break_enabled={scene_cut_break_enabled}, "
             f"scene_cut_break_threshold={scene_cut_break_threshold}, "
+            f"lipsync_min_face_area_ratio={lipsync_min_face_area_ratio}, "
             f"identity_similarity_threshold={identity_similarity_threshold}, "
             f"apply_identity_filter={apply_identity_filter}, "
             f"side_face_episode_pre_pad={side_face_episode_pre_pad}, "
@@ -2709,6 +2873,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 min_merged_lipsync_seconds=min_merged_lipsync_seconds,
                 scene_cut_break_enabled=scene_cut_break_enabled,
                 scene_cut_break_threshold=scene_cut_break_threshold,
+                lipsync_min_face_area_ratio=lipsync_min_face_area_ratio,
                 identity_similarity_threshold=identity_similarity_threshold,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
@@ -2823,6 +2988,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 min_merged_lipsync_seconds=min_merged_lipsync_seconds,
                 scene_cut_break_enabled=scene_cut_break_enabled,
                 scene_cut_break_threshold=scene_cut_break_threshold,
+                lipsync_min_face_area_ratio=lipsync_min_face_area_ratio,
                 identity_similarity_threshold=identity_similarity_threshold,
                 apply_identity_filter=apply_identity_filter,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
@@ -2995,6 +3161,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # or shot from leaking through EMA / mouth stabilization.
         scene_cut_break_enabled: bool = True,
         scene_cut_break_threshold: float = 0.45,
+        lipsync_min_face_area_ratio: float = 0.015,
         # Shot-level passthrough guard: when enabled, any shot whose prefilter
         # skip ratio is too high is kept entirely as source video. This avoids
         # alternating generated/source frames inside side-face or fast-turn
@@ -3159,6 +3326,7 @@ class LipsyncPipeline(DiffusionPipeline):
             min_merged_lipsync_seconds=min_merged_lipsync_seconds,
             scene_cut_break_enabled=scene_cut_break_enabled,
             scene_cut_break_threshold=scene_cut_break_threshold,
+            lipsync_min_face_area_ratio=lipsync_min_face_area_ratio,
             identity_similarity_threshold=identity_similarity_threshold,
             apply_identity_filter=apply_identity_filter,
             side_face_episode_pre_pad=side_face_episode_pre_pad,
@@ -3169,6 +3337,7 @@ class LipsyncPipeline(DiffusionPipeline):
             side_face_warn_min_run_seconds=side_face_warn_min_run_seconds,
             aligned_mouth_ema_alpha=aligned_mouth_ema_alpha,
         )
+        source_scene_cut_after = getattr(self, "_last_source_scene_cut_after", None)
         shot_passthrough_stats = {"shots": 0, "frames": 0}
         if shot_passthrough_enabled:
             shot_passthrough_stats = self._apply_shot_passthrough_guard(
@@ -3180,6 +3349,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 skip_ratio_threshold=shot_passthrough_skip_ratio_threshold,
                 min_shot_frames=shot_passthrough_min_frames,
                 min_bad_frames=shot_passthrough_min_bad_frames,
+                source_scene_cut_after=source_scene_cut_after,
             )
             logger.info(
                 f"[ShotGuard] passthrough={shot_passthrough_stats['shots']} shots / "
@@ -3713,15 +3883,50 @@ class LipsyncPipeline(DiffusionPipeline):
         quality_skip = sum(quality_skip_mask)
         effective_skip = sum(effective_skip_mask)
         effective_generated = len(effective_skip_mask) - effective_skip
+        shot_routing = self._build_shot_routing_manifest(
+            effective_skip_mask,
+            source_indices,
+            source_scene_cut_after,
+            fps=float(video_fps),
+            pre_skip_mask=skip_mask,
+            quality_skip_mask=quality_skip_mask,
+            adaptive_quality_skip_mask=adaptive_quality_skip_mask,
+            silent_skip_mask=silent_skip_mask,
+        )
         logger.info(
             f"[Diag] skip summary: pre(loop_video)={pre_skip} quality_postfilter={quality_skip} "
             f"adaptive_quality_fallback={adaptive_quality_fallback_count} "
             f"effective_total={effective_skip} generated={effective_generated} / {len(skip_mask)} "
             f"inference_short_circuit_batches={skipped_inference_batches} "
-            f"inference_short_circuit_frames={skipped_inference_frames}"
+            f"inference_short_circuit_frames={skipped_inference_frames} "
+            f"shots={shot_routing['shots_total']} passthrough_shots={shot_routing['passthrough_shots']} "
+            f"mixed_shots={shot_routing['mixed_shots']}"
         )
         if quality_fallback_count:
             logger.info(f"[LipSync] quality_fallback_frames={quality_fallback_count} / {len(skip_mask)}")
+        quality_passthrough_frames = int(quality_skip + adaptive_quality_fallback_count)
+        quality_passthrough_ratio = float(quality_passthrough_frames / max(1, len(effective_skip_mask)))
+        if quality_passthrough_ratio >= 0.20:
+            retry_recommendation = {
+                "retry_needed": True,
+                "reason": "quality_fallback_ratio_high",
+                "recommended_next_route": "external_retry_or_passthrough",
+                "quality_passthrough_ratio": quality_passthrough_ratio,
+            }
+        elif quality_passthrough_frames > 0:
+            retry_recommendation = {
+                "retry_needed": False,
+                "reason": "quality_fallback_applied",
+                "recommended_next_route": "keep_current_output",
+                "quality_passthrough_ratio": quality_passthrough_ratio,
+            }
+        else:
+            retry_recommendation = {
+                "retry_needed": False,
+                "reason": "none",
+                "recommended_next_route": "keep_current_output",
+                "quality_passthrough_ratio": 0.0,
+            }
         all_faces = torch.cat(synced_video_frames, dim=0)
         # CodeFormer postprocess. We hand the restorer the *aligned* face
         # crops (512x512, [-1, 1]) rather than the full-frame output, for
@@ -3754,68 +3959,81 @@ class LipsyncPipeline(DiffusionPipeline):
             checkpoint_path="",
             error="",
         ).as_dict()
-        if codeformer_enabled:
-            if codeformer_restorer is None:
-                logger.warning(
-                    "[LipSync] codeformer_enabled=True but no restorer was passed; "
-                    "skipping CodeFormer postprocess"
-                )
-                self._last_codeformer_stats["error"] = "no restorer"
+        if effective_skip == len(effective_skip_mask):
+            logger.info("[LipSync] all frames are passthrough; skipping CodeFormer and restore_video")
+            if source_indices:
+                out_frames = []
+                source_len = len(source_video_frames)
+                if source_len > 0:
+                    for src_idx in source_indices:
+                        src_idx = max(0, min(source_len - 1, int(src_idx)))
+                        out_frames.append(source_video_frames[src_idx])
+                synced_video_frames = np.stack(out_frames, axis=0) if out_frames else source_video_frames[:0]
             else:
-                logger.info(
-                    f"[LipSync] CodeFormer postprocess starting: faces={all_faces.shape}, "
-                    f"fidelity_weight={codeformer_fidelity_weight}, "
-                    f"frames_to_enhance={all_faces.shape[0] - int(sum(effective_skip_mask))}"
-                )
-                all_faces, cf_stats = codeformer_restorer.restore_faces(
-                    all_faces,
-                    skip_mask=effective_skip_mask,
-                    fidelity_weight=codeformer_fidelity_weight,
-                    adain=codeformer_adain,
-                    adaptive_w_enabled=codeformer_adaptive_w_enabled,
-                    retry_enabled=codeformer_retry_enabled,
-                    mouth_only_paste_enabled=codeformer_mouth_only_paste_enabled,
-                )
-                self._last_codeformer_stats = cf_stats.as_dict()
-                # Cross-frame 1-order EMA on the restored crops. Only
-                # runs when CF actually ran (otherwise we'd be blending
-                # diffusion output, which already has its own smoother
-                # via ``temporal_smoothing_enabled``). 0 disables.
-                if codeformer_post_ema_alpha > 0.0:
-                    all_faces, post_ema_stats = self._post_codeformer_temporal_ema(
+                synced_video_frames = source_video_frames[: len(effective_skip_mask)]
+        else:
+            if codeformer_enabled:
+                if codeformer_restorer is None:
+                    logger.warning(
+                        "[LipSync] codeformer_enabled=True but no restorer was passed; "
+                        "skipping CodeFormer postprocess"
+                    )
+                    self._last_codeformer_stats["error"] = "no restorer"
+                else:
+                    logger.info(
+                        f"[LipSync] CodeFormer postprocess starting: faces={all_faces.shape}, "
+                        f"fidelity_weight={codeformer_fidelity_weight}, "
+                        f"frames_to_enhance={all_faces.shape[0] - int(sum(effective_skip_mask))}"
+                    )
+                    all_faces, cf_stats = codeformer_restorer.restore_faces(
                         all_faces,
                         skip_mask=effective_skip_mask,
-                        track_ids=track_ids,
-                        alpha=codeformer_post_ema_alpha,
-                        track_aware=codeformer_post_ema_track_aware,
+                        fidelity_weight=codeformer_fidelity_weight,
+                        adain=codeformer_adain,
+                        adaptive_w_enabled=codeformer_adaptive_w_enabled,
+                        retry_enabled=codeformer_retry_enabled,
+                        mouth_only_paste_enabled=codeformer_mouth_only_paste_enabled,
                     )
-                    self._last_codeformer_stats["ema_chain_breaks"] = int(
-                        post_ema_stats["breaks"]
-                    )
-                    self._last_codeformer_stats["ema_resets_on_track_switch"] = int(
-                        post_ema_stats["track_switch"]
-                    )
-        # Concatenate the per-batch dynamic mouth masks (computed in
-        # the inference loop above) and pass them to restore_video so
-        # it can reuse them instead of calling
-        # generate_dynamic_mouth_mask a second time per frame.
-        all_dynamic_mask_tensor = (
-            torch.cat(all_dynamic_masks, dim=0)[: len(aligned_mouth_info)]
-            if all_dynamic_masks
-            else None
-        )
-        synced_video_frames = self.restore_video(
-            all_faces,
-            source_video_frames,
-            boxes,
-            affine_matrices,
-            effective_skip_mask,
-            blend_mask=effective_blend_mask,
-            aligned_mouth_info=aligned_mouth_info,
-            dynamic_masks=all_dynamic_mask_tensor,
-            source_indices=source_indices,
-        )
-        logger.info(f"[LipSync] restored video frames shape={synced_video_frames.shape}")
+                    self._last_codeformer_stats = cf_stats.as_dict()
+                    # Cross-frame 1-order EMA on the restored crops. Only
+                    # runs when CF actually ran (otherwise we'd be blending
+                    # diffusion output, which already has its own smoother
+                    # via ``temporal_smoothing_enabled``). 0 disables.
+                    if codeformer_post_ema_alpha > 0.0:
+                        all_faces, post_ema_stats = self._post_codeformer_temporal_ema(
+                            all_faces,
+                            skip_mask=effective_skip_mask,
+                            track_ids=track_ids,
+                            alpha=codeformer_post_ema_alpha,
+                            track_aware=codeformer_post_ema_track_aware,
+                        )
+                        self._last_codeformer_stats["ema_chain_breaks"] = int(
+                            post_ema_stats["breaks"]
+                        )
+                        self._last_codeformer_stats["ema_resets_on_track_switch"] = int(
+                            post_ema_stats["track_switch"]
+                        )
+            # Concatenate the per-batch dynamic mouth masks (computed in
+            # the inference loop above) and pass them to restore_video so
+            # it can reuse them instead of calling
+            # generate_dynamic_mouth_mask a second time per frame.
+            all_dynamic_mask_tensor = (
+                torch.cat(all_dynamic_masks, dim=0)[: len(aligned_mouth_info)]
+                if all_dynamic_masks
+                else None
+            )
+            synced_video_frames = self.restore_video(
+                all_faces,
+                source_video_frames,
+                boxes,
+                affine_matrices,
+                effective_skip_mask,
+                blend_mask=effective_blend_mask,
+                aligned_mouth_info=aligned_mouth_info,
+                dynamic_masks=all_dynamic_mask_tensor,
+                source_indices=source_indices,
+            )
+            logger.info(f"[LipSync] restored video frames shape={synced_video_frames.shape}")
 
         output_frame_count = len(source_indices) if source_indices else synced_video_frames.shape[0]
         audio_samples_remain_length = int(output_frame_count / video_fps * audio_sample_rate)
@@ -3838,6 +4056,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 "passthrough_frames": int(effective_skip),
                 "passthrough_ratio": float(effective_skip / max(1, len(effective_skip_mask))),
                 "prefilter_passthrough_frames": int(pre_skip),
+                "small_face_passthrough_frames": int(getattr(self, "_last_small_face_skip_count", 0)),
                 "shot_passthrough_frames": int(shot_passthrough_stats.get("frames", 0)),
                 "shot_passthrough_shots": int(shot_passthrough_stats.get("shots", 0)),
                 "quality_passthrough_frames": int(quality_skip),
@@ -3847,6 +4066,14 @@ class LipsyncPipeline(DiffusionPipeline):
                 "skipped_inference_frames": int(skipped_inference_frames),
                 "route": "latentsync_or_passthrough",
             },
+            "retry_recommendation": retry_recommendation,
+            "shot_summary": {
+                "shots_total": int(shot_routing["shots_total"]),
+                "latentsync_shots": int(shot_routing["latentsync_shots"]),
+                "passthrough_shots": int(shot_routing["passthrough_shots"]),
+                "mixed_shots": int(shot_routing["mixed_shots"]),
+            },
+            "routing_manifest": shot_routing["shots"],
             "quality_fallback_frames": quality_fallback_count,
             "adaptive_quality_fallback_frames": adaptive_quality_fallback_count,
             "adaptive_quality_fallback_enabled": adaptive_quality_fallback_enabled,
@@ -3870,6 +4097,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "mouth_occlusion_skip_count": getattr(self, "_last_mouth_occlusion_skip_count", 0),
             "motion_blur_skip_count": getattr(self, "_last_motion_blur_skip_count", 0),
             "face_jump_skip_count": getattr(self, "_last_face_jump_skip_count", 0),
+            "small_face_skip_count": getattr(self, "_last_small_face_skip_count", 0),
             "side_face_episode_extra_skip_count": getattr(
                 self, "_last_side_face_episode_extra_skip_count", 0
             ),
@@ -3888,6 +4116,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "lipsync_continuity_max_center_shift": lipsync_continuity_max_center_shift,
             "lipsync_continuity_max_scale_change": lipsync_continuity_max_scale_change,
             "lipsync_mouth_diff_break_threshold": lipsync_mouth_diff_break_threshold,
+            "lipsync_min_face_area_ratio": lipsync_min_face_area_ratio,
             "temporal_diff_break_count": getattr(self, "_last_temporal_diff_break_count", 0),
             "scene_cut_break_count": getattr(self, "_last_scene_cut_break_count", 0),
             "scene_cut_break_enabled": scene_cut_break_enabled,

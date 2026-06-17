@@ -1550,6 +1550,7 @@ class LatentSyncApiRuntime:
                 min_merged_lipsync_seconds=payload.min_merged_lipsync_seconds,
                 scene_cut_break_enabled=payload.scene_cut_break_enabled,
                 scene_cut_break_threshold=payload.scene_cut_break_threshold,
+                lipsync_min_face_area_ratio=payload.lipsync_min_face_area_ratio,
                 shot_passthrough_enabled=payload.shot_passthrough_enabled,
                 shot_passthrough_skip_ratio_threshold=payload.shot_passthrough_skip_ratio_threshold,
                 shot_passthrough_min_frames=payload.shot_passthrough_min_frames,
@@ -1617,6 +1618,7 @@ class LatentSyncApiRuntime:
             mouth_occlusion_skip_count = int(run_stats.get("mouth_occlusion_skip_count", 0))
             motion_blur_skip_count = int(run_stats.get("motion_blur_skip_count", 0))
             face_jump_skip_count = int(run_stats.get("face_jump_skip_count", 0))
+            small_face_skip_count = int(run_stats.get("small_face_skip_count", 0))
             side_face_episode_extra_skip_count = int(
                 run_stats.get("side_face_episode_extra_skip_count", 0)
             )
@@ -1661,6 +1663,7 @@ class LatentSyncApiRuntime:
                 "passthrough_frames": int(effective_skip_frames),
                 "passthrough_ratio": float(effective_skip_frames / max(1, source_frame_count)),
                 "prefilter_passthrough_frames": int(pre_skip_frames),
+                "small_face_passthrough_frames": int(small_face_skip_count),
                 "shot_passthrough_frames": int(shot_passthrough_frames),
                 "shot_passthrough_shots": int(shot_passthrough_shots),
                 "quality_passthrough_frames": int(quality_skip_frames),
@@ -1685,12 +1688,15 @@ class LatentSyncApiRuntime:
                 "effective_inference_steps": effective_inference_steps,
                 "effective_seed": effective_seed,
                 "generation_summary": dict(generation_summary),
+                "retry_recommendation": dict(run_stats.get("retry_recommendation") or {}),
+                "shot_summary": dict(run_stats.get("shot_summary") or {}),
+                "routing_manifest": list(run_stats.get("routing_manifest") or []),
                 "matched_source_frames": source_frame_count,
                 "filled_source_frames": 0,
                 "filtered_motion_frames": 0,
                 "filtered_fast_motion_frames": 0,
                 "continuity_filled_source_frames": 0,
-                "filtered_small_face_frames": 0,
+                "filtered_small_face_frames": small_face_skip_count,
                 "filtered_short_segment_frames": int(segment_consistency_reasons.get("too_short", 0)),
                 "segment_consistency_reasons": dict(segment_consistency_reasons),
                 "segment_consistency_hard_cut_enabled": bool(run_stats.get("segment_consistency_hard_cut_enabled", False)),
@@ -1726,6 +1732,7 @@ class LatentSyncApiRuntime:
                 "mouth_occlusion_skip_count": mouth_occlusion_skip_count,
                 "motion_blur_skip_count": motion_blur_skip_count,
                 "face_jump_skip_count": face_jump_skip_count,
+                "small_face_skip_count": small_face_skip_count,
                 "side_face_episode_extra_skip_count": side_face_episode_extra_skip_count,
                 "side_face_warn_run_skip_count": side_face_warn_run_skip_count,
                 "silent_skip_frames": silent_skip_frames,

@@ -110,6 +110,50 @@ class TestTemporalContinuity(unittest.TestCase):
         small_lighting_shift = LipsyncPipeline._source_frame_scene_cut_score(black, dim)
         self.assertLess(small_lighting_shift, 0.45)
 
+    def test_source_scene_cut_after_marks_hard_boundaries(self):
+        import numpy as np
+
+        try:
+            from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"pipeline optional dependency missing: {exc.name}")
+
+        black = np.zeros((32, 32, 3), dtype=np.uint8)
+        white = np.full((32, 32, 3), 255, dtype=np.uint8)
+        frames = np.stack([black, black, white, white], axis=0)
+
+        cuts = LipsyncPipeline._compute_source_scene_cut_after(frames, threshold=0.45)
+
+        self.assertEqual(cuts, [False, True, False])
+
+    def test_shot_routing_manifest_splits_on_scene_cut(self):
+        try:
+            from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"pipeline optional dependency missing: {exc.name}")
+
+        effective_skip = [False, False, True, True, True, False]
+        source_indices = list(range(6))
+        source_scene_cut_after = [False, True, False, False, True]
+
+        manifest = LipsyncPipeline._build_shot_routing_manifest(
+            effective_skip,
+            source_indices,
+            source_scene_cut_after,
+            fps=25.0,
+            pre_skip_mask=effective_skip,
+        )
+
+        self.assertEqual(manifest["shots_total"], 3)
+        self.assertEqual(manifest["latentsync_shots"], 1)
+        self.assertEqual(manifest["passthrough_shots"], 1)
+        self.assertEqual(manifest["mixed_shots"], 1)
+        self.assertEqual([shot["route"] for shot in manifest["shots"]], [
+            "latentsync",
+            "passthrough",
+            "mixed",
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()
