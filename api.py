@@ -221,10 +221,6 @@ class LipSyncRequest(BaseModel):
     identity_cluster_threshold: float = Field(0.78, ge=0.0, le=1.0)
     default_identity_min_coverage: float = Field(0.5, ge=0.0, le=1.0)
     require_face_embedding: bool = True
-    active_speaker_filter_enabled: bool = Field(
-        False,
-        description="Deprecated alias for apply_identity_filter. When no avatar is provided, auto-select the active speaker and target that face instead of the largest face.",
-    )
     apply_identity_filter: bool = Field(
         False,
         description="Enable identity filtering. When True, uses avatar if provided; otherwise auto-detects the main speaker and filters to that face.",
@@ -1610,14 +1606,7 @@ class LatentSyncApiRuntime:
             else:
                 torch.seed()
 
-            effective_apply_identity_filter = bool(
-                payload.apply_identity_filter or payload.active_speaker_filter_enabled
-            )
-            if payload.active_speaker_filter_enabled and not payload.apply_identity_filter:
-                logger.warning(
-                    "[LipSync] active_speaker_filter_enabled is deprecated; "
-                    "use apply_identity_filter instead."
-                )
+            effective_apply_identity_filter = bool(payload.apply_identity_filter)
 
             logger.info(f"[LipSync] Starting pipeline: video={video_path}, audio={audio_path}, "
                          f"guidance_scale={effective_guidance_scale}, steps={effective_inference_steps}, "
@@ -1878,7 +1867,6 @@ class LatentSyncApiRuntime:
                 "identity_similarity_max": float(identity_similarity_stats.get("max", 0.0)),
                 "identity_similarity_threshold": float(run_stats.get("identity_similarity_threshold", payload.similarity_threshold)),
                 "active_speaker": dict(active_speaker_stats),
-                "active_speaker_filter_enabled": bool(payload.active_speaker_filter_enabled),
                 "apply_identity_filter": bool(effective_apply_identity_filter),
                 "target_identity_similarity": 0.0,
                 "target_identity_count": 0,
