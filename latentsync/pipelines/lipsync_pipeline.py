@@ -4695,6 +4695,43 @@ class LipsyncPipeline(DiffusionPipeline):
             f"input_duration={input_duration_seconds:.3f}s"
         )
 
+        # Normalize audio features/samples to the video length so the output
+        # video always matches the input video duration. Without this, an audio
+        # track longer than the video causes loop_video to ping-pong/loop the
+        # source frames, making the tail of the output look repeated.
+        target_chunk_count = len(video_frames)
+        target_sample_count = int(round(target_chunk_count * audio_sample_rate / video_fps))
+        if len(whisper_chunks) != target_chunk_count:
+            if len(whisper_chunks) > target_chunk_count:
+                whisper_chunks = whisper_chunks[:target_chunk_count]
+            elif whisper_chunks:
+                pad_feature = torch.zeros_like(whisper_chunks[0])
+                whisper_chunks = whisper_chunks + [
+                    pad_feature for _ in range(target_chunk_count - len(whisper_chunks))
+                ]
+            logger.info(
+                f"[LipSync] normalized whisper_chunks: {len(whisper_chunks)} -> {target_chunk_count}"
+            )
+        if audio_samples.shape[0] != target_sample_count:
+            if audio_samples.shape[0] > target_sample_count:
+                audio_samples = audio_samples[:target_sample_count]
+            else:
+                pad_samples = target_sample_count - audio_samples.shape[0]
+                audio_samples = torch.cat(
+                    [
+                        audio_samples,
+                        torch.zeros(
+                            pad_samples,
+                            dtype=audio_samples.dtype,
+                            device=audio_samples.device,
+                        ),
+                    ],
+                    dim=0,
+                )
+            logger.info(
+                f"[LipSync] normalized audio_samples: {audio_samples.shape[0]} -> {target_sample_count}"
+            )
+
         # Build kwargs dict for _process_clip from current locals.
         _process_clip_kwargs = {k: v for k, v in locals().items() if k not in {
             "self", "video_path", "audio_path", "video_out_path", "scene_split_enabled",
