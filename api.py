@@ -291,13 +291,13 @@ class LipSyncRequest(BaseModel):
     mouth_sharpen_strength: float = Field(0.30, ge=0.0, le=1.0)
     # Frame-to-frame mouth stabilization. Keep this light: too much carryover
     # damps open-mouth frames and makes speech look under-articulated.
-    mouth_temporal_stabilization_strength: float = Field(0.10, ge=0.0, le=0.6)
+    mouth_temporal_stabilization_strength: float = Field(0.15, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     mouth_audio_adaptive_motion_enabled: bool = True
     # Adaptive motion: preserve more current generated mouth motion,
     # especially on high-energy speech, so open-mouth frames are not pulled
     # back toward the smoothed/previous-frame mouth too aggressively.
-    mouth_audio_motion_min_scale: float = Field(1.00, ge=0.0, le=2.0)
+    mouth_audio_motion_min_scale: float = Field(0.75, ge=0.0, le=2.0)
     mouth_audio_motion_max_scale: float = Field(1.60, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default
     # (self.config.data.mask_image_path, usually latentsync/utils/mask.png).
@@ -1655,6 +1655,21 @@ class LatentSyncApiRuntime:
             scene_cut_break_count = int(run_stats.get("scene_cut_break_count", 0))
             shot_passthrough_shots = int(run_stats.get("shot_passthrough_shots", 0))
             shot_passthrough_frames = int(run_stats.get("shot_passthrough_frames", 0))
+            generation_summary = run_stats.get("generation_summary") or {
+                "total_frames": int(source_frame_count),
+                "latentsync_generated_frames": int(effective_generated_frames),
+                "passthrough_frames": int(effective_skip_frames),
+                "passthrough_ratio": float(effective_skip_frames / max(1, source_frame_count)),
+                "prefilter_passthrough_frames": int(pre_skip_frames),
+                "shot_passthrough_frames": int(shot_passthrough_frames),
+                "shot_passthrough_shots": int(shot_passthrough_shots),
+                "quality_passthrough_frames": int(quality_skip_frames),
+                "adaptive_quality_passthrough_frames": int(adaptive_quality_fallback_frames),
+                "silent_passthrough_frames": int(silent_skip_frames),
+                "skipped_inference_batches": int(skipped_inference_batches),
+                "skipped_inference_frames": int(skipped_inference_frames),
+                "route": "latentsync_or_passthrough",
+            }
 
             return {
                 "output_path": output_path,
@@ -1669,6 +1684,7 @@ class LatentSyncApiRuntime:
                 "effective_guidance_scale": effective_guidance_scale,
                 "effective_inference_steps": effective_inference_steps,
                 "effective_seed": effective_seed,
+                "generation_summary": dict(generation_summary),
                 "matched_source_frames": source_frame_count,
                 "filled_source_frames": 0,
                 "filtered_motion_frames": 0,

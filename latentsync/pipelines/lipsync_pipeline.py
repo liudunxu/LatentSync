@@ -3271,9 +3271,13 @@ class LipsyncPipeline(DiffusionPipeline):
 
         num_channels_latents = self.vae.config.latent_channels
 
-        # Prepare latent variables
-        all_latents = self.prepare_latents(
-            len(whisper_chunks),
+        # Prepare one initial latent frame and repeat it per generated batch.
+        # ``prepare_latents(n)`` historically sampled one frame then repeated it
+        # across all frames; keeping a one-frame base preserves that behavior
+        # while avoiding a full-video latent tensor when many shots are routed
+        # to passthrough.
+        base_latents = self.prepare_latents(
+            1,
             num_channels_latents,
             height,
             width,
@@ -3282,24 +3286,13 @@ class LipsyncPipeline(DiffusionPipeline):
             generator,
         )
 
-        # Precompute pixel-level masks and masked images once for the whole
-        # sequence. Each frame only belongs to one inference batch, so this
-        # avoids repeating the torchvision resize/normalize/mask ops inside
-        # the loop. VAE encode is still done per-batch to keep memory bounded.
-        logger.info("[LipSync] precomputing masks and dynamic mouth masks for %d frames", len(faces))
-        all_ref_pixel_values, all_masked_pixel_values, all_masks = self.image_processor.prepare_masks_and_masked_images(
-            faces, affine_transform=False
-        )
         fixed_keep_mask = self.image_processor.mask_image[0:1]
-        all_dynamic_region_masks = torch.stack([
-            self.generate_dynamic_mouth_mask(mi, height, fixed_keep_mask=fixed_keep_mask)
-            for mi in aligned_mouth_info
-        ])
 
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
         logger.info(f"[LipSync] num_inferences={num_inferences}, num_frames={num_frames}, add_audio_layer={self.unet.add_audio_layer}")
         skipped_inference_batches = 0
         skipped_inference_frames = 0
+        logged_first_generated_batch = False
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
             # p_bias EMA from the previous batch would mis-represent the
             # first frames of this batch when scene content shifts.
@@ -3344,13 +3337,20 @@ class LipsyncPipeline(DiffusionPipeline):
                     audio_embeds = torch.cat([null_audio_embeds, audio_embeds])
             else:
                 audio_embeds = None
-            latents = all_latents[:, :, batch_start:batch_end]
-            # Fixed U-shaped mask for the UNet (model was trained on this).
-            ref_pixel_values = all_ref_pixel_values[batch_start:batch_end]
-            masked_pixel_values = all_masked_pixel_values[batch_start:batch_end]
-            masks = all_masks[batch_start:batch_end]
-            # Dynamic mouth-centered mask for post-processing paste-back.
-            dynamic_region_mask_batch = all_dynamic_region_masks[batch_start:batch_end]
+            batch_len = batch_end - batch_start
+            latents = base_latents.repeat(1, 1, batch_len, 1, 1)
+
+            # Prepare masks only for batches that will actually run diffusion.
+            # Shot-level routing and silence/side-face filters can make many
+            # batches pure passthrough; skipping this work matters in long-form
+            # short-drama production.
+            ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
+                inference_faces, affine_transform=False
+            )
+            dynamic_region_mask_batch = torch.stack([
+                self.generate_dynamic_mouth_mask(mi, height, fixed_keep_mask=fixed_keep_mask)
+                for mi in aligned_mouth_info[batch_start:batch_end]
+            ])
             all_dynamic_masks.append(dynamic_region_mask_batch)
 
             # 7. Prepare mask latent variables
@@ -3409,11 +3409,11 @@ class LipsyncPipeline(DiffusionPipeline):
             decoded_latents = self.decode_latents(latents)
             # Diagnostic: show the mask convention and how much the model is
             # actually deviating from the input on the first batch.
-            if i == 0:
+            if not logged_first_generated_batch:
                 with torch.no_grad():
                     mask_first = masks[0, 0]  # (H, W) in [0, 1]
                     logger.info(
-                        f"[Diag] batch0 mask: min={mask_first.min().item():.3f} "
+                        f"[Diag] batch{i} mask: min={mask_first.min().item():.3f} "
                         f"max={mask_first.max().item():.3f} mean={mask_first.mean().item():.3f} "
                         f"frac_inpaint={float((mask_first < 0.5).float().mean().item()):.3f}"
                     )
@@ -3424,7 +3424,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     ref_first = ref_pixel_values[0].detach().cpu()
                     diff = (decoded_first - ref_first).abs().mean().item()
                     logger.info(
-                        f"[Diag] batch0 frame0: decoded range [{decoded_first.min().item():.2f}, {decoded_first.max().item():.2f}] "
+                        f"[Diag] batch{i} frame0: decoded range [{decoded_first.min().item():.2f}, {decoded_first.max().item():.2f}] "
                         f"ref range [{ref_first.min().item():.2f}, {ref_first.max().item():.2f}] "
                         f"mean|decoded-ref|={diff:.4f}"
                     )
@@ -3486,15 +3486,16 @@ class LipsyncPipeline(DiffusionPipeline):
                 decoded_latents = self._unsharp_mask(
                     decoded_latents, generated_region_mask, amount=mouth_sharpen_strength
                 )
-            if i == 0:
+            if not logged_first_generated_batch:
                 with torch.no_grad():
                     combined_first = decoded_latents[0].detach().cpu()
                     ref_first = ref_pixel_values[0].detach().cpu()
                     diff = (combined_first - ref_first).abs().mean().item()
                     logger.info(
-                        f"[Diag] batch0 frame0 after paste: mean|combined-ref|={diff:.4f} "
+                        f"[Diag] batch{i} frame0 after paste: mean|combined-ref|={diff:.4f} "
                         f"(~0 means model output was overwritten by ref)"
                     )
+                logged_first_generated_batch = True
 
             # Compute per-frame mouth center norm from aligned landmarks for
             # dynamic mask positioning in _mouth_core_mask calls below.
@@ -3831,6 +3832,21 @@ class LipsyncPipeline(DiffusionPipeline):
 
         # Stash stats for the API layer to read (synthesize() consumes this).
         self._last_run_stats = {
+            "generation_summary": {
+                "total_frames": int(len(effective_skip_mask)),
+                "latentsync_generated_frames": int(effective_generated),
+                "passthrough_frames": int(effective_skip),
+                "passthrough_ratio": float(effective_skip / max(1, len(effective_skip_mask))),
+                "prefilter_passthrough_frames": int(pre_skip),
+                "shot_passthrough_frames": int(shot_passthrough_stats.get("frames", 0)),
+                "shot_passthrough_shots": int(shot_passthrough_stats.get("shots", 0)),
+                "quality_passthrough_frames": int(quality_skip),
+                "adaptive_quality_passthrough_frames": int(adaptive_quality_fallback_count),
+                "silent_passthrough_frames": int(sum(silent_skip_mask)),
+                "skipped_inference_batches": int(skipped_inference_batches),
+                "skipped_inference_frames": int(skipped_inference_frames),
+                "route": "latentsync_or_passthrough",
+            },
             "quality_fallback_frames": quality_fallback_count,
             "adaptive_quality_fallback_frames": adaptive_quality_fallback_count,
             "adaptive_quality_fallback_enabled": adaptive_quality_fallback_enabled,
