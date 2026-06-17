@@ -4652,9 +4652,14 @@ class LipsyncPipeline(DiffusionPipeline):
             )
             scenes = self._split_scenes_from_cuts(source_scene_cut_after)
             if len(scenes) > 1:
+                scene_durations = [
+                    float(end_frame - start_frame) / max(float(video_fps), 1e-6)
+                    for start_frame, end_frame in scenes
+                ]
                 logger.info(
                     f"[LipSync] scene_split enabled: detected {len(scenes)} scenes, "
-                    f"threshold={scene_split_threshold}"
+                    f"threshold={scene_split_threshold}, "
+                    f"scene_durations=[{', '.join(f'{d:.3f}s' for d in scene_durations)}]"
                 )
 
                 scene_stats_list = []
