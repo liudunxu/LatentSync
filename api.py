@@ -238,7 +238,7 @@ class LipSyncRequest(BaseModel):
         description="Threshold for detecting scene boundaries when scene_split_enabled=True.",
     )
     min_scene_duration_seconds: float = Field(
-        0.0,
+        0.5,
         ge=0.0,
         le=60.0,
         description="Merge detected scenes shorter than this duration (seconds) with adjacent scenes. 0 disables merging.",

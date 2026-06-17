@@ -3483,7 +3483,7 @@ class LipsyncPipeline(DiffusionPipeline):
         scene_cut_break_enabled = kwargs.get("scene_cut_break_enabled", True)
         scene_cut_break_threshold = kwargs.get("scene_cut_break_threshold", 0.45)
         scene_split_threshold = kwargs.get("scene_split_threshold", 0.45)
-        min_scene_duration_seconds = kwargs.get("min_scene_duration_seconds", 0.0)
+        min_scene_duration_seconds = kwargs.get("min_scene_duration_seconds", 0.5)
         lipsync_min_face_area_ratio = kwargs.get("lipsync_min_face_area_ratio", 0.015)
         shot_passthrough_enabled = kwargs.get("shot_passthrough_enabled", False)
         shot_passthrough_skip_ratio_threshold = kwargs.get("shot_passthrough_skip_ratio_threshold", 0.45)
@@ -4579,7 +4579,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # as an independent clip with clean temporal state, then concatenate.
         scene_split_enabled: bool = True,
         scene_split_threshold: float = 0.45,
-        min_scene_duration_seconds: float = 0.0,
+        min_scene_duration_seconds: float = 0.5,
         # Audio-energy prefilter: skip sustained silent runs before diffusion.
         silent_skip_enabled: bool = False,
         silent_rms_threshold: float = 0.003,
