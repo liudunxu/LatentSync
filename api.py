@@ -651,7 +651,7 @@ class LipSyncRequest(BaseModel):
     # original, but isolated fallback decisions must be suppressed to avoid
     # visible flicker.
     adaptive_quality_fallback_enabled: bool = Field(
-        False,
+        True,
         description="Enable per-frame adaptive quality fallback. Combines mouth sharpness, "
                     "mouth-region diff, identity similarity, yaw, audio confidence and "
                     "temporal stability into a single score; frames below the adaptive "
