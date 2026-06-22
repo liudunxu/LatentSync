@@ -50,6 +50,7 @@ AUDIO_EMBEDS_CACHE_ROOT = RESULT_ROOT / "audio_embeds_cache"
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".flv", ".webm"}
 AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+SRT_SUFFIXES = {".srt"}
 
 for directory in (INPUT_ROOT, OUTPUT_ROOT, AUDIO_EMBEDS_CACHE_ROOT):
     directory.mkdir(parents=True, exist_ok=True)
@@ -572,6 +573,28 @@ class LipSyncRequest(BaseModel):
     audio_padding_length_left: int = Field(2, ge=0, le=10)
     audio_padding_length_right: int = Field(2, ge=0, le=10)
     audio_sync_offset_seconds: float = Field(0.0, ge=-0.5, le=0.5)
+    # Optional SRT subtitle URL. When provided, lip-sync is only applied to
+    # the time ranges covered by the SRT cues; every frame outside those
+    # ranges is passed through from the original video (original video +
+    # original audio). Each SRT cue interval is processed as an independent
+    # video+audio sub-clip (sliced by wall-clock time from the same timeline
+    # as the source video / audio_url), and the per-cue results are
+    # concatenated with the passthrough ranges into a single output.
+    # Cues shorter than ``srt_min_segment_seconds`` are also passed through
+    # (running the 16-frame diffusion batch on a sub-second slice is not
+    # worth it and can fail). When ``srt_url`` is None the original
+    # whole-video lip-sync path is used unchanged.
+    srt_url: Optional[str] = Field(
+        None,
+        description="Optional SRT subtitle URL. When set, lip-sync only runs inside SRT cue "
+                    "time ranges; outside ranges keep the original video+audio.",
+    )
+    srt_min_segment_seconds: float = Field(
+        0.6,
+        ge=0.0,
+        le=10.0,
+        description="SRT cues shorter than this are passed through (no lip-sync). 0 processes every cue.",
+    )
     audio_feature_fps: float = Field(
         0.0,
         ge=0.0,
@@ -1063,6 +1086,221 @@ def _read_video_info(video_path: Path) -> Tuple[int, float]:
     return frame_count, fps
 
 
+# ---------------------------------------------------------------------------
+# SRT-driven segment orchestration helpers
+# ---------------------------------------------------------------------------
+
+# LipsyncPipeline normalizes every input to 25 fps (see _resolve_target_video_path
+# / the ``video_fps`` default), so segment sub-clips and passthrough slices are
+# all produced at 25 fps to keep the final concat seamless.
+_SRT_OUTPUT_FPS = 25
+
+
+def _run_ffmpeg(args: List[str]) -> None:
+    """Run ffmpeg with the given arg list, raising on non-zero exit."""
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-nostdin", *args]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"ffmpeg failed (code {proc.returncode}): {stderr}")
+
+
+def _ffprobe_has_audio(path: Path) -> bool:
+    """True if the media file has at least one audio stream."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "a",
+                "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
+            ],
+            capture_output=True, timeout=30,
+        )
+        return bool(proc.stdout.strip())
+    except Exception:
+        # If ffprobe is unavailable, assume audio is present (the common
+        # case for dubbing sources) so we don't drop the real audio track.
+        return True
+
+
+def _parse_srt_intervals(path: Path) -> List[Tuple[float, float]]:
+    """Parse an SRT file into a sorted, overlap-merged list of (start, end) seconds.
+
+    Tolerant of CR/LF, comma/period millisecond separators, and cues missing
+    cue numbers. Returns [] for an empty / unparseable file.
+    """
+    import re
+
+    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    timestamp_re = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})")
+
+    def _ts_to_sec(match: List[str]) -> float:
+        h, mi, s, ms = (int(x) for x in match)
+        return h * 3600 + mi * 60 + s + ms / 1000.0
+
+    intervals: List[Tuple[float, float]] = []
+    for line in text.replace("\r", "\n").split("\n"):
+        if "-->" not in line:
+            continue
+        matches = timestamp_re.findall(line)
+        if len(matches) >= 2:
+            start = _ts_to_sec(matches[0])
+            end = _ts_to_sec(matches[1])
+            if end > start:
+                intervals.append((start, end))
+    if not intervals:
+        return []
+
+    intervals.sort()
+    merged: List[Tuple[float, float]] = [intervals[0]]
+    for start, end in intervals[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _extract_video_subclip(src: Path, start: float, duration: float, out: Path) -> None:
+    """Extract a video-only (no audio) sub-clip at the output fps."""
+    _run_ffmpeg([
+        "-ss", f"{start:.6f}", "-i", str(src), "-t", f"{duration:.6f}",
+        "-an", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-r", str(_SRT_OUTPUT_FPS), str(out),
+    ])
+
+
+def _extract_audio_subclip(src: Path, start: float, duration: float, out: Path) -> None:
+    """Extract a 16 kHz mono WAV sub-clip (matches read_audio's default)."""
+    _run_ffmpeg([
+        "-ss", f"{start:.6f}", "-i", str(src), "-t", f"{duration:.6f}",
+        "-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(out),
+    ])
+
+
+def _extract_passthrough_subclip(src: Path, start: float, duration: float, out: Path) -> None:
+    """Extract a video+audio sub-clip from the original source.
+
+    Uses the original audio when present; falls back to silence (anullsrc) so
+    the segment always has an audio stream for concat. Re-encoded to a uniform
+    25 fps / yuv420p / aac so it lines up with the lip-synced segments.
+    """
+    if _ffprobe_has_audio(src):
+        _run_ffmpeg([
+            "-ss", f"{start:.6f}", "-i", str(src), "-t", f"{duration:.6f}",
+            "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-r", str(_SRT_OUTPUT_FPS), "-c:a", "aac", "-b:a", "128k",
+            "-ar", "48000", "-ac", "2", str(out),
+        ])
+    else:
+        _run_ffmpeg([
+            "-ss", f"{start:.6f}", "-i", str(src), "-t", f"{duration:.6f}",
+            "-f", "lavfi", "-t", f"{duration:.6f}", "-i", "anullsrc=r=48000:cl=stereo",
+            "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-r", str(_SRT_OUTPUT_FPS), "-c:a", "aac", "-b:a", "128k",
+            "-ar", "48000", "-ac", "2", "-map", "0:v:0", "-map", "1:a:0",
+            "-shortest", str(out),
+        ])
+
+
+def _concat_clips(clips: List[Path], out: Path) -> None:
+    """Concatenate segment mp4s (each with one video + one audio stream).
+
+    Uses the concat filter with a per-input aresample so audio sample-rate
+    differences (lip-sync segments come out at 16 kHz, passthrough at 48 kHz)
+    don't break the join. Video is re-encoded to a uniform yuv420p / 25 fps.
+    """
+    if not clips:
+        raise RuntimeError("concat received no clips")
+    if len(clips) == 1:
+        # Single segment: just re-mux to the canonical output format.
+        _run_ffmpeg([
+            "-i", str(clips[0]),
+            "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-r", str(_SRT_OUTPUT_FPS), "-c:a", "aac", "-b:a", "128k",
+            "-ar", "48000", "-ac", "2", str(out),
+        ])
+        return
+
+    args: List[str] = []
+    for clip in clips:
+        args += ["-i", str(clip)]
+
+    filter_parts = []
+    for i in range(len(clips)):
+        filter_parts.append(f"[{i}:a]aresample=48000[a{i}]")
+    concat_inputs = "".join(f"[{i}:v:0][a{i}]" for i in range(len(clips)))
+    filter_parts.append(f"{concat_inputs}concat=n={len(clips)}:v=1:a=1[v][a]")
+    filter_complex = ";".join(filter_parts)
+
+    args += [
+        "-filter_complex", filter_complex,
+        "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-r", str(_SRT_OUTPUT_FPS), "-c:a", "aac", "-b:a", "128k",
+        "-ar", "48000", "-ac", "2", str(out),
+    ]
+    _run_ffmpeg(args)
+
+
+def _merge_segment_stats(
+    seg_results: List[Dict[str, object]],
+    final_output_path: Path,
+    source_frame_count: int,
+    source_fps: float,
+    srt_summary: Dict[str, object],
+) -> Dict[str, object]:
+    """Merge per-segment synthesize result dicts into one response-shaped dict.
+
+    Integer/float counters are summed; nested dicts recurse; other types take
+    the first segment's value. Whole-video totals (frame counts, fps, output
+    path) are overridden, and an ``srt`` summary is attached.
+    """
+    def merge_values(values: List[object]) -> object:
+        if not values:
+            return None
+        if all(isinstance(v, bool) for v in values):
+            return values[0]
+        if all(isinstance(v, int) for v in values):
+            return sum(values)  # type: ignore[arg-type]
+        if all(isinstance(v, float) for v in values):
+            return values[0]
+        if all(isinstance(v, dict) for v in values):
+            keys: set = set()
+            for v in values:
+                keys.update(v.keys())  # type: ignore[union-attr]
+            return {k: merge_values([v[k] for v in values if k in v]) for k in keys}  # type: ignore[index]
+        return values[0]
+
+    if not seg_results:
+        return {
+            "output_path": final_output_path,
+            "source_frame_count": source_frame_count,
+            "output_frame_count": source_frame_count,
+            "source_fps": round(float(source_fps), 6),
+            "srt": srt_summary,
+            "quality_ok": True,
+        }
+
+    merged = merge_values(seg_results)  # type: ignore[arg-type]
+    if not isinstance(merged, dict):
+        merged = {}
+    # Override whole-video totals and attach the SRT summary.
+    merged["output_path"] = final_output_path
+    merged["source_frame_count"] = source_frame_count
+    merged["output_frame_count"] = source_frame_count
+    merged["source_fps"] = round(float(source_fps), 6)
+    merged["effective_generated_output_frames"] = sum(
+        int(r.get("effective_generated_output_frames", 0)) for r in seg_results
+    )
+    merged["skipped_output_frames"] = sum(
+        int(r.get("skipped_output_frames", 0)) for r in seg_results
+    )
+    merged["srt"] = srt_summary
+    merged["quality_ok"] = True
+    return merged
+
+
 def _read_video_frames(video_path: Path) -> Tuple[List[np.ndarray], float]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -1191,7 +1429,10 @@ class LatentSyncApiRuntime:
         self.loaded = False
         self.detectors_loaded = False
         self.load_lock = threading.RLock()
-        self.run_lock = threading.Lock()
+        # RLock (not Lock): synthesize_srt acquires this for the whole
+        # multi-segment orchestration and re-enters it via per-segment
+        # synthesize calls. A plain Lock would deadlock there.
+        self.run_lock = threading.RLock()
         self.config = None
         self.pipeline = None
         self.dtype = None
@@ -2111,6 +2352,159 @@ class LatentSyncApiRuntime:
                 "quality_ok": True,
             }
 
+    @torch.no_grad()
+    def synthesize_srt(
+        self,
+        payload: LipSyncRequest,
+        paths: Dict[str, Path],
+        job_output_dir: Path,
+        srt_path: Path,
+        reference_embedding=None,
+    ) -> Dict[str, object]:
+        """SRT-driven lip-sync.
+
+        Only the time ranges covered by SRT cues are lip-synced (each cue is
+        run through the pipeline as an independent video+audio sub-clip);
+        every frame outside the cues is passed through from the original
+        source video (original video + original audio). All segments are
+        concatenated into a single ``result.mp4``.
+
+        Cues shorter than ``payload.srt_min_segment_seconds`` are also passed
+        through. Returns a response-shaped dict (same keys as ``synthesize``)
+        with per-segment stats merged and an ``srt`` summary attached.
+        """
+        self.load()
+        with self.run_lock:
+            video_path = paths["video"]
+            audio_path = paths["audio"]
+            final_output_path = job_output_dir / "result.mp4"
+
+            source_frame_count, source_fps = _read_video_info(video_path)
+            duration = float(source_frame_count) / max(float(source_fps), 1e-6)
+
+            raw_intervals = _parse_srt_intervals(srt_path)
+            if not raw_intervals:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No usable time intervals parsed from SRT: {srt_path}",
+                )
+
+            # Clamp to the source duration and drop anything fully past the end.
+            min_seg = float(payload.srt_min_segment_seconds)
+            intervals: List[Tuple[float, float]] = []
+            for start, end in raw_intervals:
+                if start >= duration:
+                    continue
+                end = min(end, duration)
+                if end > start:
+                    intervals.append((start, end))
+            if not intervals:
+                logger.warning("[LipSync/SRT] all cues fall outside the video duration; passthrough only")
+
+            # Build the timeline: gaps between cues (and the head/tail) are
+            # passthrough; each cue is either lipsync or, if too short,
+            # passthrough.
+            timeline: List[Tuple[str, float, float]] = []
+            cursor = 0.0
+            lipsync_count = 0
+            passthrough_count = 0
+            short_passthrough_count = 0
+            for start, end in intervals:
+                if start > cursor + 1e-3:
+                    timeline.append(("passthrough", cursor, start))
+                    passthrough_count += 1
+                cue_dur = end - start
+                if cue_dur >= min_seg:
+                    timeline.append(("lipsync", start, end))
+                    lipsync_count += 1
+                else:
+                    timeline.append(("passthrough", start, end))
+                    passthrough_count += 1
+                    short_passthrough_count += 1
+                cursor = end
+            if cursor < duration - 1e-3:
+                timeline.append(("passthrough", cursor, duration))
+                passthrough_count += 1
+
+            logger.info(
+                "[LipSync/SRT] duration=%.3fs cues=%d lipsync_segments=%d "
+                "passthrough_segments=%d (short=%d) min_seg=%.3fs",
+                duration, len(intervals), lipsync_count, passthrough_count,
+                short_passthrough_count, min_seg,
+            )
+
+            if not timeline:
+                # Entire video is covered by a single cue with no head/tail gap.
+                timeline.append(("lipsync" if lipsync_count else "passthrough", 0.0, duration))
+
+            segments_dir = job_output_dir / "segments"
+            segments_dir.mkdir(parents=True, exist_ok=True)
+
+            segment_clips: List[Path] = []
+            seg_results: List[Dict[str, object]] = []
+            seg_descriptors: List[Dict[str, object]] = []
+
+            for index, (kind, start, end) in enumerate(timeline):
+                seg_dur = end - start
+                if seg_dur <= 1e-3:
+                    continue
+                seg_tag = f"{index:03d}_{kind}"
+                seg_dir = segments_dir / seg_tag
+                seg_dir.mkdir(parents=True, exist_ok=True)
+
+                if kind == "lipsync":
+                    seg_video = seg_dir / "video_in.mp4"
+                    seg_audio = seg_dir / "audio_in.wav"
+                    _extract_video_subclip(video_path, start, seg_dur, seg_video)
+                    _extract_audio_subclip(audio_path, start, seg_dur, seg_audio)
+                    seg_paths = {"video": seg_video, "audio": seg_audio}
+                    seg_result = self.synthesize(
+                        payload, seg_paths, seg_dir, reference_embedding=reference_embedding
+                    )
+                    seg_out = Path(seg_result["output_path"])  # type: ignore[index]
+                    seg_results.append(seg_result)
+                    seg_descriptors.append({
+                        "index": index, "kind": "lipsync",
+                        "start": start, "end": end, "duration": seg_dur,
+                    })
+                else:
+                    seg_out = seg_dir / "passthrough.mp4"
+                    _extract_passthrough_subclip(video_path, start, seg_dur, seg_out)
+                    seg_descriptors.append({
+                        "index": index, "kind": "passthrough",
+                        "start": start, "end": end, "duration": seg_dur,
+                    })
+                segment_clips.append(seg_out)
+
+            if not segment_clips:
+                raise HTTPException(status_code=500, detail="SRT orchestration produced no segments")
+
+            _concat_clips(segment_clips, final_output_path)
+            logger.info(
+                "[LipSync/SRT] concatenated %d segments -> %s",
+                len(segment_clips), final_output_path,
+            )
+
+            srt_summary = {
+                "enabled": True,
+                "srt_path": str(srt_path),
+                "cue_count": len(intervals),
+                "lipsync_segments": lipsync_count,
+                "passthrough_segments": passthrough_count,
+                "short_passthrough_segments": short_passthrough_count,
+                "min_segment_seconds": min_seg,
+                "duration_seconds": duration,
+                "segments": seg_descriptors,
+            }
+
+            return _merge_segment_stats(
+                seg_results,
+                final_output_path,
+                source_frame_count,
+                source_fps,
+                srt_summary,
+            )
+
 
 runtime = LatentSyncApiRuntime()
 
@@ -2210,7 +2604,19 @@ async def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str,
             ".jpg",
         )
 
-    video_path, audio_path, avatar_downloaded = await asyncio.gather(
+    async def _download_srt():
+        if not payload.srt_url:
+            return None
+        return await asyncio.to_thread(
+            _download_to_file,
+            payload.srt_url,
+            job_input_dir,
+            "srt",
+            SRT_SUFFIXES,
+            ".srt",
+        )
+
+    video_path, audio_path, avatar_downloaded, srt_path = await asyncio.gather(
         asyncio.to_thread(
             _download_to_file, payload.video_url, job_input_dir, "video", VIDEO_SUFFIXES, ".mp4"
         ),
@@ -2218,6 +2624,7 @@ async def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str,
             _download_to_file, payload.audio_url, job_input_dir, "audio", AUDIO_SUFFIXES, ".wav"
         ),
         _download_avatar(),
+        _download_srt(),
     )
     try:
         input_paths = {"video": video_path, "audio": audio_path}
@@ -2272,13 +2679,24 @@ async def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str,
                 logger.warning(f"[LipSync] Face embedder not available")
         else:
             logger.info(f"[LipSync] No avatar_url provided, skipping face matching")
-        result = await asyncio.to_thread(
-            runtime.synthesize,
-            payload,
-            input_paths,
-            job_output_dir,
-            reference_embedding=reference_embedding,
-        )
+        if srt_path is not None:
+            logger.info(f"[LipSync/SRT] srt_url provided, running segment-based lip-sync: {srt_path}")
+            result = await asyncio.to_thread(
+                runtime.synthesize_srt,
+                payload,
+                input_paths,
+                job_output_dir,
+                srt_path,
+                reference_embedding,
+            )
+        else:
+            result = await asyncio.to_thread(
+                runtime.synthesize,
+                payload,
+                input_paths,
+                job_output_dir,
+                reference_embedding=reference_embedding,
+            )
     except HTTPException:
         raise
     except Exception as exc:
