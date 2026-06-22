@@ -4153,9 +4153,14 @@ class LipsyncPipeline(DiffusionPipeline):
                 max_delta_scales = [1.0] * batch_len
                 strength_scales = [1.0] * batch_len
                 audio_scales_batch = batch_audio_motion_scales[:batch_len]
-                if audio_scales_batch:
-                    a_lo = min(audio_scales_batch)
-                    a_hi = max(audio_scales_batch)
+                # Normalize audio energy over the WHOLE clip, not per batch, so a
+                # frame's stabilization strength does not step at every
+                # num_frames batch boundary inside a continuous segment (the
+                # same audio energy would otherwise map to a different
+                # strength_scale depending on which batch it lands in).
+                if audio_motion_scales:
+                    a_lo = min(audio_motion_scales)
+                    a_hi = max(audio_motion_scales)
                     a_span = max(a_hi - a_lo, 1e-6)
                 else:
                     a_lo = a_hi = a_span = 0.0
@@ -5044,7 +5049,14 @@ class LipsyncPipeline(DiffusionPipeline):
                         f"scene_frames={scene_output.shape[0]}"
                     )
 
-                synced_video_frames = np.concatenate(scene_output_frames, axis=0)
+                if not scene_output_frames:
+                    # Every scene was dropped as empty (e.g. all scenes
+                    # validated to zero length). Fall back to an empty output
+                    # rather than crashing on np.concatenate([]).
+                    logger.warning("[LipSync] all scenes empty; returning empty output")
+                    synced_video_frames = np.zeros((0,) + video_frames.shape[1:], dtype=video_frames.dtype)
+                else:
+                    synced_video_frames = np.concatenate(scene_output_frames, axis=0)
                 aggregated_stats = self._aggregate_scene_stats(scene_stats_list)
                 aggregated_stats["scene_split_enabled"] = True
                 aggregated_stats["scene_split_threshold"] = scene_split_threshold
