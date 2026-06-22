@@ -108,12 +108,17 @@ class ImageProcessor:
         source_bbox = None
         landmark_2d_106 = None
         selected_embedding = None
+        # detected_faces from the target-embedding selection pass (if it ran).
+        # Reused below for the IoU-based embedding lookup so we don't pay for a
+        # second InsightFace forward on the same frame.
+        prior_detected_faces = None
         if target_embedding is not None and self.face_embedder is not None:
             target = np.asarray(target_embedding, dtype=np.float32)
             target_norm = float(np.linalg.norm(target))
             if target_norm > 1e-6:
                 target = target / target_norm
                 detected_faces = self.face_embedder.get(image.astype(np.uint8) if image.dtype != np.uint8 else image)
+                prior_detected_faces = detected_faces
                 best_face = None
                 best_score = -1.0
                 for detected_face in detected_faces:
@@ -160,7 +165,13 @@ class ImageProcessor:
 
         embedding = selected_embedding
         if self.face_embedder is not None:
-            detected_faces = self.face_embedder.get(image.astype(np.uint8) if image.dtype != np.uint8 else image)
+            # Reuse the detection results from the target-embedding pass when
+            # available; only run a fresh face_embedder.get when that pass did
+            # not run (target_embedding was None).
+            if prior_detected_faces is not None:
+                detected_faces = prior_detected_faces
+            else:
+                detected_faces = self.face_embedder.get(image.astype(np.uint8) if image.dtype != np.uint8 else image)
             best_face = None
             best_iou = -1.0
             for detected_face in detected_faces:

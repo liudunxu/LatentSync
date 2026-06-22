@@ -1076,6 +1076,56 @@ def _read_video_frames(video_path: Path) -> Tuple[List[np.ndarray], float]:
     return frames, fps
 
 
+def _read_sampled_video_frames(
+    video_path: Path,
+    sample_interval: int,
+    max_frames: Optional[int],
+) -> Tuple[List[np.ndarray], float, int, List[int]]:
+    """Decode only the sampled frame indices for /api/faces scanning.
+
+    Returns ``(frames_bgr, fps, total_frame_count, frame_indices)`` where
+    ``frame_indices[i]`` is the original video frame number of
+    ``frames_bgr[i]``. Frames are BGR to match the cv2/InsightFace convention
+    used elsewhere. decord is preferred (it can decode an arbitrary index set
+    without reading the whole file); cv2 is the fallback.
+    """
+    indices: List[int] = []
+    fps = 25.0
+    total = 0
+    try:
+        from decord import VideoReader
+
+        vr = VideoReader(str(video_path))
+        total = len(vr)
+        raw_fps = float(vr.get_avg_fps())
+        if raw_fps and not math.isnan(raw_fps) and raw_fps > 1:
+            fps = raw_fps
+        for i in range(0, total, sample_interval):
+            indices.append(i)
+            if max_frames is not None and len(indices) >= max_frames:
+                break
+        if indices:
+            # vr[list] returns RGB (N, H, W, 3); convert to BGR for InsightFace.
+            rgb_batch = vr.get_batch(indices).asnumpy()
+            frames = [cv2.cvtColor(f, cv2.COLOR_RGB2BGR) for f in rgb_batch]
+        else:
+            frames = []
+        vr.seek(0)
+        return frames, fps, total, indices
+    except Exception:
+        # Fallback: cv2 full decode + slice. Keeps behavior identical to the
+        # prior /api/faces path on containers decord can't handle.
+        frames_all, fps = _read_video_frames(video_path)
+        total = len(frames_all)
+        indices = []
+        for i in range(0, total, sample_interval):
+            indices.append(i)
+            if max_frames is not None and len(indices) >= max_frames:
+                break
+        frames = [frames_all[i] for i in indices]
+        return frames, fps, total, indices
+
+
 def _clip_box(bbox: Tuple[int, int, int, int], frame_shape: Tuple[int, ...]) -> Optional[Tuple[int, int, int, int]]:
     height, width = frame_shape[:2]
     x1, y1, x2, y2 = [int(round(v)) for v in bbox]
@@ -1464,8 +1514,17 @@ class LatentSyncApiRuntime:
         # the GPU inference pipeline, so it should not block behind the
         # lipsync run_lock. The detector singleton is protected by load_lock
         # during initialization and is read-only after that.
-        frames, fps = _read_video_frames(video_path)
+        # Probe fps cheaply (header only) to derive the sample interval, then
+        # decode only the sampled frames instead of the whole video.
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) if cap.isOpened() else 0
+        cap.release()
+        if not fps or math.isnan(fps) or fps <= 1:
+            fps = 25.0
         sample_interval = payload.frame_sample_interval or max(1, int(round(fps / 2.0)))
+        frames, fps, total_frame_count, frame_indices = _read_sampled_video_frames(
+            video_path, sample_interval, payload.max_frames
+        )
         scanned_frames = 0
         detections = 0
         rejected_low_score = 0
@@ -1475,15 +1534,9 @@ class LatentSyncApiRuntime:
         rejected_avatar_crop = 0
 
         face_infos: List[Dict[str, object]] = []
-        frame_indices = range(0, len(frames), sample_interval)
-        total_scan_frames = len(frame_indices)
-        if payload.max_frames:
-            total_scan_frames = min(total_scan_frames, payload.max_frames)
+        total_scan_frames = len(frames)
 
-        for frame_index in frame_indices:
-            if payload.max_frames and scanned_frames >= payload.max_frames:
-                break
-            frame = frames[frame_index]
+        for pos, (frame, orig_frame_index) in enumerate(zip(frames, frame_indices)):
             scanned_frames += 1
             for face in self._detect_faces(frame):
                 if face["detection_score"] < payload.min_detection_score:
@@ -1505,7 +1558,11 @@ class LatentSyncApiRuntime:
                 # cached on the face dict so the cluster loop can take the
                 # max without recomputing. Mirrors MuseTalk 8a382f0.
                 face["mouth_openness"] = self._compute_mouth_openness(frame, face["bbox"])
-                face["frame_index"] = frame_index
+                # frame_index is the original video frame number (kept for the
+                # API response); _pos is the index into the sampled `frames`
+                # list, used to fetch the representative crop below.
+                face["frame_index"] = orig_frame_index
+                face["_pos"] = pos
                 face_infos.append(face)
 
         # Cluster faces by embedding (fallback to bbox similarity)
@@ -1539,6 +1596,7 @@ class LatentSyncApiRuntime:
                 if area > int(c["max_area"]):
                     c["max_area"] = area
                     c["best_frame_index"] = info["frame_index"]
+                    c["best_pos"] = info["_pos"]
                     c["best_bbox"] = info["bbox"]
                     c["best_detection_score"] = info["detection_score"]
                 if info_openness > float(c.get("mouth_motion_max_openness", 0.0)):
@@ -1549,6 +1607,7 @@ class LatentSyncApiRuntime:
                     "count": 1,
                     "max_area": _box_area(info["bbox"]),
                     "best_frame_index": info["frame_index"],
+                    "best_pos": info["_pos"],
                     "best_bbox": info["bbox"],
                     "best_detection_score": info["detection_score"],
                     "descriptors": [info],
@@ -1577,7 +1636,7 @@ class LatentSyncApiRuntime:
         face_paths = []
         face_items = []
         for cluster in clusters:
-            frame = frames[int(cluster["best_frame_index"])]
+            frame = frames[int(cluster["best_pos"])]
             crop = self._crop_face(frame, cluster["best_bbox"], payload.crop_padding)
             if crop is None:
                 rejected_avatar_crop += 1
@@ -1600,7 +1659,7 @@ class LatentSyncApiRuntime:
         return {
             "face_paths": face_paths,
             "faces": face_items,
-            "source_frame_count": len(frames),
+            "source_frame_count": total_frame_count,
             "frame_sample_interval": sample_interval,
             "scanned_frame_count": scanned_frames,
             "detected_face_count": detections,
@@ -2200,7 +2259,13 @@ async def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str,
                 logger.warning(f"[LipSync] Face embedder not available")
         else:
             logger.info(f"[LipSync] No avatar_url provided, skipping face matching")
-        result = runtime.synthesize(payload, input_paths, job_output_dir, reference_embedding=reference_embedding)
+        result = await asyncio.to_thread(
+            runtime.synthesize,
+            payload,
+            input_paths,
+            job_output_dir,
+            reference_embedding=reference_embedding,
+        )
     except HTTPException:
         raise
     except Exception as exc:

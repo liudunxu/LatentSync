@@ -3675,17 +3675,23 @@ class LipsyncPipeline(DiffusionPipeline):
             )
         audio_motion_scales = [1.0] * len(skip_mask)
         if mouth_audio_adaptive_motion_enabled and len(skip_mask) > 0:
-            frame_rms = []
             samples_per_frame = max(1, int(round(float(audio_sample_rate) / max(float(video_fps), 1e-6))))
             audio_float = audio_samples.detach().to(torch.float32)
-            for frame_index in range(len(skip_mask)):
-                start = frame_index * samples_per_frame
-                end = min(int(audio_float.shape[0]), start + samples_per_frame)
-                if start >= end:
-                    frame_rms.append(0.0)
-                else:
-                    frame_rms.append(float(audio_float[start:end].pow(2).mean().sqrt().item()))
-            rms_tensor = torch.tensor(frame_rms, dtype=torch.float32)
+            num_frames = len(skip_mask)
+            needed = num_frames * samples_per_frame
+            # Pad the audio buffer up to a whole number of frames so a single
+            # unfold covers every frame; the padded tail is zeros, which makes
+            # the RMS of a short trailing frame 0.0 (matching the prior
+            # start >= end branch).
+            if audio_float.shape[0] < needed:
+                pad = torch.zeros(needed - audio_float.shape[0], dtype=audio_float.dtype, device=audio_float.device)
+                audio_float = torch.cat([audio_float, pad], dim=0)
+            # (num_frames, samples_per_frame) -> per-frame RMS in one op.
+            windows = audio_float[:needed].unfold(0, samples_per_frame, samples_per_frame)
+            frame_rms_tensor = windows.pow(2).mean(dim=1).sqrt()
+            # Keep the quantile/clamp math on CPU to match the prior behavior
+            # (frame_rms was a CPU list before).
+            rms_tensor = frame_rms_tensor.detach().cpu()
             if rms_tensor.numel() > 0 and float(rms_tensor.max().item()) > 0:
                 lo = torch.quantile(rms_tensor, 0.20)
                 hi = torch.quantile(rms_tensor, 0.90)
@@ -3976,6 +3982,19 @@ class LipsyncPipeline(DiffusionPipeline):
             # EMA can't smear previous frames' content into the original-face
             # area (root cause of "previous frame's different face glued in"
             # artifacts with the wider inpaint mask).
+            # _mouth_core_mask is identical for both the temporal EMA's
+            # motion-preserve block and the stabilization block (same
+            # generated_region_mask + first_center), so compute it once and
+            # reuse across both. Guarded so we don't build it when neither
+            # block will run.
+            mouth_core_mask = None
+            if (
+                (mouth_motion_preserve_strength > 0 and temporal_smoothing_enabled)
+                or mouth_temporal_stabilization_strength > 0
+            ):
+                mouth_core_mask = self._mouth_core_mask(
+                    generated_region_mask, mouth_center_norm=first_center
+                )
             if temporal_smoothing_enabled:
                 current_mouth_motion = decoded_latents
                 decoded_latents, prev_face, prev_valid = self._smooth_face_sequence(
@@ -3987,7 +4006,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     region_mask=generated_region_mask,
                 )
                 if mouth_motion_preserve_strength > 0:
-                    mouth_motion_mask = self._mouth_core_mask(generated_region_mask, mouth_center_norm=first_center).to(
+                    mouth_motion_mask = mouth_core_mask.to(
                         device=decoded_latents.device,
                         dtype=decoded_latents.dtype,
                     )
@@ -4005,7 +4024,7 @@ class LipsyncPipeline(DiffusionPipeline):
                         * (current_mouth_motion - decoded_latents)
                     )
             if mouth_temporal_stabilization_strength > 0:
-                mouth_stabilize_mask = self._mouth_core_mask(generated_region_mask, mouth_center_norm=first_center).to(
+                mouth_stabilize_mask = mouth_core_mask.to(
                     device=decoded_latents.device,
                     dtype=decoded_latents.dtype,
                 )
