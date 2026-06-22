@@ -2188,7 +2188,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "track_switch": ema_resets_on_track_switch,
         }
 
-    def detect_main_speaker_embedding(self, video_frames: np.ndarray, face_embedder, min_detection_score: float = 0.30) -> Optional[np.ndarray]:
+    def detect_main_speaker_embedding(self, video_frames: np.ndarray, face_embedder, min_detection_score: float = 0.50) -> Optional[np.ndarray]:
         if face_embedder is None or len(video_frames) == 0:
             self._last_active_speaker_stats = {
                 "enabled": face_embedder is not None,
@@ -2248,7 +2248,7 @@ class LipsyncPipeline(DiffusionPipeline):
                         best_score = score
                         best_cluster = cluster_idx
 
-                if best_cluster is not None and best_score >= 0.72:
+                if best_cluster is not None and best_score >= 0.55:
                     cluster = clusters[best_cluster]
                     count = int(cluster["count"]) + 1
                     cluster["count"] = count
@@ -3204,7 +3204,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # (``detect_main_speaker_embedding``): faces below this InsightFace
         # confidence are dropped before clustering, so a blurry small face
         # can't win the speaker vote. Mirrors ``LipSyncRequest.min_detection_score``.
-        min_detection_score: float = 0.30,
+        min_detection_score: float = 0.50,
     ):
         logger.info(
             f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
@@ -3645,7 +3645,7 @@ class LipsyncPipeline(DiffusionPipeline):
         identity_yaw_adaptive_enabled = kwargs.get("identity_yaw_adaptive_enabled", True)
         identity_yaw_adaptive_scale = kwargs.get("identity_yaw_adaptive_scale", 0.15)
         identity_yaw_adaptive_band_deg = kwargs.get("identity_yaw_adaptive_band_deg", 25.0)
-        min_detection_score = kwargs.get("min_detection_score", 0.30)
+        min_detection_score = kwargs.get("min_detection_score", 0.50)
         temporal_smoothing_enabled = kwargs.get("temporal_smoothing_enabled", True)
         mouth_motion_preserve_strength = kwargs.get("mouth_motion_preserve_strength", 0.45)
         mouth_temporal_stabilization_strength = kwargs.get("mouth_temporal_stabilization_strength", 0.15)
@@ -4782,7 +4782,7 @@ class LipsyncPipeline(DiffusionPipeline):
         identity_yaw_adaptive_enabled: bool = True,
         identity_yaw_adaptive_scale: float = 0.15,
         identity_yaw_adaptive_band_deg: float = 25.0,
-        min_detection_score: float = 0.30,
+        min_detection_score: float = 0.50,
         # --- quality / temporal gating (added 2026-06) ---
         temporal_smoothing_enabled: bool = True,
         # Preserve current-frame mouth-core motion after temporal smoothing.
@@ -5127,6 +5127,20 @@ class LipsyncPipeline(DiffusionPipeline):
                     f"threshold={scene_split_threshold}, "
                     f"scene_durations=[{', '.join(f'{d:.3f}s' for d in scene_durations)}]"
                 )
+
+                # Detect the main speaker ONCE over the whole video (before the
+                # per-scene loop) instead of re-running it per scene. Short
+                # scenes (sub-second) sample too few frames for stable
+                # clustering/scoring, which let a blurry face win the speaker
+                # vote within a single scene. Sampling across the full video
+                # gives a reliable, consistent reference for every scene.
+                if apply_identity_filter and reference_embedding is None and face_embedder is not None:
+                    full_video_reference = self.detect_main_speaker_embedding(
+                        video_frames, face_embedder, min_detection_score=min_detection_score
+                    )
+                    if full_video_reference is not None:
+                        _process_clip_kwargs["reference_embedding"] = full_video_reference
+                        logger.info("[LipSync] Auto-detected main speaker embedding (whole-video, pre-scene)")
 
                 # Free the full-frame buffer now that scene boundaries are known.
                 # Each scene will be loaded on demand from the FPS-normalized

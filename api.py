@@ -322,7 +322,7 @@ class LipSyncRequest(BaseModel):
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
     identity_scan_require_landmark_match: bool = False
-    min_detection_score: float = Field(0.30, ge=0.0, le=1.0)
+    min_detection_score: float = Field(0.50, ge=0.0, le=1.0)
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
