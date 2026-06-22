@@ -2188,7 +2188,7 @@ class LipsyncPipeline(DiffusionPipeline):
             "track_switch": ema_resets_on_track_switch,
         }
 
-    def detect_main_speaker_embedding(self, video_frames: np.ndarray, face_embedder) -> Optional[np.ndarray]:
+    def detect_main_speaker_embedding(self, video_frames: np.ndarray, face_embedder, min_detection_score: float = 0.30) -> Optional[np.ndarray]:
         if face_embedder is None or len(video_frames) == 0:
             self._last_active_speaker_stats = {
                 "enabled": face_embedder is not None,
@@ -2220,12 +2220,17 @@ class LipsyncPipeline(DiffusionPipeline):
                 x1, y1, x2, y2 = [float(v) for v in bbox]
                 face_w = max(0.0, x2 - x1)
                 face_h = max(0.0, y2 - y1)
-                if face_w < 8 or face_h < 8:
+                if face_w < 24 or face_h < 24:
+                    continue
+                det_score = float(getattr(face, "det_score", 0.0))
+                if det_score < min_detection_score:
                     continue
                 face_size = max(face_w, face_h)
                 lmk = getattr(face, "landmark_2d_106", None)
                 mouth_ratio = self._mouth_open_ratio(lmk, face_size)
                 area_ratio = float((face_w * face_h) / max(1.0, frame_w * frame_h))
+                if area_ratio < 0.015:
+                    continue
                 center_x = (x1 + x2) * 0.5 / max(1.0, frame_w)
                 center_y = (y1 + y2) * 0.5 / max(1.0, frame_h)
                 center_dist = math.sqrt((center_x - 0.5) ** 2 + (center_y - 0.5) ** 2)
@@ -2258,6 +2263,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     cluster["area_values"].append(float(area_ratio))
                     cluster["center_values"].append(float(center_score))
                     cluster["yaw_values"].append(float(yaw))
+                    cluster["det_score_values"].append(float(det_score))
                     if mouth_ratio > float(cluster.get("best_mouth_ratio", 0.0)):
                         cluster["best_frame_index"] = idx
                         cluster["best_mouth_ratio"] = float(mouth_ratio)
@@ -2269,6 +2275,7 @@ class LipsyncPipeline(DiffusionPipeline):
                         "area_values": [float(area_ratio)],
                         "center_values": [float(center_score)],
                         "yaw_values": [float(yaw)],
+                        "det_score_values": [float(det_score)],
                         "best_frame_index": idx,
                         "best_mouth_ratio": float(mouth_ratio),
                     })
@@ -2291,21 +2298,24 @@ class LipsyncPipeline(DiffusionPipeline):
             area_values = cluster["area_values"]
             center_values = cluster["center_values"]
             yaw_values = cluster["yaw_values"]
+            det_score_values = cluster["det_score_values"]
             count = int(cluster["count"])
             coverage_score = min(1.0, count / max(1.0, len(sample_indices) * 0.35))
             mouth_max = max(mouth_values) if mouth_values else 0.0
             mouth_motion = (max(mouth_values) - min(mouth_values)) if len(mouth_values) >= 2 else mouth_max
             mouth_max_score = float(np.clip(mouth_max / 0.08, 0.0, 1.0))
-            mouth_motion_score = float(np.clip(mouth_motion / 0.04, 0.0, 1.0))
-            area_score = float(np.clip(statistics.median(area_values) / 0.12, 0.0, 1.0)) if area_values else 0.0
+            mouth_motion_score = float(np.clip(mouth_motion / 0.06, 0.0, 1.0))
+            area_score = float(np.clip(statistics.median(area_values) / 0.10, 0.0, 1.0)) if area_values else 0.0
             center_score = float(statistics.median(center_values)) if center_values else 0.0
             yaw_penalty = float(np.clip((statistics.median(yaw_values) if yaw_values else 0.0) / 45.0, 0.0, 1.0))
+            quality_score = float(np.clip(statistics.median(det_score_values) if det_score_values else 0.0, 0.0, 1.0))
             score = (
-                0.40 * mouth_motion_score
-                + 0.25 * mouth_max_score
-                + 0.15 * coverage_score
-                + 0.12 * area_score
+                0.28 * mouth_motion_score
+                + 0.17 * mouth_max_score
+                + 0.13 * coverage_score
+                + 0.20 * area_score
                 + 0.08 * center_score
+                + 0.14 * quality_score
                 - 0.10 * yaw_penalty
             )
             ranked.append({
@@ -2317,6 +2327,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 "area_median": float(statistics.median(area_values)) if area_values else 0.0,
                 "center_median": center_score,
                 "yaw_median": float(statistics.median(yaw_values)) if yaw_values else 0.0,
+                "det_score_median": float(statistics.median(det_score_values)) if det_score_values else 0.0,
                 "best_frame_index": int(cluster.get("best_frame_index", 0)),
             })
             if score > best_score:
@@ -3189,6 +3200,11 @@ class LipsyncPipeline(DiffusionPipeline):
         # inpaint region drifts off the mouth. Mirrors
         # ``LipSyncRequest.aligned_mouth_ema_alpha``.
         aligned_mouth_ema_alpha: float = 0.85,
+        # Detection-score floor for the auto-detected main speaker sweep
+        # (``detect_main_speaker_embedding``): faces below this InsightFace
+        # confidence are dropped before clustering, so a blurry small face
+        # can't win the speaker vote. Mirrors ``LipSyncRequest.min_detection_score``.
+        min_detection_score: float = 0.30,
     ):
         logger.info(
             f"[LipSync] loop_video: reference_embedding={'loaded' if reference_embedding is not None else 'None'}, "
@@ -3212,7 +3228,7 @@ class LipsyncPipeline(DiffusionPipeline):
         )
         auto_reference_embedding = False
         if apply_identity_filter and reference_embedding is None and face_embedder is not None:
-            reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder)
+            reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder, min_detection_score=min_detection_score)
             auto_reference_embedding = reference_embedding is not None
             logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
         effective_apply_identity_filter = bool(apply_identity_filter and reference_embedding is not None)
@@ -3519,7 +3535,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     "adaptive_quality_fallback_hysteresis_frames", "identity_similarity_threshold",
                     "apply_identity_filter", "identity_yaw_adaptive_enabled",
                     "identity_yaw_adaptive_scale", "identity_yaw_adaptive_band_deg",
-                    "audio_sync_offset_seconds"):
+                    "min_detection_score", "audio_sync_offset_seconds"):
             if key in first:
                 aggregated[key] = first[key]
 
@@ -3629,6 +3645,7 @@ class LipsyncPipeline(DiffusionPipeline):
         identity_yaw_adaptive_enabled = kwargs.get("identity_yaw_adaptive_enabled", True)
         identity_yaw_adaptive_scale = kwargs.get("identity_yaw_adaptive_scale", 0.15)
         identity_yaw_adaptive_band_deg = kwargs.get("identity_yaw_adaptive_band_deg", 25.0)
+        min_detection_score = kwargs.get("min_detection_score", 0.30)
         temporal_smoothing_enabled = kwargs.get("temporal_smoothing_enabled", True)
         mouth_motion_preserve_strength = kwargs.get("mouth_motion_preserve_strength", 0.45)
         mouth_temporal_stabilization_strength = kwargs.get("mouth_temporal_stabilization_strength", 0.15)
@@ -3785,6 +3802,7 @@ class LipsyncPipeline(DiffusionPipeline):
             identity_yaw_adaptive_enabled=identity_yaw_adaptive_enabled,
             identity_yaw_adaptive_scale=identity_yaw_adaptive_scale,
             identity_yaw_adaptive_band_deg=identity_yaw_adaptive_band_deg,
+            min_detection_score=min_detection_score,
             side_face_episode_pre_pad=side_face_episode_pre_pad,
             side_face_episode_post_pad=side_face_episode_post_pad,
             side_face_blend_fade_frames=side_face_blend_fade_frames,
@@ -4764,6 +4782,7 @@ class LipsyncPipeline(DiffusionPipeline):
         identity_yaw_adaptive_enabled: bool = True,
         identity_yaw_adaptive_scale: float = 0.15,
         identity_yaw_adaptive_band_deg: float = 25.0,
+        min_detection_score: float = 0.30,
         # --- quality / temporal gating (added 2026-06) ---
         temporal_smoothing_enabled: bool = True,
         # Preserve current-frame mouth-core motion after temporal smoothing.

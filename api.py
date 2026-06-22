@@ -1819,6 +1819,7 @@ class LatentSyncApiRuntime:
                 identity_yaw_adaptive_enabled=payload.identity_yaw_adaptive_enabled,
                 identity_yaw_adaptive_scale=payload.identity_yaw_adaptive_scale,
                 identity_yaw_adaptive_band_deg=payload.identity_yaw_adaptive_band_deg,
+                min_detection_score=payload.min_detection_score,
                 quality_gate_enabled=payload.quality_gate_enabled,
                 quality_min_laplacian=payload.quality_min_laplacian,
                 quality_min_sharpness_ratio=payload.quality_min_sharpness_ratio,
