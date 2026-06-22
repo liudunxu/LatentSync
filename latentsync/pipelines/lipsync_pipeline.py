@@ -2400,6 +2400,16 @@ class LipsyncPipeline(DiffusionPipeline):
         lipsync_min_face_area_ratio: float = 0.015,
         identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = False,
+        # Yaw-adaptive identity threshold: relax the identity similarity
+        # cutoff as the face turns away from frontal, so a profile-frame
+        # arcface embedding (whose cosine sim drops against a frontal
+        # avatar) does not wrongly skip a frame that should be inpainted.
+        # effective = base * (1 - scale * clip(yaw / band, 0, 1)); frontal
+        # (yaw=0) is unchanged and profile saturates at the lower bound.
+        # Falls back to ``base`` when yaw is unavailable.
+        identity_yaw_adaptive_enabled: bool = True,
+        identity_yaw_adaptive_scale: float = 0.15,
+        identity_yaw_adaptive_band_deg: float = 25.0,
         side_face_episode_pre_pad: int = 3,
         side_face_episode_post_pad: int = 3,
         side_face_blend_fade_frames: int = 3,
@@ -2569,13 +2579,6 @@ class LipsyncPipeline(DiffusionPipeline):
                         small_face_skip_count += 1
                 except Exception:
                     pass
-            if apply_identity_filter and reference_embedding is not None and face_emb is not None:
-                frame_identity_sim = float(np.dot(face_emb, reference_embedding))
-                identity_similarities.append(frame_identity_sim)
-                if frame_identity_sim < identity_similarity_threshold:
-                    should_skip = True
-                    identity_skip_count += 1
-            frame_identity_similarities.append(frame_identity_sim)
             yaw_deg = 0.0
             yaw_available = False
             yaw_was_skipped = False  # tracks the absolute yaw threshold (not yaw_rate)
@@ -2602,6 +2605,29 @@ class LipsyncPipeline(DiffusionPipeline):
                 ):
                     should_skip = True
                     side_face_passthrough_count += 1
+            # Identity similarity check (moved below the yaw block so the
+            # effective threshold can relax with yaw -- a profile-frame
+            # arcface embedding drops cosine sim against a frontal avatar,
+            # which would otherwise wrongly skip a frame that should be
+            # inpainted).
+            if apply_identity_filter and reference_embedding is not None and face_emb is not None:
+                frame_identity_sim = float(np.dot(face_emb, reference_embedding))
+                identity_similarities.append(frame_identity_sim)
+                effective_identity_threshold = identity_similarity_threshold
+                if (
+                    identity_yaw_adaptive_enabled
+                    and yaw_available
+                    and yaw_skip_threshold > 0
+                    and identity_yaw_adaptive_band_deg > 0
+                ):
+                    frac = min(1.0, abs(yaw_deg) / identity_yaw_adaptive_band_deg)
+                    effective_identity_threshold = identity_similarity_threshold * (
+                        1.0 - identity_yaw_adaptive_scale * frac
+                    )
+                if frame_identity_sim < effective_identity_threshold:
+                    should_skip = True
+                    identity_skip_count += 1
+            frame_identity_similarities.append(frame_identity_sim)
             # Yaw-rate (deg/frame) catches the mid-turn frames where the face
             # hasn't crossed the absolute threshold yet but is rotating fast
             # enough that affine alignment is unreliable. Threshold is per
@@ -3133,6 +3159,16 @@ class LipsyncPipeline(DiffusionPipeline):
         lipsync_min_face_area_ratio: float = 0.015,
         identity_similarity_threshold: float = 0.5,
         apply_identity_filter: bool = False,
+        # Yaw-adaptive identity threshold: relax the identity similarity
+        # cutoff as the face turns away from frontal, so a profile-frame
+        # arcface embedding (whose cosine sim drops against a frontal
+        # avatar) does not wrongly skip a frame that should be inpainted.
+        # effective = base * (1 - scale * clip(yaw / band, 0, 1)); frontal
+        # (yaw=0) is unchanged and profile saturates at the lower bound.
+        # Falls back to ``base`` when yaw is unavailable.
+        identity_yaw_adaptive_enabled: bool = True,
+        identity_yaw_adaptive_scale: float = 0.15,
+        identity_yaw_adaptive_band_deg: float = 25.0,
         side_face_episode_pre_pad: int = 3,
         side_face_episode_post_pad: int = 3,
         side_face_blend_fade_frames: int = 3,
@@ -3220,6 +3256,9 @@ class LipsyncPipeline(DiffusionPipeline):
                 lipsync_min_face_area_ratio=lipsync_min_face_area_ratio,
                 identity_similarity_threshold=identity_similarity_threshold,
                 apply_identity_filter=effective_apply_identity_filter,
+                identity_yaw_adaptive_enabled=identity_yaw_adaptive_enabled,
+                identity_yaw_adaptive_scale=identity_yaw_adaptive_scale,
+                identity_yaw_adaptive_band_deg=identity_yaw_adaptive_band_deg,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
                 side_face_blend_fade_frames=side_face_blend_fade_frames,
@@ -3335,6 +3374,9 @@ class LipsyncPipeline(DiffusionPipeline):
                 lipsync_min_face_area_ratio=lipsync_min_face_area_ratio,
                 identity_similarity_threshold=identity_similarity_threshold,
                 apply_identity_filter=effective_apply_identity_filter,
+                identity_yaw_adaptive_enabled=identity_yaw_adaptive_enabled,
+                identity_yaw_adaptive_scale=identity_yaw_adaptive_scale,
+                identity_yaw_adaptive_band_deg=identity_yaw_adaptive_band_deg,
                 side_face_episode_pre_pad=side_face_episode_pre_pad,
                 side_face_episode_post_pad=side_face_episode_post_pad,
                 side_face_blend_fade_frames=side_face_blend_fade_frames,
@@ -3475,7 +3517,9 @@ class LipsyncPipeline(DiffusionPipeline):
                     "shot_passthrough_min_bad_frames", "adaptive_quality_fallback_enabled",
                     "adaptive_quality_fallback_threshold", "adaptive_quality_fallback_max_ratio",
                     "adaptive_quality_fallback_hysteresis_frames", "identity_similarity_threshold",
-                    "apply_identity_filter", "audio_sync_offset_seconds"):
+                    "apply_identity_filter", "identity_yaw_adaptive_enabled",
+                    "identity_yaw_adaptive_scale", "identity_yaw_adaptive_band_deg",
+                    "audio_sync_offset_seconds"):
             if key in first:
                 aggregated[key] = first[key]
 
@@ -3582,6 +3626,9 @@ class LipsyncPipeline(DiffusionPipeline):
         face_embedder = kwargs.get("face_embedder")
         apply_identity_filter = kwargs.get("apply_identity_filter", False)
         identity_similarity_threshold = kwargs.get("identity_similarity_threshold", 0.5)
+        identity_yaw_adaptive_enabled = kwargs.get("identity_yaw_adaptive_enabled", True)
+        identity_yaw_adaptive_scale = kwargs.get("identity_yaw_adaptive_scale", 0.15)
+        identity_yaw_adaptive_band_deg = kwargs.get("identity_yaw_adaptive_band_deg", 25.0)
         temporal_smoothing_enabled = kwargs.get("temporal_smoothing_enabled", True)
         mouth_motion_preserve_strength = kwargs.get("mouth_motion_preserve_strength", 0.45)
         mouth_temporal_stabilization_strength = kwargs.get("mouth_temporal_stabilization_strength", 0.15)
@@ -3735,6 +3782,9 @@ class LipsyncPipeline(DiffusionPipeline):
             scene_cut_break_threshold=scene_cut_break_threshold,
             lipsync_min_face_area_ratio=lipsync_min_face_area_ratio,
             identity_similarity_threshold=identity_similarity_threshold,
+            identity_yaw_adaptive_enabled=identity_yaw_adaptive_enabled,
+            identity_yaw_adaptive_scale=identity_yaw_adaptive_scale,
+            identity_yaw_adaptive_band_deg=identity_yaw_adaptive_band_deg,
             side_face_episode_pre_pad=side_face_episode_pre_pad,
             side_face_episode_post_pad=side_face_episode_post_pad,
             side_face_blend_fade_frames=side_face_blend_fade_frames,
@@ -4637,6 +4687,9 @@ class LipsyncPipeline(DiffusionPipeline):
             "shot_passthrough_shots": int(shot_passthrough_stats.get("shots", 0)),
             "shot_passthrough_frames": int(shot_passthrough_stats.get("frames", 0)),
             "identity_similarity_threshold": identity_similarity_threshold,
+            "identity_yaw_adaptive_enabled": identity_yaw_adaptive_enabled,
+            "identity_yaw_adaptive_scale": identity_yaw_adaptive_scale,
+            "identity_yaw_adaptive_band_deg": identity_yaw_adaptive_band_deg,
             "identity_similarity": getattr(
                 self,
                 "_last_identity_similarity_stats",
@@ -4708,6 +4761,9 @@ class LipsyncPipeline(DiffusionPipeline):
         face_embedder=None,
         apply_identity_filter: bool = False,
         identity_similarity_threshold: float = 0.5,
+        identity_yaw_adaptive_enabled: bool = True,
+        identity_yaw_adaptive_scale: float = 0.15,
+        identity_yaw_adaptive_band_deg: float = 25.0,
         # --- quality / temporal gating (added 2026-06) ---
         temporal_smoothing_enabled: bool = True,
         # Preserve current-frame mouth-core motion after temporal smoothing.

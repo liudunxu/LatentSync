@@ -257,6 +257,12 @@ class LipSyncRequest(BaseModel):
         False,
         description="Enable identity filtering. When True, uses avatar if provided; otherwise auto-detects the main speaker and filters to that face.",
     )
+    identity_yaw_adaptive_enabled: bool = Field(
+        True,
+        description="Relax the identity similarity threshold as the face turns away from frontal (a profile-frame arcface embedding drops cosine sim against a frontal avatar and would otherwise wrongly skip a frame that should be inpainted).",
+    )
+    identity_yaw_adaptive_scale: float = Field(0.15, ge=0.0, le=0.5)
+    identity_yaw_adaptive_band_deg: float = Field(25.0, ge=5.0, le=90.0)
     scene_split_enabled: bool = Field(
         True,
         description="Split the video by detected scenes and run lip-sync on each scene independently, then concatenate the results.",
@@ -1810,6 +1816,9 @@ class LatentSyncApiRuntime:
                 face_embedder=runtime.face_embedder,
                 apply_identity_filter=effective_apply_identity_filter,
                 identity_similarity_threshold=payload.similarity_threshold,
+                identity_yaw_adaptive_enabled=payload.identity_yaw_adaptive_enabled,
+                identity_yaw_adaptive_scale=payload.identity_yaw_adaptive_scale,
+                identity_yaw_adaptive_band_deg=payload.identity_yaw_adaptive_band_deg,
                 quality_gate_enabled=payload.quality_gate_enabled,
                 quality_min_laplacian=payload.quality_min_laplacian,
                 quality_min_sharpness_ratio=payload.quality_min_sharpness_ratio,
@@ -2049,6 +2058,9 @@ class LatentSyncApiRuntime:
                 "identity_similarity_median": float(identity_similarity_stats.get("median", 0.0)),
                 "identity_similarity_max": float(identity_similarity_stats.get("max", 0.0)),
                 "identity_similarity_threshold": float(run_stats.get("identity_similarity_threshold", payload.similarity_threshold)),
+                "identity_yaw_adaptive_enabled": bool(run_stats.get("identity_yaw_adaptive_enabled", payload.identity_yaw_adaptive_enabled)),
+                "identity_yaw_adaptive_scale": float(run_stats.get("identity_yaw_adaptive_scale", payload.identity_yaw_adaptive_scale)),
+                "identity_yaw_adaptive_band_deg": float(run_stats.get("identity_yaw_adaptive_band_deg", payload.identity_yaw_adaptive_band_deg)),
                 "active_speaker": dict(active_speaker_stats),
                 "apply_identity_filter": bool(effective_apply_identity_filter),
                 "target_identity_similarity": 0.0,
