@@ -1578,6 +1578,18 @@ class LipsyncPipeline(DiffusionPipeline):
             detail_mask = (m * (1.0 - mouth_core)).expand(-1, 3, -1, -1)
 
             ref_detail = r - LipsyncPipeline._gaussian_blur_separable(r, radius=radius)
+            # Zero-mean the residual inside the detail region per sample/channel.
+            # ref_detail = r - blur(r) is the reference face's high-frequency
+            # residual, but it still carries a low-frequency color offset at
+            # strong local edges (lip boundary, cheek shadow). Adding it back
+            # onto the color-matched generated face re-introduces the
+            # reference's local tone there, partially undoing the color match
+            # and leaving a faint hue seam at the mask boundary. Subtracting
+            # the detail-region weighted mean removes the color offset while
+            # preserving the high-frequency skin texture (pores, lip contour).
+            detail_weight_sum = detail_mask.sum(dim=(2, 3)).clamp_min(1e-6)  # (B, 3)
+            ref_detail_mean = (ref_detail * detail_mask).sum(dim=(2, 3)) / detail_weight_sum  # (B, 3)
+            ref_detail = ref_detail - ref_detail_mean[:, :, None, None]
             out = x + detail_mask * strength * ref_detail
             if squeeze:
                 out = out.squeeze(0)
