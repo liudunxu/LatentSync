@@ -3826,11 +3826,6 @@ class LipsyncPipeline(DiffusionPipeline):
         skipped_inference_frames = 0
         logged_first_generated_batch = False
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
-            # p_bias EMA from the previous batch would mis-represent the
-            # first frames of this batch when scene content shifts.
-            # Reset before re-using the AlignRestore singleton so the
-            # per-frame smoothing converges from this batch's own data.
-            self.image_processor.restorer.reset_p_bias()
             batch_start = i * num_frames
             batch_end = min((i + 1) * num_frames, len(whisper_chunks))
             inference_skip_mask = skip_mask[batch_start:batch_end]
