@@ -208,8 +208,11 @@ def write_video_via_ffmpeg(
     ]
     proc = subprocess.Popen(command, stdin=subprocess.PIPE)
     try:
-        for frame in video_frames:
-            proc.stdin.write(frame.astype(np.uint8).tobytes())
+        # One contiguous write instead of a per-frame Python loop. The frames
+        # may be non-contiguous (e.g. from np.concatenate), so force a copy
+        # into a contiguous uint8 buffer first.
+        buf = np.ascontiguousarray(video_frames, dtype=np.uint8)
+        proc.stdin.write(buf.tobytes())
         proc.stdin.close()
     except BrokenPipeError as exc:
         proc.wait()

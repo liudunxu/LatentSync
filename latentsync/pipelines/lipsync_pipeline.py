@@ -1897,11 +1897,15 @@ class LipsyncPipeline(DiffusionPipeline):
             try:
                 # (B, C, H, W) -> (1, C*H*W, B) for F.conv1d over batch dim.
                 x = face_crops.permute(1, 2, 3, 0).reshape(-1, B).unsqueeze(0)
+                # Normalize the kernel so the interior frames match the loop
+                # path's per-frame normalization for any weights, not just the
+                # default sum-to-1 triplet.
+                wsum = w_prev + w_cur + w_next
                 kernel = torch.tensor(
                     [[[w_prev, w_cur, w_next]]],
                     dtype=x.dtype,
                     device=x.device,
-                )
+                ) / wsum
                 # Replicate padding keeps boundaries from shrinking.
                 x_padded = torch.nn.functional.pad(x, (1, 1), mode="replicate")
                 y = torch.nn.functional.conv1d(x_padded, kernel, padding=0)
@@ -1912,7 +1916,13 @@ class LipsyncPipeline(DiffusionPipeline):
                     w_prev * prev_face.to(face_crops.device)
                     + w_cur * face_crops[0]
                     + w_next * face_crops[1]
-                ) / (w_prev + w_cur + w_next)
+                ) / wsum
+                # Match the loop path at the trailing boundary: the last frame
+                # has no next neighbor, so the replicate pad incorrectly pulls
+                # in a copy of itself. Normalize over (w_prev, w_cur) only.
+                smoothed[-1] = (
+                    w_prev * face_crops[-2] + w_cur * face_crops[-1]
+                ) / (w_prev + w_cur)
                 last_face = face_crops[-1]
                 last_valid = True
                 return smoothed, last_face, last_valid

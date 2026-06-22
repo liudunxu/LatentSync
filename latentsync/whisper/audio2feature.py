@@ -6,6 +6,16 @@ import numpy as np
 import torch
 import os
 from pathlib import Path
+from typing import Dict, Tuple
+
+
+# Per-process memory of (path, size, mtime) -> content hash digest. The cache
+# key for embeds is the file's SHA-256 (so identical content at different paths
+# shares a cache, and a changed file invalidates it), but recomputing the hash
+# on every request -- including cache hits -- wastes a full file read. Since
+# Audio2Feature is a singleton loaded once at startup, memoizing the digest by
+# file identity lets repeated requests for the same audio skip the hash pass.
+_PATH_HASH_CACHE: Dict[Tuple[str, int, int], str] = {}
 
 
 class Audio2Feature:
@@ -125,12 +135,23 @@ class Audio2Feature:
 
     @staticmethod
     def _compute_audio_hash(audio_path: str) -> str:
-        """Return the first 8 hex chars of the file's SHA-256 hash."""
+        """Return the first 8 hex chars of the file's SHA-256 hash.
+
+        Memoized by ``(path, size, mtime_ns)`` so a repeated request for the
+        same file instance is an O(1) stat lookup instead of a full file read.
+        """
+        st = os.stat(audio_path)
+        identity = (audio_path, st.st_size, st.st_mtime_ns)
+        cached = _PATH_HASH_CACHE.get(identity)
+        if cached is not None:
+            return cached
         h = hashlib.sha256()
         with open(audio_path, "rb") as f:
             for chunk in iter(lambda: f.read(65536), b""):
                 h.update(chunk)
-        return h.hexdigest()[:8]
+        digest = h.hexdigest()[:8]
+        _PATH_HASH_CACHE[identity] = digest
+        return digest
 
     @staticmethod
     def _compute_cache_path(cache_dir: str, audio_path: str) -> str:
