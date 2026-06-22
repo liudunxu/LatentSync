@@ -89,14 +89,33 @@ class TestColorMatch(unittest.TestCase):
 
     def test_partial_strength_interpolates(self):
         # strength=0.5 should move halfway between input and full transfer.
+        # Use a large tone delta (>= 0.4) so the adaptive scaling saturates
+        # to 1.0 and strength acts as the exact interpolation coefficient.
         torch, LipsyncPipeline = self._import()
         x = torch.full((3, 32, 32), 0.1)
-        r = torch.full((3, 32, 32), 0.3)
+        r = torch.full((3, 32, 32), 0.5)
         m = torch.ones(1, 32, 32)
         out = LipsyncPipeline._match_color_to_reference(x, r, m, strength=0.5)
-        # Input mean 0.1, ref mean 0.3, so halfway ~= 0.2.
+        # Input mean 0.1, ref mean 0.5, so halfway ~= 0.3.
         out_mean = out.mean(dim=(1, 2)).mean().item()
-        self.assertAlmostEqual(out_mean, 0.2, places=4)
+        self.assertAlmostEqual(out_mean, 0.3, places=4)
+
+    def test_adaptive_strength_attenuates_on_small_tone_delta(self):
+        # When the generated face is already close to the reference tone,
+        # the adaptive scaling should attenuate the transfer below the
+        # requested strength so a near-match is not over-corrected.
+        torch, LipsyncPipeline = self._import()
+        x = torch.full((3, 32, 32), 0.10)
+        r = torch.full((3, 32, 32), 0.12)  # tiny delta (0.02 << 0.4)
+        m = torch.ones(1, 32, 32)
+        out = LipsyncPipeline._match_color_to_reference(x, r, m, strength=0.6)
+        out_mean = out.mean(dim=(1, 2)).mean().item()
+        # With delta 0.02, diff_norm ~= 0.05, strength_scale ~= 0.43,
+        # eff_strength ~= 0.6 * 0.43 ~= 0.26 -> out ~= 0.10 + 0.26*0.02 ~= 0.105.
+        # The output should move only a tiny amount toward the reference,
+        # much less than the 0.6 strength would normally produce (0.112).
+        self.assertLess(abs(out_mean - 0.10), 0.02)
+        self.assertLess(out_mean, 0.112)
 
     def test_batched_input(self):
         # (B, 3, H, W) with (B, 1, H, W) mask must not raise.

@@ -1417,7 +1417,22 @@ class LipsyncPipeline(DiffusionPipeline):
             scale = tgt_std / src_std
             shift = tgt_mean - src_mean * scale
             adjusted = x * scale[:, :, None, None] + shift[:, :, None, None]
-            mixed = x + m3 * strength * (adjusted - x)
+            # Adaptive strength: scale the transfer by how far the generated
+            # face's tone is from the reference. When they already match
+            # (small per-channel mean delta) a fixed strength over-corrects
+            # and hurts naturalness; when the inpainter drifted noticeably
+            # the transfer needs to act fully. mean(|src-tgt|) over channels
+            # in [-1, 1] is ~0 for a match and ~0.4+ for a visible drift.
+            # strength >= 1.0 is treated as an explicit "fully align" escape
+            # hatch and bypasses the scaling so callers can force exact stats.
+            if strength >= 1.0:
+                eff_strength = torch.full((x.shape[0], 1), 1.0, device=x.device, dtype=x.dtype)
+            else:
+                color_diff = (src_mean - tgt_mean).abs().mean(dim=1)  # (B,)
+                diff_norm = (color_diff / 0.4).clamp(0.0, 1.0)
+                strength_scale = 0.4 + 0.6 * diff_norm  # 0.4x close .. 1.0x drifted
+                eff_strength = (strength * strength_scale).clamp(0.0, 1.0).view(-1, 1)
+            mixed = x + m3 * eff_strength[:, :, None, None] * (adjusted - x)
             if squeeze:
                 mixed = mixed.squeeze(0)
             return mixed.to(face.dtype)
