@@ -4122,6 +4122,43 @@ class LipsyncPipeline(DiffusionPipeline):
                 )
                 if mouth_stabilize_mask.dim() == 4 and mouth_stabilize_mask.shape[1] == 1:
                     mouth_stabilize_mask = mouth_stabilize_mask.expand(-1, 3, -1, -1)
+                # Adaptive scaling per frame:
+                # (A1) Widen max_delta on large mouth openings (half_height in
+                #   aligned 512 space; ~3px closed, ~30px wide laugh). A fixed
+                #   max_delta trips the EMA chain on legitimate laughs / deep
+                #   lipstick / beards, leaving the laugh's first frame
+                #   un-smoothed. Scale max_delta up with openness so big motion
+                #   is tolerated while closed-mouth frames stay tight.
+                # (A2) Reduce stabilization strength on weak audio. The
+                #   generated mouth barely moves on quiet/airy speech; a fixed
+                #   strength locks it in place ("frozen mouth"). Scale strength
+                #   with the per-frame audio motion scale so weak-audio frames
+                #   keep their small generated motion.
+                batch_len = decoded_latents.shape[0]
+                max_delta_scales = [1.0] * batch_len
+                strength_scales = [1.0] * batch_len
+                audio_scales_batch = batch_audio_motion_scales[:batch_len]
+                if audio_scales_batch:
+                    a_lo = min(audio_scales_batch)
+                    a_hi = max(audio_scales_batch)
+                    a_span = max(a_hi - a_lo, 1e-6)
+                else:
+                    a_lo = a_hi = a_span = 0.0
+                batch_mouth_info_all = aligned_mouth_info[batch_start:batch_start + batch_len]
+                for k in range(batch_len):
+                    # A1: mouth-opening scale from aligned half_height (px).
+                    mi = batch_mouth_info_all[k] if k < len(batch_mouth_info_all) else None
+                    if mi is not None:
+                        open_norm = float(min(max((mi.get("half_height", 0.0) - 4.0) / 26.0, 0.0), 1.0))
+                    else:
+                        open_norm = 0.0
+                    max_delta_scales[k] = 1.0 + 2.0 * open_norm  # 1x closed .. 3x wide-open
+                    # A2: audio strength scale, normalized within this batch.
+                    if audio_scales_batch and a_span > 0:
+                        audio_norm = (float(audio_scales_batch[k]) - a_lo) / a_span
+                    else:
+                        audio_norm = 1.0
+                    strength_scales[k] = 0.4 + 0.6 * float(min(max(audio_norm, 0.0), 1.0))  # 0.4x weak .. 1x strong
                 batch_mouth_deltas: List[Optional[float]] = [None] * decoded_latents.shape[0]
                 for k in range(decoded_latents.shape[0]):
                     if inference_skip_mask[k] or inference_continuity_break_mask[k]:
@@ -4132,8 +4169,15 @@ class LipsyncPipeline(DiffusionPipeline):
                     current_frame = decoded_latents[k]
                     if prev_mouth_stabilized_valid and prev_mouth_stabilized is not None:
                         prev_frame = prev_mouth_stabilized.to(current_frame.device)
-                        effective_stabilization_strength = mouth_temporal_stabilization_strength
-                        if mouth_temporal_stabilization_max_delta > 0:
+                        # A2: scale base strength by per-frame audio energy.
+                        effective_stabilization_strength = (
+                            mouth_temporal_stabilization_strength * strength_scales[k]
+                        )
+                        # A1: widen max_delta for this frame's mouth opening.
+                        eff_max_delta = (
+                            mouth_temporal_stabilization_max_delta * max_delta_scales[k]
+                        ) if mouth_temporal_stabilization_max_delta > 0 else 0.0
+                        if eff_max_delta > 0:
                             mask_k = mouth_stabilize_mask[k]
                             mask_sum = mask_k.sum().clamp_min(1e-6)
                             mouth_delta = (
@@ -4142,7 +4186,7 @@ class LipsyncPipeline(DiffusionPipeline):
                             mouth_delta_values.append(float(mouth_delta.item()))
                             batch_mouth_deltas[k] = float(mouth_delta.item())
                             # Smoothstep taper: full blend at delta==0, zero at
-                            # delta>=max_delta. The hard "continue" was removed so
+                            # delta>=eff_max_delta. The hard "continue" was removed so
                             # very large mouth motion (head turn / scene cut) now
                             # rolls off the blend weight smoothly instead of
                             # producing a single-frame "no blend" pop, while the
@@ -4150,13 +4194,13 @@ class LipsyncPipeline(DiffusionPipeline):
                             # is still applied so the next frame blends from a
                             # fresh baseline.
                             continuity = 1.0 - (
-                                mouth_delta / mouth_temporal_stabilization_max_delta
+                                mouth_delta / eff_max_delta
                             ).clamp(0.0, 1.0)
                             continuity = continuity * continuity
                             effective_stabilization_strength = (
-                                mouth_temporal_stabilization_strength * float(continuity.item())
+                                mouth_temporal_stabilization_strength * strength_scales[k] * float(continuity.item())
                             )
-                            if float(mouth_delta.item()) > mouth_temporal_stabilization_max_delta:
+                            if float(mouth_delta.item()) > eff_max_delta:
                                 mouth_stabilization_delta_skip_count += 1
                                 prev_mouth_stabilized = current_frame.detach()
                                 prev_mouth_stabilized_valid = True
@@ -4174,6 +4218,15 @@ class LipsyncPipeline(DiffusionPipeline):
                     else:
                         prev_mouth_stabilized = current_frame.detach()
                     prev_mouth_stabilized_valid = True
+
+                if i == 0:
+                    logger.info(
+                        "[LipSync] adaptive stabilization: "
+                        f"max_delta_scale=[{min(max_delta_scales):.2f},{max(max_delta_scales):.2f}] "
+                        f"strength_scale=[{min(strength_scales):.2f},{max(strength_scales):.2f}] "
+                        f"(base max_delta={mouth_temporal_stabilization_max_delta}, "
+                        f"base strength={mouth_temporal_stabilization_strength})"
+                    )
 
             # Quality postfilter: flag frames whose generated mouth ROI is too
             # blurry to be worth showing. Checked AFTER paste/detail recovery.
