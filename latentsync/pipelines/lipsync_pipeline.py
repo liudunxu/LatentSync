@@ -3767,6 +3767,30 @@ class LipsyncPipeline(DiffusionPipeline):
                 f"[LipSync] silent_skip={silent_skip_count}/{len(silent_skip_mask)} "
                 f"(threshold={silent_rms_threshold}, min_run={silent_min_run_frames}, pad={silent_pad_frames})"
             )
+        # Trailing frames with zero-padded audio features (audio shorter than
+        # video) have no real audio to sync to. Generating from null audio
+        # embeddings produces a spurious "neutral mumble" mouth pasted onto the
+        # source face. Pass them through as source regardless of silent_skip,
+        # because this is "no audio" not "silent audio".
+        audio_pad_mask_in = kwargs.get("audio_pad_mask")
+        if audio_pad_mask_in:
+            n = len(skip_mask)
+            # Right-align: padding is always at the tail. If lengths differ
+            # (defensive), only apply where indices overlap at the end.
+            audio_pad_mask = [False] * n
+            offset = n - len(audio_pad_mask_in)
+            for i, v in enumerate(audio_pad_mask_in):
+                j = offset + i
+                if 0 <= j < n:
+                    audio_pad_mask[j] = bool(v)
+            audio_pad_count = sum(audio_pad_mask)
+            if audio_pad_count:
+                skip_mask = [a or b for a, b in zip(skip_mask, audio_pad_mask)]
+                continuity_break_mask = [a or b for a, b in zip(continuity_break_mask, audio_pad_mask)]
+                logger.info(
+                    f"[LipSync] audio_pad_passthrough={audio_pad_count}/{n} "
+                    f"(trailing frames with no audio -> source)"
+                )
         audio_motion_scales = [1.0] * len(skip_mask)
         if mouth_audio_adaptive_motion_enabled and len(skip_mask) > 0:
             samples_per_frame = max(1, int(round(float(audio_sample_rate) / max(float(video_fps), 1e-6))))
@@ -4915,16 +4939,31 @@ class LipsyncPipeline(DiffusionPipeline):
         # source frames, making the tail of the output look repeated.
         target_chunk_count = len(video_frames)
         target_sample_count = int(round(target_chunk_count * audio_sample_rate / video_fps))
+        # Track which trailing frames were padded with zero audio features so
+        # _process_clip can pass them through as source instead of generating a
+        # "neutral mumble" mouth from null audio embeddings. These frames have
+        # no audio, not merely silent audio, so they should not depend on the
+        # silent_skip_enabled toggle.
+        audio_pad_frame_count = 0
         if len(whisper_chunks) != target_chunk_count:
             if len(whisper_chunks) > target_chunk_count:
                 whisper_chunks = whisper_chunks[:target_chunk_count]
             elif whisper_chunks:
+                audio_pad_frame_count = target_chunk_count - len(whisper_chunks)
                 pad_feature = torch.zeros_like(whisper_chunks[0])
                 whisper_chunks = whisper_chunks + [
-                    pad_feature for _ in range(target_chunk_count - len(whisper_chunks))
+                    pad_feature for _ in range(audio_pad_frame_count)
                 ]
             logger.info(
                 f"[LipSync] normalized whisper_chunks: {len(whisper_chunks)} -> {target_chunk_count}"
+            )
+        # Per-frame mask: True for trailing frames that have no real audio
+        # (zero-feature padding). Passed to _process_clip to force passthrough.
+        audio_pad_mask = [False] * (target_chunk_count - audio_pad_frame_count) + [True] * audio_pad_frame_count
+        if audio_pad_frame_count:
+            logger.info(
+                f"[LipSync] audio shorter than video by {audio_pad_frame_count} frames; "
+                f"passing those trailing frames through as source"
             )
         if audio_samples.shape[0] != target_sample_count:
             if audio_samples.shape[0] > target_sample_count:
@@ -4951,7 +4990,8 @@ class LipsyncPipeline(DiffusionPipeline):
             "self", "video_path", "audio_path", "video_out_path", "scene_split_enabled",
             "scene_split_threshold", "min_scene_duration_seconds", "temp_dir",
             "video_frames", "audio_samples", "whisper_chunks", "whisper_feature",
-            "is_train", "kwargs"
+            "is_train", "kwargs", "audio_pad_mask", "audio_pad_frame_count",
+            "target_chunk_count", "target_sample_count"
         }}
         _process_clip_kwargs.update(kwargs)
 
@@ -5038,6 +5078,7 @@ class LipsyncPipeline(DiffusionPipeline):
                         video_frames=scene_frames,
                         audio_samples=scene_audio,
                         whisper_chunks=scene_chunks,
+                        audio_pad_mask=audio_pad_mask[start_frame:end_frame],
                         **_process_clip_kwargs,
                     )
                     scene_duration = time.perf_counter() - scene_start_time
@@ -5069,6 +5110,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     video_frames=video_frames,
                     audio_samples=audio_samples,
                     whisper_chunks=whisper_chunks,
+                    audio_pad_mask=audio_pad_mask,
                     **_process_clip_kwargs,
                 )
                 self._last_run_stats["scene_split_enabled"] = False
@@ -5080,6 +5122,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 video_frames=video_frames,
                 audio_samples=audio_samples,
                 whisper_chunks=whisper_chunks,
+                audio_pad_mask=audio_pad_mask,
                 **_process_clip_kwargs,
             )
             self._last_run_stats["scene_split_enabled"] = False
