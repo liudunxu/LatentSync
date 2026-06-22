@@ -3734,8 +3734,13 @@ class LipsyncPipeline(DiffusionPipeline):
         if mouth_audio_adaptive_motion_enabled and len(skip_mask) > 0:
             samples_per_frame = max(1, int(round(float(audio_sample_rate) / max(float(video_fps), 1e-6))))
             audio_float = audio_samples.detach().to(torch.float32)
-            num_frames = len(skip_mask)
-            needed = num_frames * samples_per_frame
+            # NOTE: deliberately a separate local -- do NOT reuse `num_frames`,
+            # which holds the UNet batch size (default 16). Overwriting it with
+            # the total frame count collapses the batch slicing below into a
+            # single giant batch and overflows the motion module's positional
+            # encoding (max_len 24).
+            total_audio_frames = len(skip_mask)
+            needed = total_audio_frames * samples_per_frame
             # Pad the audio buffer up to a whole number of frames so a single
             # unfold covers every frame; the padded tail is zeros, which makes
             # the RMS of a short trailing frame 0.0 (matching the prior
@@ -3743,7 +3748,7 @@ class LipsyncPipeline(DiffusionPipeline):
             if audio_float.shape[0] < needed:
                 pad = torch.zeros(needed - audio_float.shape[0], dtype=audio_float.dtype, device=audio_float.device)
                 audio_float = torch.cat([audio_float, pad], dim=0)
-            # (num_frames, samples_per_frame) -> per-frame RMS in one op.
+            # (total_audio_frames, samples_per_frame) -> per-frame RMS in one op.
             windows = audio_float[:needed].unfold(0, samples_per_frame, samples_per_frame)
             frame_rms_tensor = windows.pow(2).mean(dim=1).sqrt()
             # Keep the quantile/clamp math on CPU to match the prior behavior
