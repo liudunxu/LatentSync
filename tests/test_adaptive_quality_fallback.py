@@ -109,6 +109,23 @@ class TestAdaptiveQualityFallback(unittest.TestCase):
         out = LipsyncPipeline._apply_quality_hysteresis(fallback, hysteresis_frames=4)
         self.assertEqual(out, [False, True, True, True, True, True, False])
 
+    def test_hysteresis_suppresses_isolated_generated_in_fallback_run(self):
+        LipsyncPipeline = self._import_pipeline()
+        # A single generated (False) frame inside a long fallback (True) run
+        # would produce a one-frame generated blip in a passthrough segment.
+        # The symmetric pass should revert it to fallback.
+        fallback = [True, True, True, False, True, True, True]
+        out = LipsyncPipeline._apply_quality_hysteresis(fallback, hysteresis_frames=2)
+        self.assertEqual(out, [True, True, True, True, True, True, True])
+
+    def test_hysteresis_keeps_long_generated_run_inside_fallback(self):
+        LipsyncPipeline = self._import_pipeline()
+        # A 3-frame generated run (longer than hysteresis=2) inside a fallback
+        # run is a real generated segment and must be kept.
+        fallback = [True, True, False, False, False, True, True]
+        out = LipsyncPipeline._apply_quality_hysteresis(fallback, hysteresis_frames=2)
+        self.assertEqual(out, [True, True, False, False, False, True, True])
+
     def test_mouth_region_diff_normalized_zero_for_identical(self):
         LipsyncPipeline = self._import_pipeline()
         face = self._make_face(0.5)

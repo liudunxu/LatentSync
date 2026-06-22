@@ -82,7 +82,7 @@ class AlignRestore(object):
             # entire lower half of the face.
             inv_soft_mask = kornia.geometry.transform.warp_affine(
                 paste_mask_512.to(device=self.device, dtype=self.dtype).unsqueeze(0),
-                inv_affine_matrix, (h, w), padding_mode="zeros",
+                inv_affine_matrix, (h, w), padding_mode="border",
             )  # (1, 1, h, w)
             # Scale the feather sigma with the output resolution so the paste
             # seam stays soft on high-res frames. At 512x512 this keeps the

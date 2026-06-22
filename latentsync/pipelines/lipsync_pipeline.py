@@ -1327,6 +1327,23 @@ class LipsyncPipeline(DiffusionPipeline):
                 for k in range(i, j):
                     out[k] = False
             i = j
+        # Symmetric pass: a short generated (False) run sandwiched inside a
+        # long fallback (True) region produces a one-frame generated blip in
+        # the middle of a source-passthrough segment. Revert those short
+        # False runs to True so the passthrough stays continuous.
+        i = 0
+        while i < n:
+            if out[i]:
+                i += 1
+                continue
+            j = i
+            while j < n and not out[j]:
+                j += 1
+            run_len = j - i
+            if run_len <= hysteresis_frames and i > 0 and j < n:
+                for k in range(i, j):
+                    out[k] = True
+            i = j
         return out
 
     @staticmethod
@@ -2684,7 +2701,12 @@ class LipsyncPipeline(DiffusionPipeline):
                 prev_temporal_motion_state = None
                 prev_temporal_embedding = None
                 prev_temporal_face = None
-                prev_mouth_info = None
+                # NOTE: prev_mouth_info is intentionally NOT reset here. A skip
+                # frame returns the source frame unchanged (no mask is used),
+                # but the next *generated* frame still needs a stable EMA
+                # baseline for its mouth mask. Resetting would make that frame
+                # fall back to its own (possibly noisy) raw landmarks, causing
+                # mask-boundary jitter at every skip->generate recovery.
         logger.info(
             f"[FaceMatch] detect_fail={detect_fail_count}, identity_skip={identity_skip_count}, "
             f"yaw_skip={yaw_skip_count}, yaw_rate_skip={yaw_rate_skip_count}, "
@@ -3933,6 +3955,26 @@ class LipsyncPipeline(DiffusionPipeline):
                     ).clamp(0.0, 1.0)
                 else:
                     color_match_mask = generated_region_mask
+                # Exclude the mouth core (lip aperture / oral cavity) from the
+                # color transfer. The transfer matches per-channel mean/std,
+                # which are dominated by skin pixels; without exclusion the
+                # dark oral cavity gets pulled toward the skin mean and teeth
+                # lose brightness -> the "dark mouth goes grayish" artifact.
+                color_match_first_center = None
+                for mi in aligned_mouth_info[batch_start:batch_end]:
+                    if mi is not None:
+                        color_match_first_center = (mi["center_x"] / height, mi["center_y"] / height)
+                        break
+                color_match_core = self._mouth_core_mask(
+                    color_match_mask, mouth_center_norm=color_match_first_center
+                )
+                # _mouth_core_mask returns the same channel layout as its input;
+                # reduce to (B,1,H,W) before subtracting from color_match_mask.
+                if color_match_core.dim() == 4 and color_match_core.shape[1] == 3:
+                    color_match_core = color_match_core[:, 0:1]
+                elif color_match_core.dim() == 3:
+                    color_match_core = color_match_core.unsqueeze(0)
+                color_match_mask = (color_match_mask.float() - color_match_core.float()).clamp(0.0, 1.0)
                 color_match_mask = color_match_mask.to(
                     device=decoded_latents.device, dtype=decoded_latents.dtype
                 )
