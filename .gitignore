@@ -23,6 +23,7 @@ wandb/
 /test
 /models/
 /venv/
+/.venv/
 /detect_results/
 /temp
 

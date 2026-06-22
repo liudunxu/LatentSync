@@ -36,7 +36,15 @@ import cv2
 from kornia.filters import gaussian_blur2d
 
 from ..models.unet import UNet3DConditionModel
-from ..utils.util import read_video, read_audio, write_video, check_ffmpeg_installed
+from ..utils.util import (
+    read_video,
+    read_video_with_path,
+    read_video_decord_range,
+    read_audio,
+    write_video,
+    write_video_via_ffmpeg,
+    check_ffmpeg_installed,
+)
 from ..utils.image_processor import ImageProcessor, load_fixed_mask
 from ..whisper.audio2feature import Audio2Feature
 import tqdm
@@ -1400,6 +1408,28 @@ class LipsyncPipeline(DiffusionPipeline):
             return face
 
     @staticmethod
+    def _gaussian_blur_separable(x: torch.Tensor, radius: int = 3) -> torch.Tensor:
+        """Separable Gaussian blur for (B, 3, H, W) tensors in fp32.
+
+        ``x`` must already be 4-D and on the target device. This helper is
+        shared by detail restoration and unsharp mask to avoid building the
+        same kernel twice.
+        """
+        k = 2 * radius + 1
+        sigma = max(1.0, (k - 1) / 6.0)
+        ax = torch.arange(k, dtype=torch.float32, device=x.device) - radius
+        g1 = torch.exp(-(ax ** 2) / (2 * sigma * sigma))
+        g1 = g1 / g1.sum()
+        # Per-channel separable 1D convs (groups=3 so each input channel
+        # gets its own filter, which is just the 1D Gaussian repeated).
+        kx = g1.view(1, 1, 1, k).expand(3, 1, 1, k)
+        ky = g1.view(1, 1, k, 1).expand(3, 1, k, 1)
+        inp_pad = torch.nn.functional.pad(x, (radius, radius, 0, 0), mode="reflect")
+        inp_pad = torch.nn.functional.pad(inp_pad, (0, 0, radius, radius), mode="reflect")
+        tmp = torch.nn.functional.conv2d(inp_pad, kx, groups=3)
+        return torch.nn.functional.conv2d(tmp, ky, groups=3)
+
+    @staticmethod
     def _unsharp_mask(face: torch.Tensor, mask: torch.Tensor, amount: float = 0.35, radius: int = 3) -> torch.Tensor:
         """Light unsharp mask applied only inside `mask` (1 = sharpen, 0 = leave).
 
@@ -1433,20 +1463,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 m = m.expand(x.shape[0], -1, -1, -1)
             if m.shape[0] != x.shape[0]:
                 return face
-            # Build a small Gaussian kernel -- radius 3 ≈ sigma 1.0
-            k = 2 * radius + 1
-            sigma = max(1.0, (k - 1) / 6.0)
-            ax = torch.arange(k, dtype=torch.float32, device=x.device) - radius
-            g1 = torch.exp(-(ax ** 2) / (2 * sigma * sigma))
-            g1 = g1 / g1.sum()
-            # Per-channel separable 1D convs (groups=3 so each input channel
-            # gets its own filter, which is just the 1D Gaussian repeated).
-            kx = g1.view(1, 1, 1, k).expand(3, 1, 1, k)
-            ky = g1.view(1, 1, k, 1).expand(3, 1, k, 1)
-            inp_pad = torch.nn.functional.pad(x, (radius, radius, 0, 0), mode="reflect")
-            inp_pad = torch.nn.functional.pad(inp_pad, (0, 0, radius, radius), mode="reflect")
-            tmp = torch.nn.functional.conv2d(inp_pad, kx, groups=3)
-            blurred = torch.nn.functional.conv2d(tmp, ky, groups=3)
+            blurred = LipsyncPipeline._gaussian_blur_separable(x, radius=radius)
             sharpened = x + amount * (x - blurred)
             out = x + m * (sharpened - x)
             if squeeze:
@@ -1540,22 +1557,7 @@ class LipsyncPipeline(DiffusionPipeline):
             mouth_core = LipsyncPipeline._mouth_core_mask(m).to(torch.float32)
             detail_mask = (m * (1.0 - mouth_core)).expand(-1, 3, -1, -1)
 
-            k = 2 * radius + 1
-            sigma = max(1.0, (k - 1) / 6.0)
-            ax = torch.arange(k, dtype=torch.float32, device=x.device) - radius
-            g1 = torch.exp(-(ax ** 2) / (2 * sigma * sigma))
-            g1 = g1 / g1.sum()
-            kx = g1.view(1, 1, 1, k).expand(3, 1, 1, k)
-            ky = g1.view(1, 1, k, 1).expand(3, 1, k, 1)
-
-            def blur(inp: torch.Tensor) -> torch.Tensor:
-                padded = torch.nn.functional.pad(inp, (radius, radius, 0, 0), mode="reflect")
-                padded = torch.nn.functional.pad(padded, (0, 0, radius, radius), mode="reflect")
-                return torch.nn.functional.conv2d(
-                    torch.nn.functional.conv2d(padded, kx, groups=3), ky, groups=3
-                )
-
-            ref_detail = r - blur(r)
+            ref_detail = r - LipsyncPipeline._gaussian_blur_separable(r, radius=radius)
             out = x + detail_mask * strength * ref_detail
             if squeeze:
                 out = out.squeeze(0)
@@ -1880,6 +1882,43 @@ class LipsyncPipeline(DiffusionPipeline):
             continuity_break_mask = continuity_break_mask + [False] * (B - len(continuity_break_mask))
         elif len(continuity_break_mask) > B:
             continuity_break_mask = continuity_break_mask[:B]
+
+        # Fast path: when there are no skips, no breaks, no region mask, and
+        # a valid previous face, the 3-tap EMA is just a 1-D convolution over
+        # the batch dimension. This avoids the Python loop overhead.
+        can_vectorize = (
+            region_mask is None
+            and prev_valid
+            and prev_face is not None
+            and not any(inference_skip_mask)
+            and not any(continuity_break_mask)
+        )
+        if can_vectorize and B >= 2:
+            try:
+                # (B, C, H, W) -> (1, C*H*W, B) for F.conv1d over batch dim.
+                x = face_crops.permute(1, 2, 3, 0).reshape(-1, B).unsqueeze(0)
+                kernel = torch.tensor(
+                    [[[w_prev, w_cur, w_next]]],
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                # Replicate padding keeps boundaries from shrinking.
+                x_padded = torch.nn.functional.pad(x, (1, 1), mode="replicate")
+                y = torch.nn.functional.conv1d(x_padded, kernel, padding=0)
+                smoothed = y.squeeze(0).reshape(face_crops.shape[1:]).permute(3, 0, 1, 2)
+                # Incorporate prev_face at the first frame (the replicate pad
+                # used frame 0, but the true previous face should contribute).
+                smoothed[0] = (
+                    w_prev * prev_face.to(face_crops.device)
+                    + w_cur * face_crops[0]
+                    + w_next * face_crops[1]
+                ) / (w_prev + w_cur + w_next)
+                last_face = face_crops[-1]
+                last_valid = True
+                return smoothed, last_face, last_valid
+            except Exception:
+                # Fall through to the loop-based path on any unexpected error.
+                pass
 
         # Normalize region_mask to (B, 3, H, W) for broadcasting against
         # face_crops (B, 3, H, W). Accepts (B, H, W), (B, 1, H, W),
@@ -4465,7 +4504,7 @@ class LipsyncPipeline(DiffusionPipeline):
         adaptive_quality_fallback_enabled: bool = False,
         adaptive_quality_fallback_threshold: float = 0.35,
         adaptive_quality_fallback_max_ratio: float = 0.35,
-        adaptive_quality_fallback_hysteresis_frames: int = 2,
+        adaptive_quality_fallback_hysteresis_frames: int = 4,
         # Yaw-based prefilters for side faces / fast head turns. Defaults are
         # intentionally permissive so clear frontal faces are not filtered out.
         yaw_skip_threshold: float = 40.0,
@@ -4667,7 +4706,9 @@ class LipsyncPipeline(DiffusionPipeline):
                 pad = torch.zeros(offset_samples, dtype=audio_samples.dtype, device=audio_samples.device)
                 audio_samples = torch.cat([audio_samples[offset_samples:], pad], dim=0)
 
-        video_frames = read_video(video_path, use_decord=True, target_fps=float(video_fps))
+        video_frames, target_video_path = read_video_with_path(
+            video_path, use_decord=True, target_fps=float(video_fps)
+        )
         input_duration_seconds = float(video_frames.shape[0]) / max(float(video_fps), 1e-6)
         logger.info(
             f"[LipSync] video_frames shape={video_frames.shape}, "
@@ -4760,10 +4801,18 @@ class LipsyncPipeline(DiffusionPipeline):
                     f"scene_durations=[{', '.join(f'{d:.3f}s' for d in scene_durations)}]"
                 )
 
+                # Free the full-frame buffer now that scene boundaries are known.
+                # Each scene will be loaded on demand from the FPS-normalized
+                # video path, which keeps peak memory closer to the largest
+                # scene instead of the whole input.
+                del video_frames
+
                 scene_stats_list = []
                 scene_output_frames = []
                 for scene_idx, (start_frame, end_frame) in enumerate(scenes):
-                    scene_frames = video_frames[start_frame:end_frame]
+                    scene_frames = read_video_decord_range(
+                        target_video_path, start_frame, end_frame
+                    )
                     scene_chunks = whisper_chunks[start_frame:end_frame]
                     scene_audio = audio_samples[
                         int(round(start_frame * audio_sample_rate / video_fps)):
@@ -4848,11 +4897,22 @@ class LipsyncPipeline(DiffusionPipeline):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
 
-        write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps)
+        write_video_via_ffmpeg(
+            os.path.join(temp_dir, "video.mp4"),
+            synced_video_frames,
+            fps=video_fps,
+            crf=18,
+        )
 
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
-        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
+        # Copy the already-encoded video stream; only re-encode audio.
+        command = (
+            f"ffmpeg -y -loglevel error -nostdin "
+            f"-i {os.path.join(temp_dir, 'video.mp4')} "
+            f"-i {os.path.join(temp_dir, 'audio.wav')} "
+            f"-c:v copy -c:a aac -q:a 0 {video_out_path}"
+        )
         subprocess.run(command, shell=True)
 
         execution_duration_seconds = time.perf_counter() - pipeline_start_time

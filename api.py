@@ -137,6 +137,27 @@ settings = Settings()
 logger = logging.getLogger("latentsync.api")
 
 
+QUALITY_PRESETS = {
+    "natural": {
+        "color_match_strength": 0.55,
+        "mouth_detail_strength": 0.55,
+        "mouth_sharpen_strength": 0.20,
+        "mouth_temporal_stabilization_strength": 0.18,
+    },
+    "balanced": {
+        "color_match_strength": 0.60,
+        "mouth_detail_strength": 0.65,
+        "mouth_sharpen_strength": 0.30,
+        "mouth_temporal_stabilization_strength": 0.15,
+    },
+    "sharp": {
+        "color_match_strength": 0.65,
+        "mouth_detail_strength": 0.75,
+        "mouth_sharpen_strength": 0.45,
+        "mouth_temporal_stabilization_strength": 0.10,
+    },
+}
+
 LANGUAGE_LIPSYNC_PRESETS = {
     "english": {
         "guidance_scale": 1.45,
@@ -490,6 +511,15 @@ class LipSyncRequest(BaseModel):
         le=10.0,
         description="Skip sustained near-profile runs whose duration is > this many seconds; 0 disables.",
     )
+    # Quality preset for the post-processing chain. When set, it provides
+    # default values for color_match_strength, mouth_detail_strength,
+    # mouth_sharpen_strength, and mouth_temporal_stabilization_strength.
+    # Per-request explicit values still override the preset.
+    quality_preset_override: Optional[str] = Field(
+        None,
+        description="One of 'natural', 'balanced', 'sharp'. Maps to post-processing strength presets. None = no preset."
+    )
+
     # Per-request inference overrides. None = use server-side setting
     # (LATENTSYNC_GUIDANCE_SCALE / LATENTSYNC_INFERENCE_STEPS / LATENTSYNC_SEED
     # env vars, or their CLI flags). Frontend (~/Downloads/dub) sends these
@@ -670,7 +700,7 @@ class LipSyncRequest(BaseModel):
                     "raised until the budget is met.",
     )
     adaptive_quality_fallback_hysteresis_frames: int = Field(
-        2, ge=0, le=10,
+        4, ge=0, le=10,
         description="Suppress isolated single-frame fallback decisions. A run of fallback "
                     "frames shorter than or equal to this length is reverted unless it "
                     "touches the start/end of the clip.",
@@ -705,6 +735,37 @@ class FaceListRequest(BaseModel):
         le=1.0,
         description="Drop clusters whose max mouth-region dark-pixel ratio across the scan is below this. 0 disables; default 0.10 drops silent faces.",
     )
+
+
+def _apply_quality_preset(payload: LipSyncRequest) -> Dict[str, float]:
+    """Return per-request post-processing defaults from the quality preset.
+
+    Explicitly-set fields on ``payload`` take precedence over the preset.
+    The caller should use these values as the base before applying language
+    presets or server defaults.
+    """
+    preset_name = (payload.quality_preset_override or "").strip().lower()
+    if not preset_name:
+        return {}
+
+    preset = QUALITY_PRESETS.get(preset_name)
+    if preset is None:
+        logger.warning(
+            "[LipSync] Unknown quality_preset_override=%r; ignoring. "
+            "Supported: %s",
+            payload.quality_preset_override,
+            ", ".join(QUALITY_PRESETS.keys()),
+        )
+        return {}
+
+    result = dict(preset)
+    # Per-request explicit overrides win over the preset.
+    for field_name in result:
+        if _payload_field_was_set(payload, field_name):
+            explicit_value = getattr(payload, field_name)
+            if explicit_value is not None:
+                result[field_name] = explicit_value
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1399,156 +1460,159 @@ class LatentSyncApiRuntime:
         payload: FaceListRequest,
     ) -> Dict[str, object]:
         self.load_detectors()
-        with self.run_lock:
-            frames, fps = _read_video_frames(video_path)
-            sample_interval = payload.frame_sample_interval or max(1, int(round(fps / 2.0)))
-            scanned_frames = 0
-            detections = 0
-            rejected_low_score = 0
-            rejected_shape = 0
-            rejected_landmarks = 0
-            rejected_embedding = 0
-            rejected_avatar_crop = 0
+        # /api/faces only runs face detection / clustering; it does not use
+        # the GPU inference pipeline, so it should not block behind the
+        # lipsync run_lock. The detector singleton is protected by load_lock
+        # during initialization and is read-only after that.
+        frames, fps = _read_video_frames(video_path)
+        sample_interval = payload.frame_sample_interval or max(1, int(round(fps / 2.0)))
+        scanned_frames = 0
+        detections = 0
+        rejected_low_score = 0
+        rejected_shape = 0
+        rejected_landmarks = 0
+        rejected_embedding = 0
+        rejected_avatar_crop = 0
 
-            face_infos: List[Dict[str, object]] = []
-            frame_indices = range(0, len(frames), sample_interval)
-            total_scan_frames = len(frame_indices)
-            if payload.max_frames:
-                total_scan_frames = min(total_scan_frames, payload.max_frames)
+        face_infos: List[Dict[str, object]] = []
+        frame_indices = range(0, len(frames), sample_interval)
+        total_scan_frames = len(frame_indices)
+        if payload.max_frames:
+            total_scan_frames = min(total_scan_frames, payload.max_frames)
 
-            for frame_index in frame_indices:
-                if payload.max_frames and scanned_frames >= payload.max_frames:
-                    break
-                frame = frames[frame_index]
-                scanned_frames += 1
-                for face in self._detect_faces(frame):
-                    if face["detection_score"] < payload.min_detection_score:
-                        rejected_low_score += 1
-                        continue
-                    area = _box_area(face["bbox"])
-                    if area < payload.min_face_area:
-                        rejected_shape += 1
-                        continue
-                    aspect = (face["bbox"][2] - face["bbox"][0]) / max(1, face["bbox"][3] - face["bbox"][1])
-                    if aspect < 0.3 or aspect > 2.5:
-                        rejected_shape += 1
-                        continue
-                    if payload.require_face_embedding and face["embedding"] is None:
-                        rejected_embedding += 1
-                        continue
-                    detections += 1
-                    # Cheap HSV dark-pixel ratio on the lower-middle bbox --
-                    # cached on the face dict so the cluster loop can take the
-                    # max without recomputing. Mirrors MuseTalk 8a382f0.
-                    face["mouth_openness"] = self._compute_mouth_openness(frame, face["bbox"])
-                    face["frame_index"] = frame_index
-                    face_infos.append(face)
-
-            # Cluster faces by embedding (fallback to bbox similarity)
-            clusters: List[Dict[str, object]] = []
-            threshold = payload.similarity_threshold
-            for info in face_infos:
-                embedding = info.get("embedding")
-                best_cluster = None
-                best_score = -1.0
-                for i, cluster in enumerate(clusters):
-                    cluster_embedding = cluster.get("embedding")
-                    if embedding is not None and cluster_embedding is not None:
-                        score = float(np.dot(embedding, cluster_embedding))
-                    else:
-                        score = self._bbox_similarity(info["bbox"], cluster["best_bbox"])
-                    if score > best_score:
-                        best_score = score
-                        best_cluster = i
-
-                # Per-cluster max mouth openness -- a face that briefly
-                # opened its mouth once should be kept even if 90% of its
-                # sampled frames show a closed mouth. Mirrors MuseTalk
-                # 8a382f0.
-                info_openness = float(info.get("mouth_openness", 0.0))
-
-                if best_cluster is not None and best_score >= threshold:
-                    c = clusters[best_cluster]
-                    c["count"] = int(c["count"]) + 1
-                    c["descriptors"].append(info)
-                    area = _box_area(info["bbox"])
-                    if area > int(c["max_area"]):
-                        c["max_area"] = area
-                        c["best_frame_index"] = info["frame_index"]
-                        c["best_bbox"] = info["bbox"]
-                        c["best_detection_score"] = info["detection_score"]
-                    if info_openness > float(c.get("mouth_motion_max_openness", 0.0)):
-                        c["mouth_motion_max_openness"] = info_openness
-                else:
-                    clusters.append({
-                        "embedding": embedding,
-                        "count": 1,
-                        "max_area": _box_area(info["bbox"]),
-                        "best_frame_index": info["frame_index"],
-                        "best_bbox": info["bbox"],
-                        "best_detection_score": info["detection_score"],
-                        "descriptors": [info],
-                        "mouth_motion_max_openness": info_openness,
-                    })
-
-            clusters.sort(key=lambda c: (int(c["count"]), int(c["max_area"])), reverse=True)
-
-            # Drop silent clusters: faces whose mouth never visibly opened
-            # during the scan. Default threshold 0.10 keeps visible speakers
-            # and drops listeners / side-glance faces. Set
-            # ``min_mouth_openness=0`` on the request to disable.
-            # Mirrors MuseTalk 8a382f0.
-            rejected_silent_face_count = 0
-            if payload.min_mouth_openness > 0.0:
-                kept_clusters: List[Dict[str, object]] = []
-                for c in clusters:
-                    if float(c.get("mouth_motion_max_openness", 0.0)) >= payload.min_mouth_openness:
-                        kept_clusters.append(c)
-                    else:
-                        rejected_silent_face_count += 1
-                clusters = kept_clusters
-
-            faces_dir = output_dir / "faces"
-            faces_dir.mkdir(parents=True, exist_ok=True)
-            face_paths = []
-            face_items = []
-            for cluster in clusters:
-                frame = frames[int(cluster["best_frame_index"])]
-                crop = self._crop_face(frame, cluster["best_bbox"], payload.crop_padding)
-                if crop is None:
-                    rejected_avatar_crop += 1
+        for frame_index in frame_indices:
+            if payload.max_frames and scanned_frames >= payload.max_frames:
+                break
+            frame = frames[frame_index]
+            scanned_frames += 1
+            for face in self._detect_faces(frame):
+                if face["detection_score"] < payload.min_detection_score:
+                    rejected_low_score += 1
                     continue
-                index = len(face_paths)
-                face_path = faces_dir / f"face_{index:03d}.jpg"
-                cv2.imwrite(str(face_path), crop)
-                face_paths.append(face_path)
-                face_items.append({
-                    "path": face_path,
-                    "max_area": int(cluster["max_area"]),
-                    "frame_index": int(cluster["best_frame_index"]),
-                    "detection_score": float(cluster["best_detection_score"]),
-                    "count": int(cluster["count"]),
-                    "mouth_motion_max_openness": float(
-                        cluster.get("mouth_motion_max_openness", 0.0)
-                    ),
+                area = _box_area(face["bbox"])
+                if area < payload.min_face_area:
+                    rejected_shape += 1
+                    continue
+                aspect = (face["bbox"][2] - face["bbox"][0]) / max(1, face["bbox"][3] - face["bbox"][1])
+                if aspect < 0.3 or aspect > 2.5:
+                    rejected_shape += 1
+                    continue
+                if payload.require_face_embedding and face["embedding"] is None:
+                    rejected_embedding += 1
+                    continue
+                detections += 1
+                # Cheap HSV dark-pixel ratio on the lower-middle bbox --
+                # cached on the face dict so the cluster loop can take the
+                # max without recomputing. Mirrors MuseTalk 8a382f0.
+                face["mouth_openness"] = self._compute_mouth_openness(frame, face["bbox"])
+                face["frame_index"] = frame_index
+                face_infos.append(face)
+
+        # Cluster faces by embedding (fallback to bbox similarity)
+        clusters: List[Dict[str, object]] = []
+        threshold = payload.similarity_threshold
+        for info in face_infos:
+            embedding = info.get("embedding")
+            best_cluster = None
+            best_score = -1.0
+            for i, cluster in enumerate(clusters):
+                cluster_embedding = cluster.get("embedding")
+                if embedding is not None and cluster_embedding is not None:
+                    score = float(np.dot(embedding, cluster_embedding))
+                else:
+                    score = self._bbox_similarity(info["bbox"], cluster["best_bbox"])
+                if score > best_score:
+                    best_score = score
+                    best_cluster = i
+
+            # Per-cluster max mouth openness -- a face that briefly
+            # opened its mouth once should be kept even if 90% of its
+            # sampled frames show a closed mouth. Mirrors MuseTalk
+            # 8a382f0.
+            info_openness = float(info.get("mouth_openness", 0.0))
+
+            if best_cluster is not None and best_score >= threshold:
+                c = clusters[best_cluster]
+                c["count"] = int(c["count"]) + 1
+                c["descriptors"].append(info)
+                area = _box_area(info["bbox"])
+                if area > int(c["max_area"]):
+                    c["max_area"] = area
+                    c["best_frame_index"] = info["frame_index"]
+                    c["best_bbox"] = info["bbox"]
+                    c["best_detection_score"] = info["detection_score"]
+                if info_openness > float(c.get("mouth_motion_max_openness", 0.0)):
+                    c["mouth_motion_max_openness"] = info_openness
+            else:
+                clusters.append({
+                    "embedding": embedding,
+                    "count": 1,
+                    "max_area": _box_area(info["bbox"]),
+                    "best_frame_index": info["frame_index"],
+                    "best_bbox": info["bbox"],
+                    "best_detection_score": info["detection_score"],
+                    "descriptors": [info],
+                    "mouth_motion_max_openness": info_openness,
                 })
 
-            return {
-                "face_paths": face_paths,
-                "faces": face_items,
-                "source_frame_count": len(frames),
-                "frame_sample_interval": sample_interval,
-                "scanned_frame_count": scanned_frames,
-                "detected_face_count": detections,
-                "rejected_low_score_count": rejected_low_score,
-                "rejected_shape_count": rejected_shape,
-                "rejected_landmark_count": rejected_landmarks,
-                "rejected_embedding_count": rejected_embedding,
-                "rejected_avatar_crop_count": rejected_avatar_crop,
-                "rejected_silent_face_count": rejected_silent_face_count,
-                "min_mouth_openness_threshold": float(payload.min_mouth_openness),
-                "face_identity_backend": "embedding" if payload.require_face_embedding else "visual",
-            }
+        clusters.sort(key=lambda c: (int(c["count"]), int(c["max_area"])), reverse=True)
+
+        # Drop silent clusters: faces whose mouth never visibly opened
+        # during the scan. Default threshold 0.10 keeps visible speakers
+        # and drops listeners / side-glance faces. Set
+        # ``min_mouth_openness=0`` on the request to disable.
+        # Mirrors MuseTalk 8a382f0.
+        rejected_silent_face_count = 0
+        if payload.min_mouth_openness > 0.0:
+            kept_clusters: List[Dict[str, object]] = []
+            for c in clusters:
+                if float(c.get("mouth_motion_max_openness", 0.0)) >= payload.min_mouth_openness:
+                    kept_clusters.append(c)
+                else:
+                    rejected_silent_face_count += 1
+            clusters = kept_clusters
+
+        faces_dir = output_dir / "faces"
+        faces_dir.mkdir(parents=True, exist_ok=True)
+        face_paths = []
+        face_items = []
+        for cluster in clusters:
+            frame = frames[int(cluster["best_frame_index"])]
+            crop = self._crop_face(frame, cluster["best_bbox"], payload.crop_padding)
+            if crop is None:
+                rejected_avatar_crop += 1
+                continue
+            index = len(face_paths)
+            face_path = faces_dir / f"face_{index:03d}.jpg"
+            cv2.imwrite(str(face_path), crop)
+            face_paths.append(face_path)
+            face_items.append({
+                "path": face_path,
+                "max_area": int(cluster["max_area"]),
+                "frame_index": int(cluster["best_frame_index"]),
+                "detection_score": float(cluster["best_detection_score"]),
+                "count": int(cluster["count"]),
+                "mouth_motion_max_openness": float(
+                    cluster.get("mouth_motion_max_openness", 0.0)
+                ),
+            })
+
+        return {
+            "face_paths": face_paths,
+            "faces": face_items,
+            "source_frame_count": len(frames),
+            "frame_sample_interval": sample_interval,
+            "scanned_frame_count": scanned_frames,
+            "detected_face_count": detections,
+            "rejected_low_score_count": rejected_low_score,
+            "rejected_shape_count": rejected_shape,
+            "rejected_landmark_count": rejected_landmarks,
+            "rejected_embedding_count": rejected_embedding,
+            "rejected_avatar_crop_count": rejected_avatar_crop,
+            "rejected_silent_face_count": rejected_silent_face_count,
+            "min_mouth_openness_threshold": float(payload.min_mouth_openness),
+            "face_identity_backend": "embedding" if payload.require_face_embedding else "visual",
+        }
 
     @torch.no_grad()
     def synthesize(self, payload: LipSyncRequest, paths: Dict[str, Path], job_output_dir: Path, reference_embedding=None) -> Dict[str, object]:
@@ -1584,14 +1648,34 @@ class LatentSyncApiRuntime:
                 if payload.seed_override is not None
                 else settings.seed
             )
+            # Resolve quality-preset defaults before language presets so that
+            # per-request explicit values > quality preset > language preset.
+            quality_preset_overrides = _apply_quality_preset(payload)
+
             effective_mouth_temporal_stabilization_strength = (
                 payload.mouth_temporal_stabilization_strength
                 if _payload_field_was_set(payload, "mouth_temporal_stabilization_strength")
-                else language_preset.get(
+                else quality_preset_overrides.get(
                     "mouth_temporal_stabilization_strength",
-                    payload.mouth_temporal_stabilization_strength,
+                    language_preset.get(
+                        "mouth_temporal_stabilization_strength",
+                        payload.mouth_temporal_stabilization_strength,
+                    ),
                 )
             )
+
+            # Quality preset provides defaults for the post-processing strengths.
+            # Explicit per-request values already win inside _apply_quality_preset.
+            effective_color_match_strength = quality_preset_overrides.get(
+                "color_match_strength", payload.color_match_strength
+            )
+            effective_mouth_detail_strength = quality_preset_overrides.get(
+                "mouth_detail_strength", payload.mouth_detail_strength
+            )
+            effective_mouth_sharpen_strength = quality_preset_overrides.get(
+                "mouth_sharpen_strength", payload.mouth_sharpen_strength
+            )
+
             effective_mouth_audio_motion_min_scale = (
                 payload.mouth_audio_motion_min_scale
                 if _payload_field_was_set(payload, "mouth_audio_motion_min_scale")
@@ -1711,9 +1795,9 @@ class LatentSyncApiRuntime:
                     int(round(payload.speech_gate_fill_gap_seconds * float(self.config.data.video_fps))),
                 ),
                 silent_pad_frames=0,
-                color_match_strength=payload.color_match_strength,
-                mouth_detail_strength=payload.mouth_detail_strength,
-                mouth_sharpen_strength=payload.mouth_sharpen_strength,
+                color_match_strength=effective_color_match_strength,
+                mouth_detail_strength=effective_mouth_detail_strength,
+                mouth_sharpen_strength=effective_mouth_sharpen_strength,
                 mouth_temporal_stabilization_strength=effective_mouth_temporal_stabilization_strength,
                 mouth_temporal_stabilization_max_delta=payload.mouth_temporal_stabilization_max_delta,
                 mouth_audio_adaptive_motion_enabled=payload.mouth_audio_adaptive_motion_enabled,

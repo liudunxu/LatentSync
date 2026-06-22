@@ -55,32 +55,62 @@ def _probe_video_fps(video_path: str) -> float:
         cap.release()
 
 
-def read_video(video_path: str, change_fps=True, use_decord=True, target_fps: float = 25.0):
-    if change_fps:
-        source_fps = _probe_video_fps(video_path)
-        # Only re-encode when the source fps differs meaningfully from the
-        # target. Many inputs are already 25 fps, and the ffmpeg pass is a
-        # noticeable startup overhead we can skip.
-        if source_fps > 0 and abs(source_fps - target_fps) < 0.1:
-            target_video_path = video_path
-        else:
-            temp_dir = "temp"
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            os.makedirs(temp_dir, exist_ok=True)
-            command = (
-                f"ffmpeg -loglevel error -y -nostdin -i {video_path} -r {target_fps} -crf 18 "
-                f"{os.path.join(temp_dir, 'video.mp4')}"
-            )
-            subprocess.run(command, shell=True)
-            target_video_path = os.path.join(temp_dir, "video.mp4")
-    else:
-        target_video_path = video_path
+def _resolve_target_video_path(video_path: str, change_fps: bool, target_fps: float) -> str:
+    """Return the path to a video guaranteed to be at ``target_fps``.
 
+    If the source fps already matches, the original path is returned.
+    Otherwise a temporary re-encoded file is produced.
+    """
+    if not change_fps:
+        return video_path
+    source_fps = _probe_video_fps(video_path)
+    # Only re-encode when the source fps differs meaningfully from the
+    # target. Many inputs are already 25 fps, and the ffmpeg pass is a
+    # noticeable startup overhead we can skip.
+    if source_fps > 0 and abs(source_fps - target_fps) < 0.1:
+        return video_path
+    temp_dir = "temp"
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir, exist_ok=True)
+    target_video_path = os.path.join(temp_dir, "video.mp4")
+    command = (
+        f"ffmpeg -loglevel error -y -nostdin -i {video_path} -r {target_fps} -crf 18 "
+        f"{target_video_path}"
+    )
+    subprocess.run(command, shell=True)
+    return target_video_path
+
+
+def read_video_with_path(video_path: str, change_fps=True, use_decord=True, target_fps: float = 25.0):
+    """Return (frames, target_video_path) where frames are decoded from the
+    path at ``target_fps``. The returned path can be used with
+    ``read_video_decord_range`` for per-scene lazy loading.
+    """
+    target_video_path = _resolve_target_video_path(video_path, change_fps, target_fps)
+    if use_decord:
+        return read_video_decord(target_video_path), target_video_path
+    else:
+        return read_video_cv2(target_video_path), target_video_path
+
+
+def read_video(video_path: str, change_fps=True, use_decord=True, target_fps: float = 25.0):
+    target_video_path = _resolve_target_video_path(video_path, change_fps, target_fps)
     if use_decord:
         return read_video_decord(target_video_path)
     else:
         return read_video_cv2(target_video_path)
+
+
+def read_video_decord_range(video_path: str, start: int, end: int):
+    """Load a half-open frame range [start, end) from ``video_path``.
+
+    Returns a numpy array of shape (end-start, H, W, 3) in RGB order.
+    """
+    vr = VideoReader(video_path)
+    frames = vr[start:end].asnumpy()
+    vr.seek(0)
+    return frames
 
 
 def read_video_decord(video_path: str):
@@ -143,6 +173,52 @@ def write_video(video_output_path: str, video_frames: np.ndarray, fps: int):
     ) as writer:
         for video_frame in video_frames:
             writer.append_data(video_frame)
+
+
+def write_video_via_ffmpeg(
+    video_output_path: str,
+    video_frames: np.ndarray,
+    fps: int,
+    crf: int = 18,
+    pix_fmt: str = "yuv420p",
+) -> None:
+    """Write RGB numpy frames directly to an H.264 MP4 via ffmpeg stdin.
+
+    This avoids the intermediate imageio layer and a second encoding pass
+    when muxing with audio.
+    """
+    if video_frames.size == 0:
+        raise ValueError("video_frames is empty")
+    height, width = video_frames[0].shape[:2]
+    command = [
+        "ffmpeg",
+        "-y",
+        "-loglevel", "error",
+        "-nostdin",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-s", f"{width}x{height}",
+        "-pix_fmt", "rgb24",
+        "-r", str(fps),
+        "-i", "-",
+        "-c:v", "libx264",
+        "-crf", str(crf),
+        "-pix_fmt", pix_fmt,
+        video_output_path,
+    ]
+    proc = subprocess.Popen(command, stdin=subprocess.PIPE)
+    try:
+        for frame in video_frames:
+            proc.stdin.write(frame.astype(np.uint8).tobytes())
+        proc.stdin.close()
+    except BrokenPipeError as exc:
+        proc.wait()
+        raise RuntimeError(
+            f"ffmpeg exited early with code {proc.returncode}"
+        ) from exc
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed with exit code {proc.returncode}")
 
 
 def write_video_cv2(video_output_path: str, video_frames: np.ndarray, fps: int):

@@ -84,8 +84,13 @@ class AlignRestore(object):
                 paste_mask_512.to(device=self.device, dtype=self.dtype).unsqueeze(0),
                 inv_affine_matrix, (h, w), padding_mode="zeros",
             )  # (1, 1, h, w)
+            # Scale the feather sigma with the output resolution so the paste
+            # seam stays soft on high-res frames. At 512x512 this keeps the
+            # original sigma=4 / kernel=21; at 1080p sigma grows to ~8.4.
+            sigma = max(4.0, float(min(h, w)) / 128.0)
+            kernel_size = int(sigma * 5) // 2 * 2 + 1
             inv_soft_mask = kornia.filters.gaussian_blur2d(
-                inv_soft_mask, (21, 21), (4.0, 4.0)
+                inv_soft_mask, (kernel_size, kernel_size), (sigma, sigma)
             ).squeeze(0)  # -> (1, h, w)
             inv_soft_mask_3d = inv_soft_mask.expand_as(inv_face)
             img_back = inv_soft_mask_3d * inv_face + (1 - inv_soft_mask_3d) * input_img

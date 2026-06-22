@@ -110,6 +110,40 @@ class TestTemporalContinuity(unittest.TestCase):
         small_lighting_shift = LipsyncPipeline._source_frame_scene_cut_score(black, dim)
         self.assertLess(small_lighting_shift, 0.45)
 
+    def test_smooth_face_sequence_vectorized_matches_loop(self):
+        import torch
+
+        try:
+            from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"pipeline optional dependency missing: {exc.name}")
+
+        torch.manual_seed(0)
+        face_crops = torch.randn(4, 3, 64, 64)
+        prev_face = torch.randn(3, 64, 64)
+
+        # Loop path forces vectorized=False by supplying a region_mask.
+        loop_out, _, _ = LipsyncPipeline._smooth_face_sequence(
+            face_crops,
+            prev_face=prev_face,
+            prev_valid=True,
+            inference_skip_mask=[False] * 4,
+            continuity_break_mask=[False] * 4,
+            region_mask=torch.ones(4, 1, 64, 64),
+        )
+
+        # Fast path triggers with no masks/breaks/skips.
+        fast_out, _, _ = LipsyncPipeline._smooth_face_sequence(
+            face_crops,
+            prev_face=prev_face,
+            prev_valid=True,
+            inference_skip_mask=[False] * 4,
+            continuity_break_mask=[False] * 4,
+            region_mask=None,
+        )
+
+        self.assertTrue(torch.allclose(loop_out, fast_out, atol=1e-5))
+
     def test_source_scene_cut_after_marks_hard_boundaries(self):
         import numpy as np
 

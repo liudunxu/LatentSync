@@ -95,6 +95,20 @@ class TestAdaptiveQualityFallback(unittest.TestCase):
         out = LipsyncPipeline._apply_quality_hysteresis(fallback, hysteresis_frames=2)
         self.assertEqual(out, [False, True, True, True, False])
 
+    def test_hysteresis_default_four_frames(self):
+        LipsyncPipeline = self._import_pipeline()
+        # A 4-frame internal run should be suppressed with the new default.
+        fallback = [False, True, True, True, True, False]
+        out = LipsyncPipeline._apply_quality_hysteresis(fallback, hysteresis_frames=4)
+        self.assertEqual(out, [False] * len(fallback))
+
+    def test_hysteresis_keeps_five_frame_run(self):
+        LipsyncPipeline = self._import_pipeline()
+        # A 5-frame internal run should be kept with hysteresis=4.
+        fallback = [False, True, True, True, True, True, False]
+        out = LipsyncPipeline._apply_quality_hysteresis(fallback, hysteresis_frames=4)
+        self.assertEqual(out, [False, True, True, True, True, True, False])
+
     def test_mouth_region_diff_normalized_zero_for_identical(self):
         LipsyncPipeline = self._import_pipeline()
         face = self._make_face(0.5)

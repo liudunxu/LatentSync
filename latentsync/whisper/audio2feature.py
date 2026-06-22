@@ -1,6 +1,7 @@
 # Adapted from https://github.com/TMElyralab/MuseTalk/blob/main/musetalk/whisper/audio2feature.py
 
 from .whisper import load_model
+import hashlib
 import numpy as np
 import torch
 import os
@@ -122,12 +123,35 @@ class Audio2Feature:
         concatenated_array = torch.from_numpy(np.concatenate(embed_list, axis=0))
         return concatenated_array
 
+    @staticmethod
+    def _compute_audio_hash(audio_path: str) -> str:
+        """Return the first 8 hex chars of the file's SHA-256 hash."""
+        h = hashlib.sha256()
+        with open(audio_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()[:8]
+
+    @staticmethod
+    def _compute_cache_path(cache_dir: str, audio_path: str) -> str:
+        """Build a cache path that includes the file content hash.
+
+        This prevents collisions when two inputs share the same basename and
+        invalidates stale caches when the source file changes.
+        """
+        path = Path(audio_path)
+        stem = path.stem
+        ext_hash = Audio2Feature._compute_audio_hash(audio_path)
+        # Keep the stem reasonable in length to avoid extremely long filenames.
+        safe_stem = stem[:64]
+        return os.path.join(cache_dir, f"{safe_stem}_{ext_hash}_embeds.pt")
+
     def audio2feat(self, audio_path):
         if self.audio_embeds_cache_dir == "" or self.audio_embeds_cache_dir is None:
             return self._audio2feat(audio_path)
 
-        audio_embeds_cache_path = os.path.join(
-            self.audio_embeds_cache_dir, os.path.basename(audio_path).replace(".mp4", "_embeds.pt")
+        audio_embeds_cache_path = self._compute_cache_path(
+            self.audio_embeds_cache_dir, audio_path
         )
 
         if os.path.isfile(audio_embeds_cache_path):

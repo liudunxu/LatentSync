@@ -196,17 +196,37 @@ class ImageProcessor:
     def prepare_masks_and_masked_images(self, images: Union[torch.Tensor, np.ndarray], affine_transform=False, per_frame_masks=None):
         if isinstance(images, np.ndarray):
             images = torch.from_numpy(images)
-        if images.shape[3] == 3:
+        if images.shape[-1] == 3:
             images = rearrange(images, "f h w c -> f c h w")
         logger.info(f"[ImageProcessor] prepare_masks_and_masked_images: input shape={images.shape}, affine_transform={affine_transform}, per_frame_masks={'provided' if per_frame_masks is not None else 'none'}")
 
-        results = []
-        for i, image in enumerate(images):
-            mask_override = per_frame_masks[i] if per_frame_masks is not None else None
-            results.append(self.preprocess_fixed_mask_image(image, affine_transform=affine_transform, mask_override=mask_override))
+        if affine_transform:
+            # affine_transform returns a per-frame numpy face crop, so keep
+            # the loop for this legacy path.
+            results = []
+            for i, image in enumerate(images):
+                mask_override = per_frame_masks[i] if per_frame_masks is not None else None
+                results.append(self.preprocess_fixed_mask_image(image, affine_transform=True, mask_override=mask_override))
+            pixel_values_list, masked_pixel_values_list, masks_list = list(zip(*results))
+            return torch.stack(pixel_values_list), torch.stack(masked_pixel_values_list), torch.stack(masks_list)
 
-        pixel_values_list, masked_pixel_values_list, masks_list = list(zip(*results))
-        return torch.stack(pixel_values_list), torch.stack(masked_pixel_values_list), torch.stack(masks_list)
+        # Batch path: resize + normalize the whole stack at once.
+        resized = self.resize(images)
+        pixel_values = self.normalize(resized / 255.0)
+
+        if per_frame_masks is not None:
+            masks = per_frame_masks
+            if masks.dim() == 3:  # (B, H, W) -> (B, 1, H, W)
+                masks = masks.unsqueeze(1)
+            if masks.dim() != 4 or masks.shape[0] != pixel_values.shape[0]:
+                raise ValueError(
+                    f"per_frame_masks shape {masks.shape} incompatible with images {pixel_values.shape}"
+                )
+        else:
+            masks = self.mask_image[0:1].unsqueeze(0).expand(pixel_values.shape[0], -1, -1, -1)
+
+        masked_pixel_values = pixel_values * masks
+        return pixel_values, masked_pixel_values, masks
 
     def process_images(self, images: Union[torch.Tensor, np.ndarray]):
         if isinstance(images, np.ndarray):
