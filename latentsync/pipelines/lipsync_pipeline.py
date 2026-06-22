@@ -2696,6 +2696,16 @@ class LipsyncPipeline(DiffusionPipeline):
             if continuity_break:
                 track_ids.append((prev_track_id + 1) if prev_track_id is not None else 0)
                 prev_track_id = track_ids[-1]
+                # A continuity break that is NOT a scene cut (identity /
+                # geometry / content-diff break) means the speaker changed
+                # within the same shot. The cross-frame affine translation
+                # EMA (p_bias) still carries the previous speaker's bias, so
+                # the new speaker's first few frames paste back with a
+                # stale translation. Reset it here so the next frame's
+                # align_warp_face converges from its own data. Scene cuts
+                # already reset at the scene_cut_break branch above.
+                if not scene_cut_break:
+                    self.image_processor.restorer.reset_p_bias()
             else:
                 track_ids.append(prev_track_id)
             faces.append(face)
