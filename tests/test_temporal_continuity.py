@@ -90,6 +90,80 @@ class TestTemporalContinuity(unittest.TestCase):
         # Wrong rank -> 0.0
         self.assertEqual(LipsyncPipeline._mouth_region_diff(a, c), 0.0)
 
+    def test_upper_face_region_diff_distinguishes_faces(self):
+        """Identical crops -> 0, opposite extremes -> close to 1.
+
+        The upper-face diff samples the forehead/upper-cheek band, so it is
+        stable under mouth motion and used for the continuity-break check
+        instead of the mouth band (which trips on laughs / teeth flashes).
+        """
+        import torch
+
+        try:
+            from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"pipeline optional dependency missing: {exc.name}")
+
+        black = torch.zeros(3, 512, 512, dtype=torch.uint8)
+        white = torch.full((3, 512, 512), 255, dtype=torch.uint8)
+        mid = torch.full((3, 512, 512), 100, dtype=torch.uint8)
+
+        # Identical -> 0
+        self.assertEqual(LipsyncPipeline._upper_face_region_diff(black, black), 0.0)
+        self.assertEqual(LipsyncPipeline._upper_face_region_diff(mid, mid), 0.0)
+
+        # Full flip -> ~= 1.0
+        diff_extreme = LipsyncPipeline._upper_face_region_diff(black, white)
+        self.assertGreater(diff_extreme, 0.95)
+
+        # Black vs mid -> ~= 100/255 ~= 0.39
+        diff_mid = LipsyncPipeline._upper_face_region_diff(black, mid)
+        self.assertGreater(diff_mid, 0.35)
+        self.assertLess(diff_mid, 0.45)
+
+    def test_upper_face_region_diff_ignores_mouth_band(self):
+        """A change confined to the mouth band must NOT register as upper-face
+        content change -- this is the whole point of switching the continuity
+        check off the mouth ROI."""
+        import torch
+
+        try:
+            from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"pipeline optional dependency missing: {exc.name}")
+
+        base = torch.zeros(3, 512, 512, dtype=torch.uint8)
+        # Flip ONLY the mouth band (y 0.55..0.74, x 0.30..0.70) to white.
+        mouth_only = base.clone()
+        H, W = 512, 512
+        y0, y1 = int(H * 0.55), int(H * 0.74)
+        x0, x1 = int(W * 0.30), int(W * 0.70)
+        mouth_only[:, y0:y1, x0:x1] = 255
+
+        # Upper-face diff sees no change (forehead/cheeks identical).
+        self.assertEqual(LipsyncPipeline._upper_face_region_diff(base, mouth_only), 0.0)
+        # The mouth-band diff DOES see it (sanity check the contrast).
+        self.assertGreater(LipsyncPipeline._mouth_region_diff(base, mouth_only), 0.5)
+
+    def test_upper_face_region_diff_returns_zero_on_shape_mismatch(self):
+        """Defensive: None / different shapes / wrong rank must not raise."""
+        import torch
+
+        try:
+            from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"pipeline optional dependency missing: {exc.name}")
+
+        a = torch.zeros(3, 512, 512, dtype=torch.uint8)
+        b = torch.zeros(3, 256, 256, dtype=torch.uint8)
+        c = torch.zeros(3, 512, 512, 512, dtype=torch.uint8)
+
+        self.assertEqual(LipsyncPipeline._upper_face_region_diff(None, a), 0.0)
+        self.assertEqual(LipsyncPipeline._upper_face_region_diff(a, None), 0.0)
+        self.assertEqual(LipsyncPipeline._upper_face_region_diff(None, None), 0.0)
+        self.assertEqual(LipsyncPipeline._upper_face_region_diff(a, b), 0.0)
+        self.assertEqual(LipsyncPipeline._upper_face_region_diff(a, c), 0.0)
+
     def test_source_frame_scene_cut_score(self):
         import numpy as np
 

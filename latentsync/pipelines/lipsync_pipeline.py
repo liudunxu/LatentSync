@@ -1538,11 +1538,14 @@ class LipsyncPipeline(DiffusionPipeline):
         mask: torch.Tensor,
         strength: float = 0.65,
         radius: int = 3,
+        mouth_center_norm: Optional[Tuple[float, float]] = None,
     ) -> torch.Tensor:
         """Blend original high-frequency detail back outside the mouth core.
 
         This reduces washed cheeks/chin and mask-boundary softness while
         preserving the generated lip opening/closing in the central mouth.
+        ``mouth_center_norm`` localizes the protected mouth core; when None
+        it falls back to the default (0.5, 0.66).
         """
         if strength <= 0 or face is None or ref_face is None or mask is None:
             return face
@@ -1571,7 +1574,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 m = m.expand(x.shape[0], -1, -1, -1)
             if m.shape[0] != x.shape[0]:
                 return face
-            mouth_core = LipsyncPipeline._mouth_core_mask(m).to(torch.float32)
+            mouth_core = LipsyncPipeline._mouth_core_mask(m, mouth_center_norm=mouth_center_norm).to(torch.float32)
             detail_mask = (m * (1.0 - mouth_core)).expand(-1, 3, -1, -1)
 
             ref_detail = r - LipsyncPipeline._gaussian_blur_separable(r, radius=radius)
@@ -1848,6 +1851,35 @@ class LipsyncPipeline(DiffusionPipeline):
             H, W = curr_face.shape[-2:]
             y0, y1 = int(H * 0.55), int(H * 0.74)
             x0, x1 = int(W * 0.30), int(W * 0.70)
+            prev = prev_face[..., y0:y1, x0:x1].to(torch.float32)
+            curr = curr_face[..., y0:y1, x0:x1].to(torch.float32)
+            return float((curr - prev).abs().mean().item()) / 255.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _upper_face_region_diff(prev_face: torch.Tensor, curr_face: torch.Tensor) -> float:
+        """Mean absolute diff in the upper-face (forehead/upper-cheek) band.
+
+        Same contract as :meth:`_mouth_region_diff` but samples a region that
+        is stable during normal speech and expressions (laughs, wide opens)
+        while still changing on a real face switch. Using this for the
+        continuity-break check avoids mistaking a big laugh / teeth flash for
+        a scene cut (the mouth band diff trips on legitimate mouth motion).
+
+        Region: y in [0.20, 0.45], x in [0.20, 0.80] of the aligned crop.
+        Returns 0.0 on None / shape mismatch (defensive, never raises).
+        """
+        if prev_face is None or curr_face is None:
+            return 0.0
+        if prev_face.shape != curr_face.shape:
+            return 0.0
+        if prev_face.dim() != 3:
+            return 0.0
+        try:
+            H, W = curr_face.shape[-2:]
+            y0, y1 = int(H * 0.20), int(H * 0.45)
+            x0, x1 = int(W * 0.20), int(W * 0.80)
             prev = prev_face[..., y0:y1, x0:x1].to(torch.float32)
             curr = curr_face[..., y0:y1, x0:x1].to(torch.float32)
             return float((curr - prev).abs().mean().item()) / 255.0
@@ -2610,19 +2642,22 @@ class LipsyncPipeline(DiffusionPipeline):
                     if geometry_break:
                         continuity_break = True
                         temporal_geometry_break_count += 1
-                # Mouth-region pixel diff: catches face switches the embedding
+                # Upper-face pixel diff: catches face switches the embedding
                 # check misses (similar-looking people, side faces). Strictly
                 # complementary to the embedding break: embedding asks "same
-                # person?", pixel diff asks "same content?". Cheap (one crop
-                # + abs + mean) so it doesn't gate the loop.
+                # person?", pixel diff asks "same content?". Sampled on the
+                # forehead/upper-cheek band (NOT the mouth) so a big laugh or
+                # teeth flash -- which moves mouth-region pixels a lot -- does
+                # not trip a false scene cut and reset the temporal EMA
+                # mid-expression. Cheap (one crop + abs + mean).
                 if (
                     not continuity_break
                     and lipsync_mouth_diff_break_threshold > 0
                     and prev_temporal_face is not None
                     and face is not None
                 ):
-                    mouth_diff = self._mouth_region_diff(prev_temporal_face, face)
-                    if mouth_diff > lipsync_mouth_diff_break_threshold:
+                    face_diff = self._upper_face_region_diff(prev_temporal_face, face)
+                    if face_diff > lipsync_mouth_diff_break_threshold:
                         continuity_break = True
                         temporal_diff_break_count += 1
             # Mouth occlusion: skip frames where the mouth is covered by a
@@ -3929,6 +3964,17 @@ class LipsyncPipeline(DiffusionPipeline):
             # paste_surrounding_pixels_back expects: 1=generated, 0=reference
             # generated_region_mask: 1=generated region, 0=reference
             generated_region_mask = (1.0 - dynamic_region_mask_batch).to(device=device, dtype=decoded_latents.dtype)
+            # Batch-level mouth center (normalized) from aligned landmarks.
+            # Shared by color match (exclude mouth core from stats) and detail
+            # restore (protect the mouth core) so both use the real mouth
+            # position instead of the default (0.5, 0.66) when the mouth is
+            # off-center. None when no landmarks are available -> helpers fall
+            # back to the default center.
+            batch_first_center = None
+            for mi in aligned_mouth_info[batch_start:batch_end]:
+                if mi is not None:
+                    batch_first_center = (mi["center_x"] / height, mi["center_y"] / height)
+                    break
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, generated_region_mask, device, weight_dtype
             )
@@ -3960,13 +4006,8 @@ class LipsyncPipeline(DiffusionPipeline):
                 # which are dominated by skin pixels; without exclusion the
                 # dark oral cavity gets pulled toward the skin mean and teeth
                 # lose brightness -> the "dark mouth goes grayish" artifact.
-                color_match_first_center = None
-                for mi in aligned_mouth_info[batch_start:batch_end]:
-                    if mi is not None:
-                        color_match_first_center = (mi["center_x"] / height, mi["center_y"] / height)
-                        break
                 color_match_core = self._mouth_core_mask(
-                    color_match_mask, mouth_center_norm=color_match_first_center
+                    color_match_mask, mouth_center_norm=batch_first_center
                 )
                 # _mouth_core_mask returns the same channel layout as its input;
                 # reduce to (B,1,H,W) before subtracting from color_match_mask.
@@ -3990,6 +4031,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     ref_pixel_values,
                     generated_region_mask,
                     strength=mouth_detail_strength,
+                    mouth_center_norm=batch_first_center,
                 )
             # Mouth-region unsharp: recover high-frequency detail in the
             # generated mouth. Inpainter outputs tend to be slightly soft
@@ -4009,33 +4051,19 @@ class LipsyncPipeline(DiffusionPipeline):
                     )
                 logged_first_generated_batch = True
 
-            # Compute per-frame mouth center norm from aligned landmarks for
-            # dynamic mask positioning in _mouth_core_mask calls below.
-            batch_mouth_info = aligned_mouth_info[batch_start:batch_end]
-            first_center = None
-            for mi in batch_mouth_info:
-                if mi is not None:
-                    first_center = (mi["center_x"] / height, mi["center_y"] / height)
-                    break
-
-            # Temporal EMA across face crops (cross-batch state via prev_face).
-            # region_mask restricts the EMA to the inpaint area: outside the
-            # mask the face stays as the raw inpainter+paste-back output, so
-            # EMA can't smear previous frames' content into the original-face
-            # area (root cause of "previous frame's different face glued in"
-            # artifacts with the wider inpaint mask).
             # _mouth_core_mask is identical for both the temporal EMA's
             # motion-preserve block and the stabilization block (same
-            # generated_region_mask + first_center), so compute it once and
-            # reuse across both. Guarded so we don't build it when neither
-            # block will run.
+            # generated_region_mask + batch_first_center), so compute it once
+            # and reuse across both. batch_first_center was derived above from
+            # the batch's aligned landmarks. Guarded so we don't build it when
+            # neither block will run.
             mouth_core_mask = None
             if (
                 (mouth_motion_preserve_strength > 0 and temporal_smoothing_enabled)
                 or mouth_temporal_stabilization_strength > 0
             ):
                 mouth_core_mask = self._mouth_core_mask(
-                    generated_region_mask, mouth_center_norm=first_center
+                    generated_region_mask, mouth_center_norm=batch_first_center
                 )
             if temporal_smoothing_enabled:
                 current_mouth_motion = decoded_latents
