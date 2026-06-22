@@ -2491,6 +2491,7 @@ class LipsyncPipeline(DiffusionPipeline):
         temporal_identity_break_count = 0
         temporal_geometry_break_count = 0
         temporal_diff_break_count = 0
+        detect_gap_break_count = 0
         scene_cut_break_count = 0
         small_face_skip_count = 0
         identity_skip_count = 0
@@ -2642,6 +2643,22 @@ class LipsyncPipeline(DiffusionPipeline):
                     face_jump_skip_count += 1
             continuity_break = scene_cut_break
             if not should_skip:
+                # If we have had a valid identity before (prev_track_id is not
+                # None) but the last temporal embedding was cleared by a
+                # detect-fail gap, the embedding-similarity check below is
+                # gated on prev_temporal_embedding is not None and would be
+                # skipped -- so a speaker switch across the gap goes undetected
+                # and the new speaker inherits the old track_id + p_bias
+                # (stale alignment for 1-2 frames). Force a continuity break
+                # here: detection was interrupted, so don't assume identity
+                # continuity. Clip-first-frame is excluded because
+                # prev_track_id is still None there.
+                if (
+                    prev_track_id is not None
+                    and prev_temporal_embedding is None
+                ):
+                    continuity_break = True
+                    detect_gap_break_count += 1
                 if face_emb is not None and prev_temporal_embedding is not None:
                     continuity_similarity = float(np.dot(face_emb, prev_temporal_embedding))
                     if continuity_similarity < 0.70:
@@ -2789,6 +2806,7 @@ class LipsyncPipeline(DiffusionPipeline):
             f"temporal_identity_break={temporal_identity_break_count}, "
             f"temporal_geometry_break={temporal_geometry_break_count}, "
             f"temporal_diff_break={temporal_diff_break_count}, "
+            f"detect_gap_break={detect_gap_break_count}, "
             f"scene_cut_break={scene_cut_break_count}, "
             f"small_face_skip={small_face_skip_count}"
         )
