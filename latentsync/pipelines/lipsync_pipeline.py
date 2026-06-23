@@ -2424,6 +2424,79 @@ class LipsyncPipeline(DiffusionPipeline):
         )
         return refs
 
+    def derive_speaker_reference_embeddings(
+        self,
+        video_path: str,
+        speaker_cue_ranges: Dict[str, List[Tuple[float, float]]],
+        face_embedder,
+        min_detection_score: float = 0.50,
+        video_fps: float = 25.0,
+        max_samples_per_speaker: int = 48,
+    ) -> Dict[str, np.ndarray]:
+        """Derive a per-speaker reference embedding for SRT-driven multi-speaker lip-sync.
+
+        For each speaker, samples frames inside that speaker's cue time-ranges and
+        clusters them with :meth:`_cluster_speaker_faces`; the top cluster's mean
+        embedding (the most mouth-active face during that speaker's cues — i.e. the
+        speaker) is returned as that speaker's reference. Used by ``synthesize_srt``
+        to inpaint only the cue's speaker face per segment.
+
+        Loads the whole video once (RGB, normalized to ``video_fps`` via
+        ``read_video_with_path``); frame ``i`` <-> time ``i / video_fps``. Speakers
+        with no detectable face in any sampled frame are omitted (the caller falls
+        back to the global reference for their segments).
+        """
+        if face_embedder is None or not speaker_cue_ranges:
+            return {}
+        frames, _ = read_video_with_path(
+            str(video_path), use_decord=True, target_fps=float(video_fps)
+        )
+        total = int(len(frames))
+        speaker_map: Dict[str, np.ndarray] = {}
+        try:
+            for speaker, ranges in speaker_cue_ranges.items():
+                if not ranges:
+                    continue
+                # Cue (start,end) seconds -> frame indices, clamped to [0, total).
+                indices: List[int] = []
+                for start, end in ranges:
+                    lo = max(0, int(round(float(start) * video_fps)))
+                    hi = min(total, int(round(float(end) * video_fps)))
+                    for fi in range(lo, max(lo + 1, hi)):
+                        indices.append(fi)
+                if not indices:
+                    continue
+                indices = sorted(set(indices))
+                # Even-stride sub-sample, mirroring _cluster_speaker_faces.
+                if len(indices) > max_samples_per_speaker:
+                    stride = max(1, len(indices) // max_samples_per_speaker)
+                    indices = indices[::stride][:max_samples_per_speaker]
+                speaker_frames = frames[indices]
+                clusters = self._cluster_speaker_faces(
+                    speaker_frames, face_embedder, min_detection_score
+                )
+                if clusters:
+                    emb = np.asarray(clusters[0]["embedding"], dtype=np.float32)
+                    norm = float(np.linalg.norm(emb))
+                    if norm > 1e-6:
+                        emb = emb / norm
+                    speaker_map[speaker] = emb
+                    logger.info(
+                        "[LipSync] speaker %s: %d sampled frames -> %d cluster(s), "
+                        "ref selected (count=%s)",
+                        speaker, len(indices), len(clusters),
+                        int(clusters[0].get("count", 0)),
+                    )
+                else:
+                    logger.info(
+                        "[LipSync] speaker %s: %d sampled frames -> no cluster; "
+                        "will fall back to global reference",
+                        speaker, len(indices),
+                    )
+        finally:
+            del frames
+        return speaker_map
+
     def affine_transform_video(
         self,
         video_frames: np.ndarray,

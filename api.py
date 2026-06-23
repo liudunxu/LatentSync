@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import cv2
 import numpy as np
+import re
 import requests
 import torch
 
@@ -1169,6 +1170,90 @@ def _parse_srt_intervals(path: Path) -> List[Tuple[float, float]]:
     return merged
 
 
+_SRT_SPEAKER_RE = re.compile(
+    r"^(?P<speaker>(?:SPEAKER_\d+|[A-Z][A-Z0-9_ -]{1,39}))[:：]\s*(?P<text>.+)$"
+)
+_SRT_BRACKET_SPEAKER_RE = re.compile(
+    r"^[\[【]\s*(?P<speaker>[^\]】\r\n]{1,40})\s*[\]】]\s*[:：-]?\s*(?P<text>.+)$"
+)
+
+
+def _parse_srt_cues_with_speakers(path: Path) -> List[Tuple[float, float, Optional[str]]]:
+    """Parse an SRT into per-cue ``(start, end, speaker_or_None)`` seconds.
+
+    Unlike :func:`_parse_srt_intervals`, this keeps cues separate (NO overlap
+    merge — merging would collapse different speakers) and extracts a speaker
+    label from the cue text when the frontend wrote a diarized SRT
+    (``"SPEAKER_00: text"`` or ``"[SPEAKER_00]: text"``). Mirrors the frontend's
+    speaker regexes (dubbing ``subtitle_text.py``).
+
+    A defensive disjoint pass clamps a cue's end to the next cue's start when
+    they overlap with DIFFERENT speakers, so each frame is attributed to exactly
+    one speaker and the downstream timeline stays non-overlapping. Same-speaker
+    overlaps are left as-is (redundant frames, harmless). Returns [] for an
+    empty / unparseable file.
+    """
+    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    timestamp_re = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})")
+
+    def _ts_to_sec(match) -> float:
+        h, mi, s, ms = (int(x) for x in match)
+        return h * 3600 + mi * 60 + s + ms / 1000.0
+
+    def _extract_speaker(text_line: str) -> Optional[str]:
+        line = text_line.strip()
+        if not line:
+            return None
+        for rx in (_SRT_SPEAKER_RE, _SRT_BRACKET_SPEAKER_RE):
+            m = rx.match(line)
+            if m:
+                return m.group("speaker").strip().upper()
+        return None
+
+    cues: List[Tuple[float, float, Optional[str]]] = []
+    # Split into cue blocks (blank-line separated), tolerant of CR/LF.
+    blocks = re.split(r"\r?\n\s*\r?\n", text.replace("\r", "\n"))
+    for block in blocks:
+        lines = [ln for ln in block.split("\n") if ln.strip() != ""]
+        if not lines:
+            continue
+        # Find the timestamp line.
+        ts_idx = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
+        if ts_idx is None:
+            continue
+        matches = timestamp_re.findall(lines[ts_idx])
+        if len(matches) < 2:
+            continue
+        start = _ts_to_sec(matches[0])
+        end = _ts_to_sec(matches[1])
+        if end <= start:
+            continue
+        # Speaker label: first non-empty text line after the timestamp.
+        speaker: Optional[str] = None
+        for ln in lines[ts_idx + 1:]:
+            sp = _extract_speaker(ln)
+            if sp is not None:
+                speaker = sp
+                break
+        cues.append((start, end, speaker))
+
+    if not cues:
+        return []
+
+    cues.sort(key=lambda c: (c[0], c[1]))
+    # Disjoint pass: clamp a cue's end to the next cue's start on different-speaker
+    # overlap so each frame maps to one speaker.
+    disjoint: List[Tuple[float, float, Optional[str]]] = []
+    for start, end, speaker in cues:
+        if disjoint:
+            prev_start, prev_end, prev_sp = disjoint[-1]
+            if start < prev_end and (speaker or "") != (prev_sp or ""):
+                # Different speakers overlap: truncate the previous cue.
+                disjoint[-1] = (prev_start, start, prev_sp)
+        disjoint.append((start, end, speaker))
+    return disjoint
+
+
 def _extract_video_subclip(src: Path, start: float, duration: float, out: Path) -> None:
     """Extract a video-only (no audio) sub-clip at the output fps."""
     _run_ffmpeg([
@@ -2043,7 +2128,10 @@ class LatentSyncApiRuntime:
                 and effective_apply_identity_filter
                 and reference_embedding is None
             )
-            if payload.per_speaker_reference and reference_embedding is not None:
+            # Warn only when a user-supplied avatar overrides per-speaker mode.
+            # (In the SRT per-cue path each segment is passed a *derived*
+            # speaker embedding on purpose, which is not an avatar override.)
+            if payload.per_speaker_reference and reference_embedding is not None and payload.avatar_url:
                 logger.warning(
                     "[LipSync] per_speaker_reference ignored because avatar_url is set "
                     "(avatar is an explicit single reference)"
@@ -2403,7 +2491,24 @@ class LatentSyncApiRuntime:
             source_frame_count, source_fps = _read_video_info(video_path)
             duration = float(source_frame_count) / max(float(source_fps), 1e-6)
 
-            raw_intervals = _parse_srt_intervals(srt_path)
+            # Per-speaker mode (Option B): derive a speaker->reference-embedding
+            # map from frames inside each speaker's cue ranges, then inpaint only
+            # that speaker's face per cue. Effective only with no avatar (avatar
+            # is an explicit single reference) — mirrors effective_per_speaker.
+            per_speaker = bool(
+                payload.per_speaker_reference
+                and payload.apply_identity_filter
+                and reference_embedding is None
+            )
+
+            # Per-speaker cues carry speaker labels; the plain parser (no merge)
+            # is used otherwise to preserve current behavior.
+            raw_cues: List[Tuple[float, float, Optional[str]]] = []
+            if per_speaker:
+                raw_cues = _parse_srt_cues_with_speakers(srt_path)
+                raw_intervals = [(s, e) for (s, e, _) in raw_cues]
+            else:
+                raw_intervals = _parse_srt_intervals(srt_path)
             if not raw_intervals:
                 raise HTTPException(
                     status_code=400,
@@ -2421,6 +2526,41 @@ class LatentSyncApiRuntime:
                     intervals.append((start, end))
             if not intervals:
                 logger.warning("[LipSync/SRT] all cues fall outside the video duration; passthrough only")
+
+            # Derive the per-speaker reference-embedding map (Option B). Only when
+            # >=2 distinct speakers are present; single-speaker degrades to the
+            # global/auto-main path unchanged.
+            speaker_map: Dict[str, np.ndarray] = {}
+            if per_speaker and raw_cues:
+                distinct_speakers = {sp for (_, _, sp) in raw_cues if sp}
+                if len(distinct_speakers) >= 2:
+                    ranges: Dict[str, List[Tuple[float, float]]] = {}
+                    for (cs, ce, csp) in raw_cues:
+                        if csp is None:
+                            continue
+                        if cs >= duration:
+                            continue
+                        ce2 = min(ce, duration)
+                        if ce2 > cs:
+                            ranges.setdefault(csp, []).append((cs, ce2))
+                    if ranges:
+                        self.load_detectors()
+                        if self.face_embedder is not None:
+                            speaker_map = self.pipeline.derive_speaker_reference_embeddings(
+                                str(video_path),
+                                ranges,
+                                self.face_embedder,
+                                min_detection_score=payload.min_detection_score,
+                                video_fps=float(_SRT_OUTPUT_FPS),
+                            )
+                            logger.info(
+                                "[LipSync/SRT] per-speaker refs derived: %s",
+                                {sp: bool(v) for sp, v in speaker_map.items()},
+                            )
+                        else:
+                            logger.warning("[LipSync/SRT] face_embedder unavailable; per-speaker derivation skipped")
+                else:
+                    logger.info("[LipSync/SRT] <2 distinct speakers; per-speaker mode degrades to global")
 
             # Build the timeline: gaps between cues (and the head/tail) are
             # passthrough; each cue is either lipsync or, if too short,
@@ -2479,14 +2619,31 @@ class LatentSyncApiRuntime:
                     _extract_video_subclip(video_path, start, seg_dur, seg_video)
                     _extract_audio_subclip(audio_path, start, seg_dur, seg_audio)
                     seg_paths = {"video": seg_video, "audio": seg_audio}
+                    # Option B: attribute this segment to the cue whose range
+                    # contains its midpoint, and use that speaker's derived
+                    # reference embedding. Falls back to the global reference
+                    # when no per-speaker map / unmatched / no derivable face.
+                    seg_speaker: Optional[str] = None
+                    seg_ref = reference_embedding
+                    if speaker_map and raw_cues:
+                        mid = (start + end) * 0.5
+                        for (cs, ce, csp) in raw_cues:
+                            if csp is not None and cs <= mid < ce:
+                                seg_speaker = csp
+                                break
+                        if seg_speaker is not None:
+                            derived = speaker_map.get(seg_speaker)
+                            if derived is not None:
+                                seg_ref = derived
                     seg_result = self.synthesize(
-                        payload, seg_paths, seg_dir, reference_embedding=reference_embedding
+                        payload, seg_paths, seg_dir, reference_embedding=seg_ref
                     )
                     seg_out = Path(seg_result["output_path"])  # type: ignore[index]
                     seg_results.append(seg_result)
                     seg_descriptors.append({
                         "index": index, "kind": "lipsync",
                         "start": start, "end": end, "duration": seg_dur,
+                        "speaker": seg_speaker,
                     })
                 else:
                     seg_out = seg_dir / "passthrough.mp4"
