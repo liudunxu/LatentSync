@@ -101,7 +101,7 @@ class ImageProcessor:
         face = rearrange(torch.from_numpy(face), "h w c -> c h w")
         return face, box, affine_matrix
 
-    def affine_transform_with_embedding(self, image: torch.Tensor, target_embedding=None):
+    def affine_transform_with_embedding(self, image: torch.Tensor, target_embedding=None, target_embeddings=None):
         if self.face_detector is None:
             raise NotImplementedError("Using the CPU for face detection is not supported")
         self.face_detector.last_pose_yaw = None
@@ -112,6 +112,17 @@ class ImageProcessor:
         # Reused below for the IoU-based embedding lookup so we don't pay for a
         # second InsightFace forward on the same frame.
         prior_detected_faces = None
+        # Normalize the per-speaker reference list once (multi-speaker mode).
+        normed_targets = None
+        if target_embeddings is not None and target_embedding is None and self.face_embedder is not None:
+            normed_targets = []
+            for tgt in target_embeddings:
+                tgt = np.asarray(tgt, dtype=np.float32)
+                n = float(np.linalg.norm(tgt))
+                if n > 1e-6:
+                    normed_targets.append(tgt / n)
+            if not normed_targets:
+                normed_targets = None
         if target_embedding is not None and self.face_embedder is not None:
             target = np.asarray(target_embedding, dtype=np.float32)
             target_norm = float(np.linalg.norm(target))
@@ -143,6 +154,36 @@ class ImageProcessor:
                     pose = getattr(best_face, "pose", None)
                     if pose is not None and self.face_detector is not None:
                         self.face_detector.last_pose_yaw = float(abs(pose[1]))
+        elif normed_targets is not None:
+            # Multi-speaker: pick the detected face with the highest cosine to
+            # ANY speaker reference (generalizes the single-target loop above).
+            detected_faces = self.face_embedder.get(image.astype(np.uint8) if image.dtype != np.uint8 else image)
+            prior_detected_faces = detected_faces
+            best_face = None
+            best_score = -1.0
+            for detected_face in detected_faces:
+                emb = getattr(detected_face, "normed_embedding", None)
+                bbox = getattr(detected_face, "bbox", None)
+                lmk = getattr(detected_face, "landmark_2d_106", None)
+                if emb is None or bbox is None or lmk is None:
+                    continue
+                emb = np.asarray(emb, dtype=np.float32)
+                emb_norm = float(np.linalg.norm(emb))
+                if emb_norm <= 1e-6:
+                    continue
+                emb = emb / emb_norm
+                # Max cosine over all speaker references.
+                face_best = max(float(np.dot(emb, t)) for t in normed_targets)
+                if face_best > best_score:
+                    best_score = face_best
+                    best_face = detected_face
+                    selected_embedding = emb
+            if best_face is not None:
+                source_bbox = np.asarray(best_face.bbox).astype(np.int_).tolist()
+                landmark_2d_106 = best_face.landmark_2d_106
+                pose = getattr(best_face, "pose", None)
+                if pose is not None and self.face_detector is not None:
+                    self.face_detector.last_pose_yaw = float(abs(pose[1]))
         if source_bbox is None or landmark_2d_106 is None:
             source_bbox, landmark_2d_106 = self.face_detector(image)
         if source_bbox is None:

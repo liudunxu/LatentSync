@@ -258,6 +258,14 @@ class LipSyncRequest(BaseModel):
         False,
         description="Enable identity filtering. When True, uses avatar if provided; otherwise auto-detects the main speaker and filters to that face.",
     )
+    per_speaker_reference: bool = Field(
+        False,
+        description="Multi-speaker identity mode. Effective only when apply_identity_filter=True and avatar_url is None "
+        "(avatar takes precedence; a warning is logged and this flag is ignored when avatar_url is set). "
+        "Auto-detects all speaker clusters and matches each frame to its nearest speaker, so non-main speakers are "
+        "kept (instead of being identity-skipped) and the correct speaker face is selected in multi-face frames. "
+        "Does NOT attribute audio to faces (per-cue speaker mapping is a future frontend feature).",
+    )
     identity_yaw_adaptive_enabled: bool = Field(
         True,
         description="Relax the identity similarity threshold as the face turns away from frontal (a profile-frame arcface embedding drops cosine sim against a frontal avatar and would otherwise wrongly skip a frame that should be inpainted).",
@@ -2028,6 +2036,18 @@ class LatentSyncApiRuntime:
                 torch.seed()
 
             effective_apply_identity_filter = bool(payload.apply_identity_filter)
+            # per_speaker_reference only applies in auto-detect mode (no avatar).
+            # An explicit avatar is a single reference and takes precedence.
+            effective_per_speaker_reference = bool(
+                payload.per_speaker_reference
+                and effective_apply_identity_filter
+                and reference_embedding is None
+            )
+            if payload.per_speaker_reference and reference_embedding is not None:
+                logger.warning(
+                    "[LipSync] per_speaker_reference ignored because avatar_url is set "
+                    "(avatar is an explicit single reference)"
+                )
 
             logger.info(f"[LipSync] Starting pipeline: video={video_path}, audio={audio_path}, "
                          f"guidance_scale={effective_guidance_scale}, steps={effective_inference_steps}, "
@@ -2056,6 +2076,7 @@ class LatentSyncApiRuntime:
                 reference_embedding=reference_embedding,
                 face_embedder=runtime.face_embedder,
                 apply_identity_filter=effective_apply_identity_filter,
+                per_speaker_reference=effective_per_speaker_reference,
                 identity_similarity_threshold=payload.similarity_threshold,
                 identity_yaw_adaptive_enabled=payload.identity_yaw_adaptive_enabled,
                 identity_yaw_adaptive_scale=payload.identity_yaw_adaptive_scale,

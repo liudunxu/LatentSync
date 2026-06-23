@@ -2188,18 +2188,25 @@ class LipsyncPipeline(DiffusionPipeline):
             "track_switch": ema_resets_on_track_switch,
         }
 
-    def detect_main_speaker_embedding(self, video_frames: np.ndarray, face_embedder, min_detection_score: float = 0.50) -> Optional[np.ndarray]:
+    def _cluster_speaker_faces(
+        self, video_frames: np.ndarray, face_embedder, min_detection_score: float = 0.50
+    ) -> List[Dict[str, object]]:
+        """Cluster sampled-frame face embeddings into speaker clusters.
+
+        Returns clusters sorted by main-speaker score (desc). Each cluster dict
+        carries: ``embedding`` (normalized mean), ``count``, ``score``,
+        ``best_frame_index``, ``det_score_median``, ``mouth_max``,
+        ``mouth_motion``, ``area_median``, ``center_median``, ``yaw_median``.
+        Reuses the 0.55 cosine merge threshold and the per-face filters
+        (face w/h >= 24px, det_score >= min_detection_score, area_ratio >= 0.015).
+        Returns ``[]`` when no embedder / empty video / no clusters.
+        """
         if face_embedder is None or len(video_frames) == 0:
-            self._last_active_speaker_stats = {
-                "enabled": face_embedder is not None,
-                "selected": False,
-                "reason": "missing_face_embedder_or_empty_video",
-                "sampled_frames": 0,
-                "clusters": 0,
-            }
-            return None
+            self._last_cluster_sampled_frames = 0
+            return []
         clusters: List[Dict[str, object]] = []
         sample_indices = list(range(0, len(video_frames), max(1, len(video_frames) // 24)))[:48]
+        self._last_cluster_sampled_frames = len(sample_indices)
         for idx in sample_indices:
             frame = video_frames[idx]
             try:
@@ -2281,17 +2288,8 @@ class LipsyncPipeline(DiffusionPipeline):
                     })
 
         if not clusters:
-            self._last_active_speaker_stats = {
-                "enabled": True,
-                "selected": False,
-                "reason": "no_face_embedding_clusters",
-                "sampled_frames": len(sample_indices),
-                "clusters": 0,
-            }
-            return None
+            return []
 
-        best_cluster = None
-        best_score = -1.0
         ranked = []
         for cluster_idx, cluster in enumerate(clusters):
             mouth_values = cluster["mouth_values"]
@@ -2330,24 +2328,54 @@ class LipsyncPipeline(DiffusionPipeline):
                 "det_score_median": float(statistics.median(det_score_values)) if det_score_values else 0.0,
                 "best_frame_index": int(cluster.get("best_frame_index", 0)),
             })
-            if score > best_score:
-                best_score = score
-                best_cluster = cluster
 
         ranked.sort(key=lambda item: item["score"], reverse=True)
-        selected = ranked[0] if ranked else {}
-        self._last_active_speaker_stats = {
-            "enabled": True,
-            "selected": best_cluster is not None,
-            "sampled_frames": len(sample_indices),
-            "clusters": len(clusters),
-            "selected_cluster": selected,
-            "top_clusters": ranked[:3],
-        }
-        if best_cluster is None:
+        # Attach the score/ranked fields onto the cluster dicts, preserving the
+        # original embedding, and return in ranked order.
+        sorted_clusters: List[Dict[str, object]] = []
+        for item in ranked:
+            cluster = clusters[item["cluster_index"]]
+            sorted_clusters.append({
+                "embedding": cluster["embedding"],
+                "count": item["count"],
+                "score": item["score"],
+                "best_frame_index": item["best_frame_index"],
+                "det_score_median": item["det_score_median"],
+                "mouth_max": item["mouth_max"],
+                "mouth_motion": item["mouth_motion"],
+                "area_median": item["area_median"],
+                "center_median": item["center_median"],
+                "yaw_median": item["yaw_median"],
+            })
+        return sorted_clusters
+
+    def detect_main_speaker_embedding(self, video_frames: np.ndarray, face_embedder, min_detection_score: float = 0.50) -> Optional[np.ndarray]:
+        sorted_clusters = self._cluster_speaker_faces(video_frames, face_embedder, min_detection_score)
+        sampled_frames = int(getattr(self, "_last_cluster_sampled_frames", 0))
+        if not sorted_clusters:
+            self._last_active_speaker_stats = {
+                "enabled": face_embedder is not None,
+                "selected": False,
+                "reason": "no_face_embedding_clusters" if face_embedder is not None else "missing_face_embedder_or_empty_video",
+                "sampled_frames": sampled_frames,
+                "clusters": 0,
+            }
             return None
 
-        best_emb = np.asarray(best_cluster["embedding"], dtype=np.float32)
+        selected = sorted_clusters[0]
+        # Stats face the API response as JSON, so strip the numpy embedding
+        # (the original ranked dict carried only scalar fields).
+        def _stats_view(cluster: Dict[str, object]) -> Dict[str, object]:
+            return {k: v for k, v in cluster.items() if k != "embedding"}
+        self._last_active_speaker_stats = {
+            "enabled": True,
+            "selected": True,
+            "sampled_frames": sampled_frames,
+            "clusters": len(sorted_clusters),
+            "selected_cluster": _stats_view(selected),
+            "top_clusters": [_stats_view(c) for c in sorted_clusters[:3]],
+        }
+        best_emb = np.asarray(selected["embedding"], dtype=np.float32)
         norm = float(np.linalg.norm(best_emb))
         if norm > 1e-6:
             best_emb = best_emb / norm
@@ -2357,14 +2385,55 @@ class LipsyncPipeline(DiffusionPipeline):
             float(selected.get("score", 0.0)),
             float(selected.get("mouth_max", 0.0)),
             float(selected.get("mouth_motion", 0.0)),
-            len(clusters),
+            len(sorted_clusters),
         )
         return best_emb
+
+    def detect_speaker_embeddings(
+        self, video_frames: np.ndarray, face_embedder, min_detection_score: float = 0.50,
+        max_speakers: int = 4, min_count: int = 2,
+    ) -> List[np.ndarray]:
+        """Return per-speaker reference embeddings for multi-speaker content.
+
+        Reuses :meth:`_cluster_speaker_faces` and returns the normalized mean
+        embedding of each plausible speaker cluster (sorted by score desc).
+        Clusters with ``count < min_count`` are filtered as transient
+        passers-by, but the top-scoring cluster is always included so there is
+        at least one reference. Capped at ``max_speakers``.
+        """
+        sorted_clusters = self._cluster_speaker_faces(video_frames, face_embedder, min_detection_score)
+        if not sorted_clusters:
+            return []
+        refs: List[np.ndarray] = []
+        for cluster in sorted_clusters:
+            if len(refs) >= max_speakers:
+                break
+            count = int(cluster.get("count", 0))
+            if count < min_count and len(refs) >= 1:
+                # Drop transient clusters once we have at least one reference.
+                continue
+            emb = np.asarray(cluster["embedding"], dtype=np.float32)
+            norm = float(np.linalg.norm(emb))
+            if norm > 1e-6:
+                emb = emb / norm
+            refs.append(emb)
+        logger.info(
+            "[LipSync] Per-speaker reference: %d clusters, counts=%s",
+            len(sorted_clusters),
+            [int(c.get("count", 0)) for c in sorted_clusters],
+        )
+        return refs
 
     def affine_transform_video(
         self,
         video_frames: np.ndarray,
         reference_embedding=None,
+        # Per-speaker reference embeddings (multi-speaker mode). When provided
+        # (non-empty list) and ``reference_embedding`` is None, each frame's
+        # face is matched to its nearest speaker cluster for both face
+        # selection and the identity-similarity check. Mutually exclusive with
+        # ``reference_embedding``.
+        reference_embeddings=None,
         # Source video frame rate. Used by segment-consistency to
         # convert time-window merge / min-merged length from seconds
         # into frames. 0 disables the time-based gates (falls back to
@@ -2544,9 +2613,13 @@ class LipsyncPipeline(DiffusionPipeline):
                     prev_temporal_embedding = None
                     prev_temporal_face = None
                     prev_mouth_info = None
+            multi_speaker_refs = reference_embeddings if (
+                apply_identity_filter and reference_embeddings
+            ) else None
             affine_result = self.image_processor.affine_transform_with_embedding(
                 frame,
-                target_embedding=reference_embedding if apply_identity_filter else None,
+                target_embedding=reference_embedding if apply_identity_filter and multi_speaker_refs is None else None,
+                target_embeddings=multi_speaker_refs,
             )
             if len(affine_result) == 5:
                 face, box, affine_matrix, face_emb, lmk = affine_result
@@ -2621,23 +2694,30 @@ class LipsyncPipeline(DiffusionPipeline):
             # arcface embedding drops cosine sim against a frontal avatar,
             # which would otherwise wrongly skip a frame that should be
             # inpainted).
-            if apply_identity_filter and reference_embedding is not None and face_emb is not None:
-                frame_identity_sim = float(np.dot(face_emb, reference_embedding))
-                identity_similarities.append(frame_identity_sim)
-                effective_identity_threshold = identity_similarity_threshold
-                if (
-                    identity_yaw_adaptive_enabled
-                    and yaw_available
-                    and yaw_skip_threshold > 0
-                    and identity_yaw_adaptive_band_deg > 0
-                ):
-                    frac = min(1.0, abs(yaw_deg) / identity_yaw_adaptive_band_deg)
-                    effective_identity_threshold = identity_similarity_threshold * (
-                        1.0 - identity_yaw_adaptive_scale * frac
-                    )
-                if frame_identity_sim < effective_identity_threshold:
-                    should_skip = True
-                    identity_skip_count += 1
+            if apply_identity_filter and face_emb is not None:
+                if multi_speaker_refs is not None:
+                    # Multi-speaker: keep the frame if it matches ANY speaker
+                    # cluster above the (yaw-adaptive) threshold.
+                    frame_identity_sim = max(float(np.dot(face_emb, r)) for r in multi_speaker_refs)
+                    identity_similarities.append(frame_identity_sim)
+                elif reference_embedding is not None:
+                    frame_identity_sim = float(np.dot(face_emb, reference_embedding))
+                    identity_similarities.append(frame_identity_sim)
+                if frame_identity_sim is not None:
+                    effective_identity_threshold = identity_similarity_threshold
+                    if (
+                        identity_yaw_adaptive_enabled
+                        and yaw_available
+                        and yaw_skip_threshold > 0
+                        and identity_yaw_adaptive_band_deg > 0
+                    ):
+                        frac = min(1.0, abs(yaw_deg) / identity_yaw_adaptive_band_deg)
+                        effective_identity_threshold = identity_similarity_threshold * (
+                            1.0 - identity_yaw_adaptive_scale * frac
+                        )
+                    if frame_identity_sim < effective_identity_threshold:
+                        should_skip = True
+                        identity_skip_count += 1
             frame_identity_similarities.append(frame_identity_sim)
             # Yaw-rate (deg/frame) catches the mid-turn frames where the face
             # hasn't crossed the absolute threshold yet but is rotating fast
@@ -3125,6 +3205,12 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         skip_mask=None,
+        # Per-speaker reference embeddings + mode flag (multi-speaker mode).
+        # When ``per_speaker_reference`` is set and no explicit reference is
+        # given, the main-speaker auto-detect fallback instead detects all
+        # speaker clusters and passes the list down to affine_transform_video.
+        reference_embeddings=None,
+        per_speaker_reference: bool = False,
         # Source video frame rate. Forwarded to
         # ``affine_transform_video`` for the time-based segment
         # consistency gates.
@@ -3227,11 +3313,17 @@ class LipsyncPipeline(DiffusionPipeline):
             f"side_face_blend_fade_frames={side_face_blend_fade_frames}"
         )
         auto_reference_embedding = False
-        if apply_identity_filter and reference_embedding is None and face_embedder is not None:
-            reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder, min_detection_score=min_detection_score)
-            auto_reference_embedding = reference_embedding is not None
-            logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
-        effective_apply_identity_filter = bool(apply_identity_filter and reference_embedding is not None)
+        if apply_identity_filter and reference_embedding is None and reference_embeddings is None and face_embedder is not None:
+            if per_speaker_reference:
+                reference_embeddings = self.detect_speaker_embeddings(video_frames, face_embedder, min_detection_score=min_detection_score)
+                logger.info(f"[LipSync] Auto-detected per-speaker embeddings: {len(reference_embeddings) if reference_embeddings else 0}")
+            else:
+                reference_embedding = self.detect_main_speaker_embedding(video_frames, face_embedder, min_detection_score=min_detection_score)
+                logger.info(f"[LipSync] Auto-detected main speaker embedding: {'loaded' if reference_embedding is not None else 'None'}")
+            auto_reference_embedding = (reference_embedding is not None) or (bool(reference_embeddings))
+        effective_apply_identity_filter = bool(
+            apply_identity_filter and (reference_embedding is not None or bool(reference_embeddings))
+        )
         if auto_reference_embedding:
             stats = getattr(self, "_last_active_speaker_stats", {}) or {}
             stats["filter_enabled"] = bool(apply_identity_filter)
@@ -3252,6 +3344,7 @@ class LipsyncPipeline(DiffusionPipeline):
             ) = self.affine_transform_video(
                 video_frames,
                 reference_embedding,
+                reference_embeddings=reference_embeddings,
                 yaw_skip_threshold=yaw_skip_threshold,
                 yaw_rate_skip_threshold=yaw_rate_skip_threshold,
                 side_face_passthrough_yaw_threshold=side_face_passthrough_yaw_threshold,
@@ -3370,6 +3463,7 @@ class LipsyncPipeline(DiffusionPipeline):
             ) = self.affine_transform_video(
                 video_frames[: len(whisper_chunks)],
                 reference_embedding,
+                reference_embeddings=reference_embeddings,
                 yaw_skip_threshold=yaw_skip_threshold,
                 yaw_rate_skip_threshold=yaw_rate_skip_threshold,
                 side_face_passthrough_yaw_threshold=side_face_passthrough_yaw_threshold,
@@ -3639,6 +3733,8 @@ class LipsyncPipeline(DiffusionPipeline):
         callback = kwargs.get("callback")
         callback_steps = kwargs.get("callback_steps", 1)
         reference_embedding = kwargs.get("reference_embedding")
+        reference_embeddings = kwargs.get("reference_embeddings")
+        per_speaker_reference = kwargs.get("per_speaker_reference", False)
         face_embedder = kwargs.get("face_embedder")
         apply_identity_filter = kwargs.get("apply_identity_filter", False)
         identity_similarity_threshold = kwargs.get("identity_similarity_threshold", 0.5)
@@ -3752,11 +3848,13 @@ class LipsyncPipeline(DiffusionPipeline):
         # Identity filtering is controlled by the apply_identity_filter flag.
         # When enabled and no avatar is provided, loop_video will auto-detect a
         # "main speaker" and filter to that face. When disabled, all detected
-        # faces are candidates for lip-sync.
+        # faces are candidates for lip-sync. In per_speaker_reference mode the
+        # auto-detect produces all speaker clusters instead of just the main.
+        has_reference = reference_embedding is not None or bool(reference_embeddings)
         self._last_active_speaker_stats = {
-            "enabled": apply_identity_filter and reference_embedding is None and face_embedder is not None,
+            "enabled": apply_identity_filter and not has_reference and face_embedder is not None,
             "selected": False,
-            "reason": "reference_embedding_provided" if reference_embedding is not None else "not_run",
+            "reason": "reference_embedding_provided" if has_reference else "not_run",
             "sampled_frames": 0,
             "clusters": 0,
         }
@@ -3778,6 +3876,8 @@ class LipsyncPipeline(DiffusionPipeline):
             video_frames,
             reference_embedding=reference_embedding,
             face_embedder=face_embedder,
+            reference_embeddings=reference_embeddings,
+            per_speaker_reference=per_speaker_reference,
             apply_identity_filter=apply_identity_filter,
             video_fps=video_fps,
             yaw_skip_threshold=yaw_skip_threshold,
@@ -4778,6 +4878,11 @@ class LipsyncPipeline(DiffusionPipeline):
         reference_embedding=None,
         face_embedder=None,
         apply_identity_filter: bool = False,
+        # Multi-speaker mode: when set (and apply_identity_filter is on with no
+        # explicit avatar), auto-detect all speaker clusters and match each
+        # frame to its nearest speaker, instead of filtering to one main speaker.
+        per_speaker_reference: bool = False,
+        reference_embeddings=None,
         identity_similarity_threshold: float = 0.5,
         identity_yaw_adaptive_enabled: bool = True,
         identity_yaw_adaptive_scale: float = 0.15,
@@ -5128,19 +5233,31 @@ class LipsyncPipeline(DiffusionPipeline):
                     f"scene_durations=[{', '.join(f'{d:.3f}s' for d in scene_durations)}]"
                 )
 
-                # Detect the main speaker ONCE over the whole video (before the
-                # per-scene loop) instead of re-running it per scene. Short
-                # scenes (sub-second) sample too few frames for stable
+                # Detect the speaker reference(s) ONCE over the whole video
+                # (before the per-scene loop) instead of re-running it per scene.
+                # Short scenes (sub-second) sample too few frames for stable
                 # clustering/scoring, which let a blurry face win the speaker
                 # vote within a single scene. Sampling across the full video
-                # gives a reliable, consistent reference for every scene.
-                if apply_identity_filter and reference_embedding is None and face_embedder is not None:
-                    full_video_reference = self.detect_main_speaker_embedding(
-                        video_frames, face_embedder, min_detection_score=min_detection_score
-                    )
-                    if full_video_reference is not None:
-                        _process_clip_kwargs["reference_embedding"] = full_video_reference
-                        logger.info("[LipSync] Auto-detected main speaker embedding (whole-video, pre-scene)")
+                # gives a reliable, consistent reference for every scene. In
+                # per_speaker_reference mode this detects all speaker clusters.
+                if apply_identity_filter and reference_embedding is None and reference_embeddings is None and face_embedder is not None:
+                    if per_speaker_reference:
+                        full_video_refs = self.detect_speaker_embeddings(
+                            video_frames, face_embedder, min_detection_score=min_detection_score
+                        )
+                        if full_video_refs:
+                            _process_clip_kwargs["reference_embeddings"] = full_video_refs
+                            logger.info(
+                                "[LipSync] Auto-detected %d per-speaker embeddings (whole-video, pre-scene)",
+                                len(full_video_refs),
+                            )
+                    else:
+                        full_video_reference = self.detect_main_speaker_embedding(
+                            video_frames, face_embedder, min_detection_score=min_detection_score
+                        )
+                        if full_video_reference is not None:
+                            _process_clip_kwargs["reference_embedding"] = full_video_reference
+                            logger.info("[LipSync] Auto-detected main speaker embedding (whole-video, pre-scene)")
 
                 # Free the full-frame buffer now that scene boundaries are known.
                 # Each scene will be loaded on demand from the FPS-normalized
