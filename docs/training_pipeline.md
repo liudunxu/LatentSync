@@ -3594,6 +3594,358 @@ checkpoints/
 
 ---
 
+## 19. LPIPS & koniq_pretrained.pkl：图像质量评估的完整应用
+
+> **这一节专门讲两个"看起来很相似但用途完全不同"的质量工具，在训练 / 预处理 / 离线评估 / 推理 4 个阶段分别怎么用。**
+
+### 19.1 一张表看清两者定位
+
+| 维度 | **LPIPS** | **koniq_pretrained.pkl**（HyperIQA） |
+|---|---|---|
+| **全称** | Learned Perceptual Image Patch Similarity | HyperIQA 模型权重（koniq-10k 预训练） |
+| **类型** | **有参考** 指标（需要 GT） | **无参考** 指标（不需要 GT） |
+| **核心 backbone** | VGG-16（在 ImageNet 上预训练） | ResNet-50（koniq-10k 预训练）+ HyperNet + TargetNet |
+| **作用** | 算"两张图差多远"（感知距离） | 算"这张图本身质量多少分"（0-100） |
+| **使用方式** | 损失函数（要反传） | 评估函数（不反传） |
+| **输出范围** | 0 ~ 1+（越小越相似） | 0 ~ 100（越高越好） |
+| **是否需要 GT** | ✅ 需要 | ❌ 不需要 |
+| **是否冻结** | 冻结（只取特征） | 冻结（只 inference） |
+| **模型文件** | `lpips` Python 包 | `checkpoints/auxiliary/koniq_pretrained.pkl` |
+| **下载方式** | `pip install lpips` | HF 自动下载（`check_model_and_download`） |
+
+```mermaid
+flowchart TB
+    subgraph HAS_REF[有参考工具: LPIPS]
+        A1[GT 图]
+        A2[生成图]
+        A1 --> L1[LPIPS-VGG]
+        A2 --> L1
+        L1 --> O1[感知距离<br/>越小越像]
+    end
+
+    subgraph NO_REF[无参考工具: HyperIQA]
+        B1[任意图] --> L2[HyperNet + TargetNet]
+        L2 --> O2[0-100 质量分<br/>越大越好]
+    end
+```
+
+### 19.2 LPIPS 在训练 / 推理 / 评估阶段的完整用法
+
+#### 19.2.1 训练阶段（作为感知损失）
+
+**初始化**（`scripts/train_unet.py:208-209`）：
+
+```python
+if config.run.perceptual_loss_weight != 0 and config.run.pixel_space_supervise:
+    lpips_loss_func = lpips.LPIPS(net="vgg").to(device)
+    # ↑ 加载 VGG-16 ImageNet 预训练权重（不是 lpips 自己训的）
+    # 冻结，不参与训练
+```
+
+**使用**（`scripts/train_unet.py:372-377`）：
+
+```python
+if config.run.perceptual_loss_weight != 0 and config.run.pixel_space_supervise:
+    # 只取下半张脸（嘴部区域）
+    pred_pixel_values_perceptual = pred_pixel_values[
+        :, :, pred_pixel_values.shape[2] // 2 :, :  # H/2:
+    ]
+    gt_pixel_values_perceptual = gt_pixel_values[
+        :, :, gt_pixel_values.shape[2] // 2 :, :
+    ]
+    
+    lpips_loss = lpips_loss_func(
+        pred_pixel_values_perceptual.float(),
+        gt_pixel_values_perceptual.float(),
+    ).mean()
+```
+
+**作用**：把生成的嘴部和真实嘴部都送进 VGG-16 提取高层特征，比较特征的 L2 距离。
+
+```mermaid
+flowchart LR
+    P[pred_pixel<br/>生成的下半脸] --> VGG[VGG-16<br/>ImageNet 预训练<br/>冻结]
+    G[gt_pixel<br/>GT 的下半脸] --> VGG
+    VGG --> FEAT[高层特征]
+    FEAT --> L2[L2 距离]
+    L2 --> LOSS[LPIPS loss]
+```
+
+**配置**（`configs/unet/stage2.yaml`）：
+
+```yaml
+run:
+  perceptual_loss_weight: 0.1   # 总损失的权重
+  pixel_space_supervise: true   # 必开
+```
+
+**为什么只看下半脸**：
+- 上半脸 UNet 不改 → 算 LPIPS 浪费
+- 嘴部是 LPIPS 唯一想优化的区域
+- 节省计算量
+
+#### 19.2.2 推理阶段（**不用**）
+
+`LipsyncPipeline` 里**完全没加载 LPIPS**。嘴部质量是 UNet 训练时通过 LPIPS 损失"烧"进去的，推理时不需要。
+
+```bash
+# 验证：grep 0 匹配
+$ grep -rn "lpips\|LPIPS" latentsync/pipelines/
+# 无结果
+```
+
+#### 19.2.3 评估阶段（量化"糊不糊"）
+
+参考 §13，单帧 LPIPS 评估代码：
+
+```python
+import lpips
+import torch
+from torchvision import transforms
+
+loss_fn = lpips.LPIPS(net="vgg").to("cuda")
+
+def evaluate_lpips(generated_frames, gt_frames):
+    """对 16 帧计算平均 LPIPS"""
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Resize((256, 256)),
+    ])
+    losses = []
+    for gen, gt in zip(generated_frames, gt_frames):
+        # 注意：也只算下半脸（和训练一致）
+        h = gen.shape[1] // 2
+        g = transform(gen)[:, h:, :].unsqueeze(0).to("cuda")
+        t = transform(gt)[:, h:, :].unsqueeze(0).to("cuda")
+        losses.append(loss_fn(g, t).item())
+    return sum(losses) / len(losses)
+
+# 判读
+# < 0.05: 极好
+# 0.05-0.15: 好
+# 0.15-0.30: 一般
+# > 0.30: 差
+```
+
+### 19.3 koniq_pretrained.pkl（HyperIQA）的完整应用
+
+> **这是个更复杂的工具**：两层网络（HyperNet + TargetNet），动态生成 Target 网络参数。
+
+#### 19.3.1 架构：HyperNet + TargetNet
+
+```mermaid
+flowchart TB
+    subgraph STAGE1[Stage 1: HyperNet 生成参数]
+        IMG[输入图 224x224] --> RN[ResNet-50<br/>koniq-10k 预训练]
+        RN --> FEAT[特征]
+        FEAT --> HNET[HyperNet]
+        HNET --> PARAS[生成 Target Net 的<br/>所有 fc 权重和偏置]
+    end
+
+    subgraph STAGE2[Stage 2: TargetNet 打分]
+        PARAS --> TNET[TargetNet<br/>每张图专属的 MLP]
+        FEAT --> TNET
+        TNET --> SCORE[0-100 质量分]
+    end
+```
+
+**核心思想**：不同的图应该用**不同的 MLP** 来打分（"好"的定义因图而异），所以 HyperNet 先看图，再用图的内容生成专属的 TargetNet 权重。
+
+#### 19.3.2 训练阶段（**不用**）
+
+`scripts/train_unet.py` 完全不引用 HyperIQA。它是离线工具，不参与 UNet 训练。
+
+#### 19.3.3 预处理阶段（**用**）
+
+`preprocess/filter_visual_quality.py:56-97`：
+
+```python
+def func(paths, device_id):
+    device = f"cuda:{device_id}"
+
+    # 1. 创建并加载 HyperNet
+    model_hyper = HyperNet(16, 112, 224, 112, 56, 28, 14, 7).to(device)
+    model_hyper.train(False)
+    model_hyper.load_state_dict(
+        torch.load("checkpoints/auxiliary/koniq_pretrained.pkl", 
+                  map_location=device, weights_only=True)
+    )
+
+    # 2. 预处理：center crop 224 + ImageNet normalize
+    transforms = torchvision.transforms.Compose([
+        torchvision.transforms.CenterCrop(size=224),
+        torchvision.transforms.Normalize(
+            mean=(0.485, 0.456, 0.406), 
+            std=(0.229, 0.224, 0.225)
+        ),
+    ])
+
+    for video_input, video_output in paths:
+        try:
+            # 3. 读首/中/末 3 帧
+            video_frames = read_video(video_input)  # 首/中/末
+            
+            # 4. 预处理
+            video_frames = transforms(video_frames).to(device)
+            
+            # 5. HyperNet 生成 Target Net 参数
+            paras = model_hyper(video_frames)
+            
+            # 6. 用生成的参数构建 Target Net
+            model_target = TargetNet(paras).to(device)
+            
+            # 7. 打分
+            pred = model_target(paras["target_in_vec"])
+            quality_score = pred.mean().item()  # 0-100
+            
+            # 8. 阈值过滤
+            if quality_score >= 40:
+                # 保留到 high_visual_quality/
+                shutil.copy(video_input, video_output)
+        except Exception as e:
+            print(e)
+```
+
+**关键点**：
+- **每视频取 3 帧**（首/中/末），不跑全视频（节省算力）
+- **阈值 40**（论文 + 经验值）保留
+- **中心裁剪 224×224**（人脸主体）
+
+#### 19.3.4 评估阶段（**用**）
+
+`eval/hyper_iqa.py` 提供了可复用的 HyperNet + TargetNet 类，§13 评估流程用到：
+
+```python
+from eval.hyper_iqa import HyperNet, TargetNet
+
+def evaluate_hyperiqa(image_paths):
+    model_hyper = HyperNet(16, 112, 224, 112, 56, 28, 14, 7).to(device)
+    model_hyper.load_state_dict(torch.load("checkpoints/auxiliary/koniq_pretrained.pkl"))
+    model_hyper.eval()
+    
+    scores = []
+    for img in image_paths:
+        # 同样的预处理
+        frame = transform(img)
+        paras = model_hyper(frame)
+        model_target = TargetNet(paras).to(device)
+        for p in model_target.parameters():
+            p.requires_grad = False
+        score = model_target(paras["target_in_vec"]).mean().item()
+        scores.append(score)
+    
+    return scores
+```
+
+**判读**：
+- 0-20：极差（基本不能用）
+- 20-40：差
+- 40-60：一般（preprocess 阈值就是 40）
+- 60-80：好
+- 80-100：非常好
+
+#### 19.3.5 推理阶段（**不用**）
+
+`LipsyncPipeline` 不加载 HyperIQA。它只在预处理和离线评估用。
+
+### 19.4 完整使用流程图
+
+```mermaid
+flowchart TB
+    subgraph STAGE_PREP[数据预处理]
+        A1[原始 mp4] --> A2[koniq_pretrained.pkl<br/>filter_visual_quality.py]
+        A2 --> A3{quality_score ≥ 40?}
+        A3 -->|是| A4[保留]
+        A3 -->|否| A5[丢弃]
+    end
+
+    subgraph STAGE_TRAIN[UNet 训练]
+        A4 --> B1[UNet 训练循环]
+        B1 --> B2[pred_pixel / gt_pixel]
+        B2 --> B3[LPIPS-VGG 算感知损失]
+        B3 --> B4[× perceptual_loss_weight=0.1]
+        B4 --> B5[L_total]
+    end
+
+    subgraph STAGE_INFER[推理部署]
+        A4 --> C1[LipsyncPipeline]
+        C1 --> C2[DDIM 生成嘴部]
+        C2 --> C3[输出 mp4]
+    end
+
+    subgraph STAGE_EVAL[离线评估]
+        C3 --> D1[§13 评估脚本]
+        B5 --> D1
+        D1 --> D2[LPIPS 算嘴部感知距离]
+        D1 --> D3[koniq_pretrained.pkl<br/>算整体质量分]
+        D1 --> D4[报告]
+    end
+```
+
+### 19.5 LPIPS vs HyperIQA：何时用哪个？
+
+| 场景 | 用 LPIPS | 用 HyperIQA |
+|---|---|---|
+| **训练时优化嘴部质量** | ✅ 必用（perceptual_loss_weight） | ❌ |
+| **preprocess 过滤低质量视频** | ❌（需要 GT） | ✅ 必用（threshold=40） |
+| **离线评估"嘴糊不糊"** | ✅ 和 GT 对比 | ⚠️ 也行但不直接 |
+| **离线评估"整体质量"** | ❌ | ✅ 0-100 分 |
+| **推理时** | ❌ 都不加载 | ❌ 都不加载 |
+
+### 19.6 关键代码引用速查
+
+| 文件 | 行号 | 作用 |
+|---|---|---|
+| `scripts/train_unet.py` | 54 | `import lpips` |
+| `scripts/train_unet.py` | 208-209 | LPIPS 初始化 |
+| `scripts/train_unet.py` | 372-377 | LPIPS 算 loss（只下半脸） |
+| `scripts/train_unet.py` | 418 | LPIPS 加到 L_total |
+| `preprocess/filter_visual_quality.py` | 56-97 | HyperIQA 打分 + 阈值过滤 |
+| `preprocess/filter_visual_quality.py` | 62-65 | 加载 koniq_pretrained.pkl |
+| `preprocess/filter_visual_quality.py` | 93 | threshold = 40 |
+| `eval/hyper_iqa.py` | 19-30 | HyperNet 类 |
+| `eval/hyper_iqa.py` | 123-155 | TargetNet 类 |
+| `eval/hyper_iqa.py` | 158+ | TargetFC 类 |
+| `config/run/pixel_space_supervise` | - | LPIPS 开关 |
+| `config/run/perceptual_loss_weight` | - | LPIPS 权重 |
+
+### 19.7 安装 / 下载
+
+```bash
+# LPIPS（pip 包）
+pip install lpips
+
+# koniq_pretrained.pkl（首次运行自动从 HF 下载）
+python -c "from latentsync.utils.util import check_model_and_download; \
+  check_model_and_download('checkpoints/auxiliary/koniq_pretrained.pkl')"
+
+# 或手动
+huggingface-cli download ByteDance/LatentSync-1.5 koniq_pretrained.pkl --local-dir checkpoints
+```
+
+### 19.8 常见问题
+
+**Q：训练时 LPIPS 显存爆炸怎么办？**
+A：关 `pixel_space_supervise`（退回 Stage 1 模式）。或者用 `stage2_efficient.yaml`（关 TREPA，省更多）。
+
+**Q：koniq_pretrained.pkl 加载失败？**
+A：检查 `checkpoints/auxiliary/` 目录权限，或重新跑 `check_model_and_download`。
+
+**Q：可以用别的 IQA 模型替代吗？**
+A：理论上可以（替换 `koniq_pretrained.pkl`），但需要保证 input shape (3, 224, 224) 和 output (1,)。建议先用论文默认值。
+
+**Q：LPIPS 和 HyperIQA 分数会冲突吗？**
+A：不会。LPIPS 衡量"和 GT 像不像"（越低越好），HyperIQA 衡量"本身质量好不好"（越高越好）。
+
+### 19.9 一句话总结
+
+> **LPIPS = 训练时的感知损失（用 GT 比对）+ 评估时量化嘴糊程度**。
+> **koniq_pretrained.pkl = 预处理过滤低质量视频 + 离线评估整体质量**。
+> **两者都不在推理时加载**——只是把"质量信号"通过训练烧进 UNet 权重里。
+> 训练想优化嘴部质量 → 调 `perceptual_loss_weight`；想过滤差数据 → 调 filter_visual_quality 的 threshold=40。
+
+---
+
 ## 附录 A：论文数学公式对照
 
 | 公式 | 含义 | 代码位置 |
