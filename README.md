@@ -21,6 +21,17 @@
 
 We present *LatentSync*, an end-to-end lip-sync method based on audio-conditioned latent diffusion models without any intermediate motion representation, diverging from previous diffusion-based lip-sync methods based on pixel-space diffusion or two-stage generation. Our framework can leverage the powerful capabilities of Stable Diffusion to directly model complex audio-visual correlations.
 
+## 📚 文档索引
+
+**finetune 用户从这里开始**:
+- [docs/finetune_studio_guide.md](docs/finetune_studio_guide.md) — 完整 finetune 操作手册
+- [docs/short_drama_workflow.md](docs/short_drama_workflow.md) — 短剧 1 页速查卡
+- [docs/README.md](docs/README.md) — 所有文档的索引
+
+**架构 / 改 model 从这里开始**:
+- [docs/training_pipeline.md](docs/training_pipeline.md) — 训练 deep reference (5600+ 行)
+- [docs/lipsync_optimization_roadmap.md](docs/lipsync_optimization_roadmap.md) — 优化 roadmap + 已知瓶颈
+
 ## 🏗️ Framework
 
 <p align="center">
