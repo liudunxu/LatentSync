@@ -29,13 +29,15 @@ from pathlib import Path
 class UNetDataset(Dataset):
     def __init__(self, train_data_dir: str, config):
         if config.data.train_fileslist != "":
+            # Priority 1: explicit fileslist
             with open(config.data.train_fileslist) as file:
-                self.video_paths = [line.rstrip() for line in file]
+                self.video_paths = [line.rstrip() for line in file if line.strip()]
         elif train_data_dir != "":
-            self.video_paths = []
-            for file in os.listdir(train_data_dir):
-                if file.endswith(".mp4"):
-                    self.video_paths.append(os.path.join(train_data_dir, file))
+            # Priority 2: directory (now recursive)
+            # Supports nested layouts like data/train/<speaker>/<video>.mp4
+            self.video_paths = sorted(
+                str(p) for p in Path(train_data_dir).rglob("*.mp4")
+            )
         else:
             raise ValueError("data_dir and fileslist cannot be both empty")
 

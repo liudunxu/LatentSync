@@ -1,3 +1,4 @@
+# LatentSync core dependencies (required for inference + basic training)
 torch==2.5.1
 torchvision==0.20.1
 --extra-index-url https://download.pytorch.org/whl/cu121
@@ -15,12 +16,45 @@ scenedetect==0.6.1
 ffmpeg-python==0.2.0
 imageio==2.31.1
 imageio-ffmpeg==0.5.1
-lpips==0.1.4
 face-alignment==1.4.1
-gradio==5.24.0
 huggingface-hub==0.30.2
 numpy==1.26.4
 kornia==0.8.0
 insightface==0.7.3
 onnxruntime-gpu==1.21.0
+
+# Perceptual / quality losses (already used in train_unet.py)
+lpips==0.1.4
+
+# Inference-time speedup
 DeepCache==0.1.1
+
+# ---------------------------------------------------------------------------
+# Optional: Gradio fine-tune UI (gradio_finetune.py)
+# ---------------------------------------------------------------------------
+gradio==5.24.0
+# matplotlib is also needed by util.plot_loss_chart; surfaced here so
+# gradio_finetune's "dataset quality eval" tab can render histograms
+# without a separate install step.
+matplotlib>=3.7
+# scikit-image provides PSNR / SSIM used by scripts/evaluate_checkpoint.py
+scikit-image>=0.21
+
+# ---------------------------------------------------------------------------
+# Optional: PEFT / LoRA / QLoRA fine-tuning (scripts/train_unet_lora.py,
+# scripts/merge_lora.py, configs/unet/stage2_lora.yaml)
+# ---------------------------------------------------------------------------
+peft>=0.10
+# bitsandbytes is required for QLoRA (4-bit nf4 base UNet)
+bitsandbytes>=0.41
+# safetensors is the peft adapter save/load format
+safetensors>=0.4
+
+# ---------------------------------------------------------------------------
+# Optional: experiment tracking (latentsync/utils/tracker.py)
+# Install EITHER wandb OR tensorboard; if neither is installed the
+# tracker silently no-ops. Force a backend with the LATENTSYNC_TRACKER
+# env var: off | wandb | tensorboard
+# ---------------------------------------------------------------------------
+wandb>=0.16                # recommended (cloud dashboards, multi-user)
+# tensorboard>=2.14         # alternative, no account needed
