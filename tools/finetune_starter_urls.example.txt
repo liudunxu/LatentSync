@@ -1,0 +1,65 @@
+# ================================================================
+#  finetune starter URL list (template)
+# ================================================================
+#
+#  Format: one URL per line. Lines beginning with '#' are ignored.
+#
+#  This is a TEMPLATE — replace the placeholder URLs below with real
+#  sources you have rights to use. After curating, you will have
+#  ~200 videos categorized by yaw (frontal/side_face) and motion
+#  (frontal/fast_motion), in:
+#      <output_dir>/{frontal,side_face,fast_motion}/<n>_<name>.mp4
+#      <output_dir>/fileslist.txt  ← plug into gradio_finetune Tab 1
+#
+#  Recommended source mix (see gradio Tab 6 cheat sheet for badcase
+#  theory; this matches the "🎯 Badcase Fix" preset bias):
+#
+#    ~40%  interview / news anchor / lecturing   (yaw stable → frontal)
+#    ~40%  interview WITH head-turning             (yaw range 20-40° → side_face)
+#    ~20%  vlog / gesturing / walking-talking     (bbox delta → fast_motion)
+#
+#  AVOID: low light, multi-speaker, occluded mouth, headwear, extreme
+#  yaw (>45°) — get filtered out by the curator as 'reject'.
+#
+# ----------------------------------------------------------------
+#  Where to find candidates
+# ----------------------------------------------------------------
+#
+#  A) VoxCeleb2 — academic dataset used to train the base LatentSync
+#     model. Requires free academic application:
+#       http://www.robots.ox.ac.uk/~vgg/data/voxceleb/vox2.html
+#     Once downloaded, point --source-dir at the directory.
+#
+#  B) HDTF — High Definition Talking Faces (YoursZ)
+#     https://github.com/youngsengli/HDTF  (research use)
+#
+#  C) Pexels (free stock footage, no registration needed for download)
+#     https://www.pexels.com/search/videos/interview/
+#     https://www.pexels.com/search/videos/head%20turning/
+#     https://www.pexels.com/search/videos/gesturing/
+#     Each video page exposes a direct .mp4 URL — right-click the
+#     download button to copy the URL.
+#
+#  D) Pixabay (similar to Pexels, all CC0):
+#     https://pixabay.com/videos/search/interview/
+#
+#  E) YouTube (interview / talk show channels). Use yt-dlp to grab:
+#     https://www.youtube.com/results?search_query=interview+single+face+talking
+#
+#  F) Your own footage — best option if you have permission. Drop mp4s
+#     into a local dir and pass --source-dir.
+#
+# ----------------------------------------------------------------
+#  Example entries (REPLACE the lines below with real URLs)
+# ----------------------------------------------------------------
+
+# --- A few short public samples for testing the curator pipeline ---
+# (Use Pexels free stock so it's safe to bake into a template.)
+
+# https://www.pexels.com/video/<some-interview-id>.mp4       # interview, frontal
+# https://www.pexels.com/video/<some-head-turn-id>.mp4       # side_face candidate
+# https://www.pexels.com/video/<some-walking-id>.mp4         # fast_motion candidate
+
+# --- Real YouTube interview clips (replace with verified URLs) ---
+# https://www.youtube.com/watch?v=XXXXXXXXXXX
+# https://www.youtube.com/watch?v=YYYYYYYYYYY
