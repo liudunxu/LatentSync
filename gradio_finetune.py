@@ -261,6 +261,22 @@ DATASET_PRESETS: Dict[str, Dict[str, str]] = {
 # Process management for background training
 # ---------------------------------------------------------------------------
 
+def _prune_debug_files(directory: Path, pattern: str, keep: int = 10) -> None:
+    """Keep only the N most-recently-modified files matching `pattern` in `directory`.
+
+    Tab 3 / 3.5 write a fresh tmp yaml per invocation; over a long session this
+    leaks disk. We cap it at `keep` files (oldest deleted first).
+    """
+    if not directory.exists():
+        return
+    matches = sorted(directory.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in matches[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 class TrainingProcess:
     """Track a single background training subprocess."""
 
@@ -915,6 +931,9 @@ def run_compare(
     if base_ckpt == fine_tuned_ckpt:
         raise gr.Error("两个 checkpoint 必须不同")
 
+    _prune_debug_files(REPO_ROOT / "debug", "compare_cfg_*.yaml")
+    _prune_debug_files(REPO_ROOT / "debug" / "compare_outputs", "compare_cfg_*.yaml")
+
     out_dir = REPO_ROOT / "debug" / "compare_outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1153,6 +1172,8 @@ def run_validation(
     # Pre-flight compatibility check
     warnings = _check_ckpt_compatibility(ckpt, cfg)
     warnings_text = "\n".join(warnings) if warnings else "✅ ckpt 与 config 兼容"
+
+    _prune_debug_files(REPO_ROOT / "debug" / "validation_outputs", "validation_cfg_*.yaml")
 
     # Build a per-run config with the user-chosen resolution / steps / guidance
     base_cfg = OmegaConf.load(cfg)
@@ -1418,7 +1439,7 @@ def build_ui() -> gr.Blocks:
                         value="latentsync/utils/mask.png",
                     )
                     save_ckpt_steps = gr.Slider(500, 50000, value=10000, step=500, label="save_ckpt_steps")
-                    max_train_steps = gr.Slider(1000, 10_000_000, value=10_000_000, step=1000, label="max_train_steps")
+                    max_train_steps = gr.Slider(1000, 100000, value=10000, step=1000, label="max_train_steps (cap: 100k ≈ 1.7 days @1.5s/step)")
                     num_workers = gr.Slider(0, 32, value=12, step=1, label="num_workers")
                     train_output_dir = gr.Textbox(
                         label=f"train_output_dir (相对于 {FINETUNE_BASE_DIR.name})",
