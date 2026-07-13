@@ -2630,6 +2630,364 @@ with gr.Tab("⚠️ Badcase 检查清单"):
 
 ---
 
+## 16. 训练 vs 推理：完整对比
+
+> **这一节专门讲"训练时一套东西、推理时另一套东西"，把哪些是公用的、哪些是独有的摸清楚。**
+> **这对你 debug "训练 loss 降了但推理效果差" 类问题非常关键。**
+
+### 16.1 一图看懂数据流对比
+
+```mermaid
+flowchart LR
+    subgraph TRAIN[训练流程<br/>scripts/train_unet.py]
+        T1[VoxCeleb2 + HDTF<br/>mp4 文件] --> T2[UNetDataset<br/>随机抽 16 帧 + ref 帧]
+        T2 --> T3[gt / masked / ref / masks]
+        T3 --> T4[VAE encode<br/>→ latent]
+        T4 --> T5[UNet + noise + audio<br/>→ pred_noise]
+        T5 --> T6[recon / sync / lpips / trepa]
+        T6 --> T7[AdamW + GradScaler<br/>DDP 反向传播]
+        T7 --> T8[checkpoint<br/>latentsync_unet.pt]
+    end
+
+    subgraph INFER[推理流程<br/>LipsyncPipeline / api.py]
+        I1[用户上传<br/>mp4 + wav] --> I2[InsightFace 检测<br/>逐帧仿射对齐]
+        I2 --> I3[prepare_masks_and_masked_images<br/>+ dynamic mouth mask]
+        I3 --> I4[VAE encode<br/>→ latent]
+        I4 --> I5[UNet + noise + audio<br/>DDIM 20-40 步]
+        I5 --> I6[VAE decode<br/>→ pixel]
+        I6 --> I7[paste_surrounding_pixels_back<br/>+ color match<br/>+ detail restore]
+        I7 --> I8[restore_img 贴回原帧]
+        I8 --> I9[ffmpeg + 音频 mux]
+        I9 --> I10[result.mp4]
+    end
+
+    T8 -.加载.-> I5
+```
+
+**关键差异**：
+- 训练是 **offline + 大批量 + 反向传播**
+- 推理是 **online + 实时单 batch + 前向 + 大量后处理**
+
+### 16.2 模型清单：谁用谁
+
+| 模型 | 训练时 | 推理时 | 加载来源 |
+|---|---|---|---|
+| **UNet3DConditionModel** | ✅ 训练更新 | ✅ 加载训好的 | `latentsync_unet.pt`（训完） / SD1.5 warm start（首次训） |
+| **AutoencoderKL（VAE）** | ✅ 用，**冻结** | ✅ 用，**冻结** | `stabilityai/sd-vae-ft-mse`（自动下载） |
+| **Whisper tiny** | ✅ 用，**冻结** | ✅ 用，**冻结** | `checkpoints/whisper/tiny.pt`（自动下载） |
+| **StableSyncNet** | ✅ Stage 2 训练用 | ❌ **不用** | `stable_syncnet.pt`（训完） |
+| **SyncNetEval**（Joon Son Chung 原版） | ⚠️ 仅训练时验证 val_video | ❌ 推理不用 | `checkpoints/auxiliary/syncnet_v2.model` |
+| **SyncNetDetector** | ❌ | ❌ 推理不用 | — |
+| **InsightFace** | ❌（preprocess 已对齐） | ✅ 推理时**实时对齐** | `~/.insightface/` |
+| **Codeformer Restorer** | ❌ | ✅ 可选后处理 | `checkpoints/Codeformer/` |
+| **MediaPipe face detector** | ⚠️ 仅 FVD 评估时 | ❌ | — |
+| **HyperIQA** | ❌ | ❌ | 仅离线评估 |
+
+### 16.3 公有资产：两边都用、完全一样
+
+```mermaid
+flowchart TB
+    COMMON[公有资产<br/>训练和推理都加载] --> VAE
+    COMMON --> WHISPER
+    COMMON --> UNET_ARCH[UNet 架构<br/>from_config 一致]
+    COMMON --> IMG_PROC[ImageProcessor<br/>mask 逻辑一致]
+    COMMON --> SCHED[DDIMScheduler<br/>configs/scheduler_config.json]
+
+    VAE[AutoencoderKL<br/>sd-vae-ft-mse<br/>冻结<br/>scaling=0.18215, shift=0]
+    WHISPER[whisper-tiny.pt<br/>384 维<br/>冻结]
+    UNET_ARCH[UNet3DConditionModel<br/>13 通道 conv_in<br/>384 维 cross-attn]
+    IMG_PROC[prepare_masks_and_masked_images<br/>mask.png × gt = masked]
+    SCHED[DDIMScheduler<br/>1000 步<br/>linear beta]
+```
+
+#### VAE（公有）
+
+**训练**：
+```python
+# scripts/train_unet.py:95
+vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=torch.float16)
+vae.requires_grad_(False)  # 冻结
+vae.to(device)
+```
+
+**推理**：
+```python
+# latentsync/pipelines/lipsync_pipeline.py:20
+from diffusers.models import AutoencoderKL
+vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", dtype=dtype)
+```
+
+**完全一致**：同一个模型、同一个 scaling_factor (0.18215)、同一个 shift_factor (0)。
+
+#### Whisper-tiny（公有）
+
+**训练**：
+```python
+# scripts/train_unet.py:118
+audio_encoder = Audio2Feature(
+    model_path="checkpoints/whisper/tiny.pt",
+    num_frames=config.data.num_frames,
+    audio_feat_length=config.data.audio_feat_length,
+)
+```
+
+**推理**：
+```python
+# api.py / gradio_app.py 类似加载
+audio_encoder = Audio2Feature(model_path="checkpoints/whisper/tiny.pt")
+```
+
+**完全一致**：384 维特征、`audio_feat_length=[2,2]`、5 帧捆绑。
+
+#### UNet 架构（公有）
+
+**两边都从 `configs/unet/stage*.yaml` 读同一份配置**，用 `from_config()` 构造同结构模型。区别：
+- 训练：从 checkpoint 加载权重（或 SD1.5 warm start）继续训练
+- 推理：加载训练产物 `latentsync_unet.pt`
+
+```python
+# 训练 (scripts/train_unet.py:126)
+unet, resume_global_step = UNet3DConditionModel.from_pretrained(
+    OmegaConf.to_container(config.model),
+    config.ckpt.resume_ckpt_path,  # = checkpoints/latentsync_unet.pt
+    device=device,
+)
+
+# 推理 (latentsync/pipelines/lipsync_pipeline.py 类似)
+unet = UNet3DConditionModel.from_config(cfg.model)
+unet.load_state_dict(load(checkpoint_path))
+```
+
+**架构 100% 一致**：13 通道 conv_in、384 维 cross-attn、Motion Module（Stage 2 时）。
+
+#### ImageProcessor（公有）
+
+**两边都用** `latentsync.utils.image_processor.ImageProcessor`：
+- `prepare_masks_and_masked_images(gt_frames)` 输出 `(gt, masked, masks)`
+- `load_fixed_mask(resolution, mask_image_path)` 加载 mask.png
+
+```python
+# 训练 (latentsync/data/unet_dataset.py:129)
+gt_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
+    gt_frames, affine_transform=False
+)
+
+# 推理 (lipsync_pipeline.py:4194)
+ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
+    inference_faces, affine_transform=False
+)
+```
+
+#### DDIMScheduler（公有）
+
+```python
+# 两边都从 configs/scheduler_config.json 加载
+noise_scheduler = DDIMScheduler.from_pretrained("configs")
+```
+
+配置：`num_train_timesteps=1000`, `beta_start=0.00085`, `beta_end=0.012`, `prediction_type="epsilon"`
+
+### 16.4 训练专有：这些只在训练时存在
+
+| 组件 | 用途 | 代码 |
+|---|---|---|
+| **DDP 分布式** | 多卡并行 | `init_dist()`, `DistributedSampler`, `DistributedDataParallel` |
+| **Mixed Precision（fp16）** | 省显存 + 加速 | `torch.amp.GradScaler("cuda")` |
+| **AdamW 优化器** | 反向传播 | `torch.optim.AdamW` |
+| **LR Scheduler** | 学习率衰减 | `diffusers.optimization.get_scheduler` |
+| **Gradient Checkpointing** | 省显存 | `unet.enable_gradient_checkpointing()` |
+| **损失计算** | recon / sync / lpips / trepa | `train_unet.py:415-420` |
+| **VAE decode for loss** | 把 latent 解回 pixel 算感知损失 | `vae.decode(pred_latents)` |
+| **StableSyncNet** | Stage 2 sync 监督 | `latentsync.models.stable_syncnet` |
+| **Checkpoint 保存** | 每 N 步存一次 | `torch.save(state_dict, path)` |
+| **Validation pipeline** | 训 N 步跑一次 LipsyncPipeline | 嵌在 train loop 里 |
+| **Sync_conf 评估** | 训 N 步给 val_video 打分 | `eval.eval_sync_conf` |
+| **Loss curve 画图** | `plot_loss_chart` | `latentsync/utils/util.py` |
+| **Log 日志** | tqdm progress bar | `from tqdm.auto import tqdm` |
+
+### 16.5 推理专有：这些只在推理时存在
+
+| 组件 | 用途 | 代码位置 |
+|---|---|---|
+| **InsightFace 实时检测** | 每帧对齐人脸 | `latentsync/utils/face_detector.py` |
+| **AffineTransform 实时仿射** | 把脸 crop 到 256×256 | `latentsync/utils/affine_transform.py` |
+| **AlignRestore** | 贴回原帧 | `latentsync/utils/affine_transform.py` |
+| **Prefilters**（多类）| 检测失败/yaw/jump/blur/identity 都 skip | `lipsync_pipeline.py:2660-3020` |
+| **Dynamic mouth mask** | 嘴部椭圆（实时算） | `generate_dynamic_mouth_mask` |
+| **paste_surrounding_pixels_back** | mask 外用原图 | `lipsync_pipeline.py:253` |
+| **_match_color_to_reference** | 颜色匹配 | `lipsync_pipeline.py` |
+| **_restore_reference_detail** | L4 细节贴回 | `lipsync_pipeline.py:1550` |
+| **_unsharp_mask** | 嘴部锐化 | `lipsync_pipeline.py` |
+| **时序 EMA 平滑** | 3 帧 EMA | `_smooth_face_sequence` |
+| **mouth motion preserve** | 音频能量自适应 | `lipsync_pipeline.py` |
+| **mouth_temporal_stabilization** | 时序稳定 | `lipsync_pipeline.py` |
+| **quality gate / adaptive fallback** | 质量门控 | `lipsync_pipeline.py` |
+| **CodeFormer** | 可选人脸修复 | `latentsync/utils/codeformer_restorer.py` |
+| **ffmpeg 视频写入 + 音频 mux** | 输出 mp4 | `latentsync/utils/audio.py` |
+| **scene detection / shot passthrough** | 镜头感知 | `lipsync_pipeline.py` |
+| **SRT cue 解析** | 只在指定 cue 范围内 inpaint | `lipsync_pipeline.py` |
+| **reference embedding 加载** | 多人物身份参考 | `reference_embedding` kwarg |
+
+### 16.6 Checkpoint 兼容性
+
+```mermaid
+flowchart LR
+    SD[SD1.5 UNet<br/>stable-diffusion-v1-5] -->|warm start| STAGE1[Stage 1 checkpoint]
+    STAGE1 --> STAGE2[Stage 2 checkpoint]
+    STAGE2 --> FINE[fine-tuned checkpoint]
+    FINE --> DEPLOY[部署到 api.py]
+    
+    SD -.不兼容.-> DEPLOY
+    STAGE1 -.可以但 sync 差.-> DEPLOY
+    STAGE2 --> DEPLOY
+    FINE --> DEPLOY
+```
+
+**关键点**：
+
+| 起点 | 能不能直接推理 | 原因 |
+|---|---|---|
+| SD1.5 原生 UNet | ❌ | 没训过 lip-sync，13 通道 conv_in 维度也不对 |
+| Stage 1 checkpoint | ⚠️ 可以但 sync 差 | 没训过 sync/lpips/trepa |
+| Stage 2 checkpoint | ✅ 推荐 | 完整训练过 |
+| Fine-tuned checkpoint | ✅ 推荐 | 在 Stage 2 基础上微调 |
+| 不同分辨率 ckpt（256 vs 512） | ❌ 不互通 | `resolution` 和 `mask_image_path` 都不同 |
+
+### 16.7 端到端时间线对比
+
+#### 训练一个 Stage 2（256，1 张 A100）
+
+```mermaid
+gantt
+    title 训练 256 Stage 2 ~30 小时
+    dateFormat  HH:mm
+    section 启动
+    加载模型 + 数据集初始化   :a1, 00:00, 20m
+    section 训练循环
+    训练 step 1-1000       :a2, 00:20, 3h
+    训练 step 1000-5000     :a3, after a2, 12h
+    训练 step 5000-10000    :a4, after a3, 12h
+    section 保存
+    checkpoint + validation :a5, after a4, 30m
+```
+
+#### 推理一段 30 秒视频（1080p，A10）
+
+```mermaid
+gantt
+    title 推理 30s 1080p 视频 ~2-5 分钟
+    dateFormat  HH:mm
+    section 输入
+    下载 + 解码           :a1, 00:00, 30s
+    section 预处理
+    人脸检测 + 仿射对齐    :a2, 00:00, 1m
+    section 推理
+    16 帧 batch × N 个     :a3, 00:01, 1m
+    section 后处理
+    paste back + 颜色匹配  :a4, 00:02, 30s
+    section 输出
+    ffmpeg mux            :a5, 00:02, 30s
+```
+
+**时间差距**：
+- 训练：数小时到数天
+- 推理：几秒到几分钟
+
+### 16.8 训练-推理不对齐的常见坑
+
+#### 坑 1：mask 不一致
+
+| 场景 | 现象 | 原因 |
+|---|---|---|
+| 训 256，推理 512 | 推理出来脸变形 | mask 形状不匹配 |
+| 训 `mask.png`，推理 `mask2.png` | 边界接缝 | mask 形状不同 |
+| 训 standard dynamic mask，推理 aggressive | identity 偏移 | mask 范围不一致 |
+
+**避免**：训练和推理用**同一份** `mask_image_path`。
+
+#### 坑 2：audio_feat_length 不一致
+
+```yaml
+# train stage1.yaml
+audio_feat_length: [2, 2]
+
+# inference (api.py)
+audio_feat_length: [2, 2]  # 必须一致！
+```
+
+不一致会直接报错 shape mismatch。
+
+#### 坑 3：cross_attention_dim 不一致
+
+| 配置 | dim | whisper |
+|---|---|---|
+| 默认 | 384 | tiny |
+| 改 768 | 768 | small |
+
+训练和推理必须一致，否则 cross-attn 层 shape 对不上。
+
+#### 坑 4：use_motion_module 不一致
+
+```yaml
+# stage2.yaml
+use_motion_module: true  # 训了
+
+# inference config
+use_motion_module: false  # 推时漏掉 → 严重 badcase
+```
+
+#### 坑 5：pixel_space_supervise 推理时被忽略
+
+`pixel_space_supervise` 只影响训练循环（是否 decode 到 pixel 算损失），**不影响推理**。但如果推理时 `num_inference_steps` 调错，会让效果差很多。
+
+#### 坑 6：分辩率不匹配
+
+```python
+# 训 512
+unet_config_path = "configs/unet/stage2_512.yaml"  # resolution: 512
+
+# 推理 256（忘了改）
+config = OmegaConf.load("configs/unet/stage2.yaml")  # resolution: 256
+unet.load_state_dict(...)  # ← 加载 512 权重！
+# → shape 不匹配，crash
+```
+
+**避免**：训练产物和推理 config **强绑定**。建议在 config 文件名里带分辨率（已经是这样：`stage2_512.yaml`）。
+
+### 16.9 一图总览：哪个模块在哪个阶段跑
+
+```mermaid
+flowchart TB
+    subgraph T[训练]
+        T_LOAD[模型加载<br/>VAE / Whisper / UNet / SyncNet]
+        T_DATA[UNetDataset<br/>随机抽样]
+        T_LOSS[损失计算<br/>recon / sync / lpips / trepa]
+        T_TRAIN[反向传播<br/>DDP + GradScaler]
+        T_SAVE[checkpoint 保存]
+    end
+
+    subgraph I[推理]
+        I_LOAD[模型加载<br/>VAE / Whisper / UNet<br/>没有 SyncNet]
+        I_ALIGN[实时仿射对齐<br/>InsightFace]
+        I_PREFILTER[预过滤<br/>yaw/blur/identity/jump]
+        I_DIFF[DDIM 前向<br/>20-40 步]
+        I_POSTFILTER[后处理链<br/>paste back / color / detail / sharpen / EMA]
+        I_FINAL[restore_img 贴回<br/>+ ffmpeg mux]
+    end
+
+    T --> T_SAVE
+    T_SAVE -.UNet 权重.-> I_LOAD
+```
+
+### 16.10 一句话总结
+
+> **公有资产**（VAE、Whisper、UNet 架构、ImageProcessor、DDIM scheduler）必须**保持一致**。
+> **训练独有**：DDP、optimizer、GradScaler、4 大损失、StableSyncNet。
+> **推理独有**：实时仿射对齐、预过滤、动态嘴部 mask、paste back、颜色匹配、细节贴回、CodeFormer、ffmpeg mux。
+> **Checkpoint 兼容性**：必须 Stage 2+ 训完才能用，必须 mask / 分辨率 / audio_feat_length / cross_attention_dim 一致。
+
+---
+
 ## 附录 A：论文数学公式对照
 
 | 公式 | 含义 | 代码位置 |
