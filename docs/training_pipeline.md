@@ -1295,6 +1295,130 @@ score = trepa(videos, videos_groundtruth).item()
 
 但这只在离线评估时跑，**不进入推理流程**。
 
+#### 5.8.15 有了 SyncNet，为何还需要这些时序机制？
+
+> **直答**：**SyncNet 只管一件事（嘴音是否同步），其他时序机制管其他维度**。它们是**互补**的，不是冗余。
+
+##### 5.8.15.1 视频时序质量包含哪些维度
+
+| 维度 | 含义 | 例子 |
+|---|---|---|
+| 嘴音对齐 | 嘴的动作是否跟得上音频 | 嘴在说"你好"时嘴型对 |
+| 整视频时序 | 16 帧作为整体是否连贯 | 牙齿/胡须不闪烁 |
+| 像素级稳定 | 帧间像素是否平滑 | 边像素不抖 |
+| 嘴部区域动态 | inpaint 范围是否对 | 大嘴/大笑覆盖完整 |
+
+**SyncNet 只管第一个维度**，剩下三个需要其他机制：
+
+```mermaid
+flowchart TB
+    Q[视频时序质量] --> A1[嘴音对齐<br/>SyncNet ✅]
+    Q --> A2[整视频时序<br/>TREPA + Motion Module + Mixed Noise]
+    Q --> A3[像素级稳定<br/>EMA + mouth_temporal_stabilization]
+    Q --> A4[嘴部区域动态<br/>dynamic region mask]
+```
+
+##### 5.8.15.2 7 个时序机制对比
+
+| 机制 | 关注维度 | 训练/推理 | 解决什么 | 看不到什么 |
+|---|---|---|---|---|
+| **SyncNet** | 嘴音对齐（粗粒度） | 训练 loss | 嘴型对不上音 | 嘴部细节、面部其他区域 |
+| **TREPA** | 16 帧整视频时序（特征级） | 训练 loss | 牙齿/胡须帧间闪烁 | 具体的音视关系 |
+| **Motion Module** | UNet 内建时序结构 | 架构组件 | UNet 知道"这是连续 16 帧" | 时序好坏（需要 loss 监督） |
+| **Mixed Noise** | 训练时分布层面时序 | 训练 noise 策略 | 强制 UNet 学时序平滑 | 推理时如何平滑 |
+| **EMA smoothing** | 像素级帧间平滑 | 推理后处理 | 残存抖动 | 同步问题 |
+| **mouth_temporal_stabilization** | 嘴部 1-order EMA | 推理后处理 | 嘴部最敏感区域的稳定 | 整脸一致性 |
+| **dynamic region mask** | 嘴部动态椭圆 | 推理 mask | 大嘴/极端表情覆盖 | 时序本身 |
+
+##### 5.8.15.3 SyncNet 看不到的东西
+
+```mermaid
+flowchart LR
+    subgraph SN[SyncNet 视角]
+        SN1[16 帧嘴部<br/>下半张脸<br/>48 通道]
+        SN1 --> SN2[vision_embeds<br/>2048 维<br/>粗粒度]
+    end
+
+    subgraph MISS[SyncNet 看不到]
+        M1[牙齿细节闪烁]
+        M2[胡须抖动]
+        M3[皮肤纹理帧间不一致]
+        M4[UNet 不知道时序]
+        M5[像素级残存抖动]
+    end
+```
+
+**SyncNet 看不到的具体问题**：
+1. **牙齿闪烁**（论文 Fig.11 主推的 TREPA 卖点）— 嘴在动、音也对，但每帧牙齿形状/亮度微抖动
+2. **胡须抖动** — 男士胡须每帧不一样
+3. **皮肤纹理帧间不一致** — 痣、皱纹位置/亮度变
+4. **UNet 不知道时序** — 没有 Motion Module 时，UNet 把 16 帧当 16 张独立图
+5. **像素级残存抖动** — 训练时 loss 再小，推理输出仍有微抖
+
+##### 5.8.15.4 4 个层级的时序保障
+
+```mermaid
+flowchart TB
+    L1[第一层: 训练时 - 分布层面<br/>Mixed Noise] --> L2
+    L2[第二层: 训练时 - 架构层面<br/>Motion Module] --> L3
+    L3[第三层: 训练时 - 监督层面<br/>SyncNet + TREPA + LPIPS] --> L4
+    L4[第四层: 推理时 - 后处理<br/>EMA + mouth_temporal_stabilization] --> OUT[最终高质量视频]
+```
+
+**每一层都是必要的**：
+- 去掉 L1：UNet 不知道"这是 16 帧而不是 16 张图"
+- 去掉 L2：UNet 不知道"前后帧要连贯"
+- 去掉 L3：UNet 不知道"目标是什么"
+- 去掉 L4：推理时残存抖动没修
+
+##### 5.8.15.5 类比：学开车
+
+| 机制 | 类比 | 关注什么 |
+|---|---|---|
+| SyncNet | 教练："看前面！" | 音视同步 |
+| TREPA | 教练："动作要连贯！" | 整视频连贯 |
+| Motion Module | 车本身的转向系统 | 结构性时序能力 |
+| Mixed Noise | 路面坑少 | 训练分布的时序 |
+| EMA smoothing | 车身稳定系统 | 像素级平滑 |
+
+> **问：有了教练（SyncNet），为何还要车身稳定系统（EMA）？**
+> **答：教练管"对不对"，车身稳定系统管"平不平"，两件事。**
+
+##### 5.8.15.6 反过来：每个机制单独存在都不够
+
+| 组合 | 缺什么 | 实际表现 |
+|---|---|---|
+| SyncNet | ❌ Motion Module | UNet 把 16 帧当 16 张独立图 |
+| SyncNet | ❌ TREPA | 单帧好看，帧间牙齿/胡须闪烁 |
+| SyncNet | ❌ EMA smoothing | 推理时残存抖动 |
+| SyncNet | ❌ dynamic mask | 大嘴/极端表情覆盖不全 |
+
+**论文 Eq.5 印证**：
+
+```
+L_total = λ1·L_simple + λ2·L_sync + λ3·L_lpips + λ4·L_trepa
+```
+
+4 项 loss 各管一摊，**互不替代**。Stage 2 训练时 4 项**全部开启**才是完整方案。
+
+##### 5.8.15.7 时序相关代码引用
+
+| 机制 | 文件 | 行号 |
+|---|---|---|
+| SyncNet | `scripts/train_unet.py` | 392-411 |
+| TREPA | `scripts/train_unet.py` | 381-388 |
+| Motion Module | `latentsync/models/motion_module.py` | 全文件 |
+| Mixed Noise | `scripts/train_unet.py` | 319-332 |
+| EMA smoothing | `lipsync_pipeline.py` | `_smooth_face_sequence` |
+| mouth_temporal_stabilization | `lipsync_pipeline.py` | 推理后处理 |
+| dynamic region mask | `lipsync_pipeline.py` | 1663-1752 |
+
+##### 5.8.15.8 一句话总结
+
+> **SyncNet 只管"嘴对不对得上音"（粗粒度），其他机制分别管"16 帧整视频连贯不"、"UNet 内部有没有时序结构"、"训练分布有没有时序"、"推理输出有没有残存抖动"、"嘴部覆盖范围对不对"**。
+> **不是冗余，是 5 个不同维度的时序保障。任何一个去掉都会出现对应类型的 badcase。**
+> **论文 Eq.5 的 4 项 loss 各管一摊，互不替代——这就是为什么 Stage 2 要把 4 项全开。**
+
 ### 5.9 LPIPS & Pixel-Space Supervision：把嘴部"画清楚"
 
 > **一句话**：LPIPS 让 UNet 生成的嘴部**看起来像嘴**（像素级感知相似），pixel-space supervision 是 LPIPS / TREPA / Sync 三大损失能算的前提（因为它们都在像素空间算）。
