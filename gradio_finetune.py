@@ -124,6 +124,60 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "mask_image_path": "latentsync/utils/mask2.png",
         "description": "512 分辨率。55GB VRAM。",
     },
+    "Stage 2 LoRA (256, 12-15GB)": {
+        "config_file": "configs/unet/stage2.yaml",
+        "resume_ckpt": "checkpoints/latentsync_unet.pt",
+        "batch_size": 1,
+        "num_frames": 16,
+        "resolution": 256,
+        "learning_rate": 5e-5,
+        "use_motion_module": True,
+        "pixel_space_supervise": True,
+        "use_syncnet": True,
+        "sync_loss_weight": 0.05,
+        "perceptual_loss_weight": 0.1,
+        "recon_loss_weight": 1.0,
+        "trepa_loss_weight": 10.0,
+        "mixed_precision_training": True,
+        "enable_gradient_checkpointing": True,
+        "mask_image_path": "latentsync/utils/mask.png",
+        "description": "LoRA 微调：adapter 仅 ~10MB，可多任务切换。需 pip install peft。",
+        "lora": {
+            "enabled": True,
+            "rank": 16,
+            "alpha": 32,
+            "dropout": 0.05,
+            "target_modules": ["to_q", "to_k", "to_v", "to_out"],
+            "qlora": False,
+        },
+    },
+    "Stage 2 QLoRA (256, 8-10GB)": {
+        "config_file": "configs/unet/stage2.yaml",
+        "resume_ckpt": "checkpoints/latentsync_unet.pt",
+        "batch_size": 1,
+        "num_frames": 16,
+        "resolution": 256,
+        "learning_rate": 2e-4,
+        "use_motion_module": True,
+        "pixel_space_supervise": True,
+        "use_syncnet": True,
+        "sync_loss_weight": 0.05,
+        "perceptual_loss_weight": 0.1,
+        "recon_loss_weight": 1.0,
+        "trepa_loss_weight": 10.0,
+        "mixed_precision_training": True,
+        "enable_gradient_checkpointing": True,
+        "mask_image_path": "latentsync/utils/mask.png",
+        "description": "QLoRA：base UNet 4-bit 量化 + LoRA。需 peft + bitsandbytes。",
+        "lora": {
+            "enabled": True,
+            "rank": 16,
+            "alpha": 32,
+            "dropout": 0.05,
+            "target_modules": ["to_q", "to_k", "to_v", "to_out"],
+            "qlora": True,
+        },
+    },
     "SyncNet 训练": {
         "config_file": "configs/syncnet/syncnet_16_pixel_attn.yaml",
         "resume_ckpt": "",
@@ -977,7 +1031,668 @@ def build_ui() -> gr.Blocks:
                 outputs=[cmp_out_base, cmp_out_ft],
             )
 
+        # =========================================================
+        # Tab 4: Identity Protection Strategy
+        # =========================================================
+        with gr.Tab("🛡️ Identity 保护策略"):
+            gr.Markdown(
+                """
+LatentSync 用 **4 层防御** 保证只改嘴部、不改脸：
+
+| 层 | 机制 | 在哪控制 |
+|---|---|---|
+| L1 | `ref_pixel_values` 提供 identity | 训练时 `UNetDataset` + 推理时实时 ref |
+| L2 | UNet 训练学到"看着 ref 还原 identity" | 训练分布自动学习 |
+| L3 | `paste_surrounding_pixels_back` mask 截断 | 推理时 `dynamic_region_mask` |
+| L4 | `_restore_reference_detail` 高频细节贴回 | 推理时 `mouth_detail_strength` |
+
+下面三个区块分别调 L1 / L3 / L4 的关键参数。改完点 **生成推理 yaml** 即可在 `gradio_app.py` / `api.py` 里复用。
+                """
+            )
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### L1: ref 窗口策略（影响训练数据采样 + 推理 ref 选择）")
+                    ref_strategy = gr.Radio(
+                        choices=["random", "adjacent", "fixed_first_frame"],
+                        value="random",
+                        label="ref 窗口选择策略",
+                        info=(
+                            "random: 随机抽远端帧（论文 baseline）\n"
+                            "adjacent: 抽相邻帧（identity 更稳但极端表情少）\n"
+                            "fixed_first_frame: 固定用第 1 帧（一致性最强但多样性差）"
+                        ),
+                    )
+                    ref_window_distance = gr.Slider(
+                        minimum=0,
+                        maximum=64,
+                        value=16,
+                        step=1,
+                        label="ref 与 gt 的最小距离（帧）",
+                        info="论文 baseline = 16 帧（约 0.64 秒）。太小容易把同一段当 ref。",
+                    )
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### L3: dynamic mask 大小（控制 paste-back 范围）")
+                    dynamic_mask_mode = gr.Radio(
+                        choices=["conservative", "standard", "aggressive"],
+                        value="standard",
+                        label="dynamic mask 大小策略",
+                        info=(
+                            "conservative: 椭圆更小（默认 pad_width×0.8），更保守\n"
+                            "standard: 论文默认（pad_width×1.5）\n"
+                            "aggressive: 椭圆更大（pad_width×2.0），覆盖大笑嘴"
+                        ),
+                    )
+                    paste_back_blur_sigma = gr.Slider(
+                        minimum=0.0,
+                        maximum=15.0,
+                        value=7.0,
+                        step=0.5,
+                        label="paste back 边缘模糊 sigma (像素)",
+                        info="越大 paste-back 边界越平滑，但嘴部边缘会糊",
+                    )
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### L4: detail / color post-processing")
+                    detail_strength = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=0.65,
+                        step=0.05,
+                        label="mouth_detail_strength (L4 detail restore)",
+                        info="越大越贴原图皮肤纹理（痣、皱纹）。>0.85 会盖掉生成的嘴型",
+                    )
+                    color_match_strength = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=0.60,
+                        step=0.05,
+                        label="color_match_strength",
+                        info="越大颜色越平滑（避免 mask 边界色差）。>0.9 可能过度",
+                    )
+
+            with gr.Row():
+                identity_generate_btn = gr.Button("📝 生成推理 kwargs / yaml", variant="primary")
+                identity_clear_btn = gr.Button("🧹 重置为默认值")
+
+            identity_output = gr.Code(
+                label="生成的推理 kwargs (Python) 和 yaml (Config)",
+                language="python",
+                lines=20,
+            )
+
+            identity_generate_btn.click(
+                fn=generate_identity_kit,
+                inputs=[
+                    ref_strategy, ref_window_distance,
+                    dynamic_mask_mode, paste_back_blur_sigma,
+                    detail_strength, color_match_strength,
+                ],
+                outputs=identity_output,
+            )
+
+            identity_clear_btn.click(
+                fn=reset_identity_defaults,
+                outputs=[
+                    ref_strategy, ref_window_distance,
+                    dynamic_mask_mode, paste_back_blur_sigma,
+                    detail_strength, color_match_strength,
+                ],
+            )
+
+            gr.Markdown(
+                """
+### 使用方法
+
+生成的 `kwargs` 可以直接传给 `LipsyncPipeline.__call__(..., **kwargs)`：
+
+```python
+from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+pipe = LipsyncPipeline(...)
+
+pipe(
+    video_path=...,
+    audio_path=...,
+    video_out_path=...,
+    inference_ckpt_path=...,
+    **identity_kwargs,  # ← 把上方生成的字典展开
+)
+```
+                """
+            )
+
+        # =========================================================
+        # Tab 5: Dataset Quality Evaluation
+        # =========================================================
+        with gr.Tab("📊 数据集质量评估"):
+            gr.Markdown(
+                """
+训练前先评估数据，避免训完才发现质量问题。
+
+会跑：
+1. **HyperIQA 分数**（每视频取 3 帧，看视觉质量分布）
+2. **SyncNet confidence**（每视频算 AV 同步质量）
+3. **文件完整性**（损坏 / 缺失 / 时长不足）
+4. **统计摘要** + **潜在问题列表**
+                """
+            )
+
+            with gr.Row():
+                ds_dir_input = gr.Textbox(
+                    label="high_visual_quality 目录",
+                    placeholder="/data/voxceleb2/high_visual_quality",
+                    scale=3,
+                )
+                ds_max_videos = gr.Slider(
+                    minimum=10,
+                    maximum=500,
+                    value=100,
+                    step=10,
+                    label="最多评估视频数（采样）",
+                    scale=1,
+                )
+                ds_eval_btn = gr.Button("🔍 开始评估", variant="primary", scale=1)
+
+            with gr.Row():
+                with gr.Column():
+                    ds_stats = gr.Textbox(label="统计摘要", lines=15)
+                with gr.Column():
+                    ds_issues = gr.Textbox(label="潜在问题", lines=15)
+
+            ds_chart = gr.Plot(label="HyperIQA / Sync_conf 分布")
+
+            ds_eval_btn.click(
+                fn=evaluate_dataset_quality,
+                inputs=[ds_dir_input, ds_max_videos],
+                outputs=[ds_stats, ds_issues, ds_chart],
+            )
+
+        # =========================================================
+        # Tab 6: Badcase Checklist
+        # =========================================================
+        with gr.Tab("⚠️ Badcase 检查清单"):
+            gr.Markdown(
+                """
+对生成的视频跑全套质量检查（对应 §13）：
+
+| 检查项 | 目标 | 含义 |
+|---|---|---|
+| 嘴糊比例 | < 30% | Laplacian 方差低于阈值的帧占比 |
+| 闪烁评分 | < 8 | 嘴部帧间平均像素差 |
+| 唇音同步 | > 7 | SyncNet confidence |
+| 身份保持 | > 0.8 | Face embedding 余弦相似度 |
+                """
+            )
+
+            with gr.Row():
+                bc_video = gr.Video(label="生成结果视频", scale=2)
+                bc_reference = gr.Video(label="原始参考视频（可选，用于 identity sim）", scale=2)
+
+            bc_check_btn = gr.Button("🔍 跑 Badcase 检测", variant="primary")
+
+            with gr.Row():
+                with gr.Column():
+                    bc_blurry = gr.Number(label="嘴糊比例 (目标 < 30%)")
+                    bc_flicker = gr.Number(label="闪烁评分 (目标 < 8)")
+                    bc_sync = gr.Number(label="唇音同步 (目标 > 7)")
+                    bc_identity = gr.Number(label="身份保持 (目标 > 0.8)")
+                with gr.Column():
+                    bc_report = gr.Textbox(label="诊断报告", lines=20)
+
+            bc_check_btn.click(
+                fn=run_badcase_checklist,
+                inputs=[bc_video, bc_reference],
+                outputs=[bc_blurry, bc_flicker, bc_sync, bc_identity, bc_report],
+            )
+
     return demo
+
+
+# ---------------------------------------------------------------------------
+# Tab 4 helpers: Identity Protection Strategy
+# ---------------------------------------------------------------------------
+
+def _ref_strategy_to_dataset_kwargs(strategy: str, min_distance: int) -> Dict[str, Any]:
+    """Map UI strategy choice to UNetDataset-side kwargs.
+
+    Currently UNetDataset only supports 'random' (the baseline). For
+    'adjacent' and 'fixed_first_frame' we emit a code-side patch that the
+    user can drop into latentsync/data/unet_dataset.py if they want.
+    """
+    if strategy == "random":
+        return {
+            "_strategy": "random",
+            "ref_min_distance": min_distance,
+            "_note": "Default UNetDataset.get_frames already picks random ref "
+                     "outside the gt window. No code change needed.",
+        }
+    if strategy == "adjacent":
+        return {
+            "_strategy": "adjacent",
+            "ref_min_distance": min_distance,
+            "_patch": (
+                "# In latentsync/data/unet_dataset.py:75-80, replace:\n"
+                "while True:\n"
+                "    ref_start_idx = random.randint(0, total_num_frames - self.num_frames)\n"
+                "    if ref_start_idx > start_idx - self.num_frames and ref_start_idx < start_idx + self.num_frames:\n"
+                "        continue\n"
+                "# With:\n"
+                "ref_start_idx = max(0, start_idx + self.num_frames + ref_min_distance)\n"
+                "if ref_start_idx + self.num_frames > total_num_frames:\n"
+                "    ref_start_idx = start_idx - self.num_frames - ref_min_distance\n"
+            ),
+        }
+    # fixed_first_frame
+    return {
+        "_strategy": "fixed_first_frame",
+        "ref_min_distance": 0,
+        "_patch": (
+            "# In latentsync/data/unet_dataset.py, replace ref sampling with:\n"
+            "ref_start_idx = 0  # always use first frame as ref\n"
+        ),
+    }
+
+
+def _dynamic_mask_mode_to_params(mode: str) -> Dict[str, float]:
+    """Map UI mode to lipsync_pipeline.generate_dynamic_mouth_mask kwargs."""
+    presets = {
+        "conservative": {"pad_width_ratio": 1.2, "pad_height_top_ratio": 1.1,
+                         "pad_height_bottom_ratio": 1.8, "feather_sigma_px": 5.0},
+        "standard":     {"pad_width_ratio": 1.5, "pad_height_top_ratio": 1.3,
+                         "pad_height_bottom_ratio": 2.2, "feather_sigma_px": 7.0},
+        "aggressive":   {"pad_width_ratio": 2.0, "pad_height_top_ratio": 1.6,
+                         "pad_height_bottom_ratio": 2.6, "feather_sigma_px": 10.0},
+    }
+    return presets[mode]
+
+
+def generate_identity_kit(
+    ref_strategy: str,
+    ref_window_distance: int,
+    dynamic_mask_mode: str,
+    paste_back_blur_sigma: float,
+    detail_strength: float,
+    color_match_strength: float,
+) -> str:
+    """Build the kwargs dict the inference pipeline should receive, plus a
+    yaml-style sidecar and human-readable warnings."""
+    dataset_kwargs = _ref_strategy_to_dataset_kwargs(ref_strategy, ref_window_distance)
+    mask_params = _dynamic_mask_mode_to_params(dynamic_mask_mode)
+    mask_params["feather_sigma_px"] = float(paste_back_blur_sigma)
+
+    inference_kwargs = {
+        # L3: dynamic mask geometry
+        "dynamic_mask_pad_width_ratio": mask_params["pad_width_ratio"],
+        "dynamic_mask_pad_height_top_ratio": mask_params["pad_height_top_ratio"],
+        "dynamic_mask_pad_height_bottom_ratio": mask_params["pad_height_bottom_ratio"],
+        # L3: paste-back blur
+        "paste_back_feather_sigma_px": mask_params["feather_sigma_px"],
+        # L4: detail / color post-processing
+        "mouth_detail_strength": float(detail_strength),
+        "color_match_strength": float(color_match_strength),
+    }
+
+    lines: List[str] = []
+    lines.append("# === LatentSync Identity-Protection Kit ===")
+    lines.append("# Generated by gradio_finetune.py Tab 4")
+    lines.append("")
+    lines.append("# ----- 1) Python kwargs to pass to LipsyncPipeline.__call__ -----")
+    lines.append("inference_kwargs = {")
+    for k, v in inference_kwargs.items():
+        lines.append(f"    {k!r}: {v!r},")
+    lines.append("}")
+    lines.append("# Usage:")
+    lines.append("# pipe(video_path=..., audio_path=..., video_out_path=..., **inference_kwargs)")
+    lines.append("")
+    lines.append("# ----- 2) Dataset-side (UNetDataset) ref strategy -----")
+    lines.append("# Strategy: " + dataset_kwargs["_strategy"])
+    lines.append("# ref_min_distance: " + str(dataset_kwargs["ref_min_distance"]))
+    if "_patch" in dataset_kwargs:
+        lines.append("# Patch (drop into latentsync/data/unet_dataset.py:75-80):")
+        for pl in dataset_kwargs["_patch"].splitlines():
+            lines.append("#   " + pl)
+    else:
+        lines.append("# " + dataset_kwargs["_note"])
+    lines.append("")
+    lines.append("# ----- 3) Sanity warnings -----")
+    if detail_strength > 0.85:
+        lines.append("# ⚠️ detail_strength > 0.85 — generated mouth shape may be washed out.")
+    if color_match_strength > 0.9:
+        lines.append("# ⚠️ color_match_strength > 0.9 — over-correction may erase emotion.")
+    if dynamic_mask_mode == "aggressive":
+        lines.append("# ⚠️ aggressive mask + ref_min_distance small — identity drift possible.")
+    if ref_strategy == "fixed_first_frame":
+        lines.append("# ⚠️ fixed_first_frame reduces temporal diversity; expect lower sync_conf.")
+    if paste_back_blur_sigma < 3.0:
+        lines.append("# ⚠️ paste_back_blur < 3 px — visible seam at mask boundary.")
+    return "\n".join(lines)
+
+
+def reset_identity_defaults() -> Tuple[str, int, str, float, float, float]:
+    return "random", 16, "standard", 7.0, 0.65, 0.60
+
+
+# ---------------------------------------------------------------------------
+# Tab 5 helpers: Dataset Quality Evaluation
+# ---------------------------------------------------------------------------
+
+def _safe_hyperiqa_score(model_hyper, model_target, frames_tensor, device, transforms):
+    """Run HyperIQA on 3 frames (first/middle/last) and return mean score 0-100."""
+    import torchvision  # local import keeps gradio launch fast
+
+    sampled = frames_tensor[::max(1, len(frames_tensor) // 3)][:3]
+    sampled = transforms(sampled).to(device)
+    paras = model_hyper(sampled)
+    preds = [model_target(paras).mean().item() for _ in [0]]
+    return float(preds[0]) if preds else 0.0
+
+
+def evaluate_dataset_quality(
+    data_dir: str, max_videos: int
+) -> Tuple[str, str, Any]:
+    """Walk the directory, sample up to max_videos mp4s, compute HyperIQA +
+    SyncNet confidence distributions, return summary text + issues + plot."""
+    import random as _random
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not data_dir or not Path(data_dir).exists():
+        return (
+            f"❌ 目录不存在: {data_dir}",
+            "请检查路径。预期目录结构: data_dir/<speaker>/<video>.mp4 或 data_dir/*.mp4",
+            None,
+        )
+
+    candidates = sorted(Path(data_dir).rglob("*.mp4"))[: int(max_videos)]
+    if not candidates:
+        return (f"❌ {data_dir} 下没有 .mp4 文件", "", None)
+
+    hyperiqa_scores: List[float] = []
+    sync_confs: List[float] = []
+    broken: List[str] = []
+    too_short: List[str] = []
+
+    try:
+        from eval.hyper_iqa import HyperNet, TargetNet
+        import torchvision
+        from torchvision import transforms
+
+        device = "cuda" if torch_available() else "cpu"
+        model_hyper = HyperNet(16, 112, 224, 112, 56, 28, 14, 7).to(device)
+        ckpt = REPO_ROOT / "checkpoints/auxiliary/koniq_pretrained.pkl"
+        if ckpt.exists():
+            model_hyper.load_state_dict(torch_load(str(ckpt), map_location=device))
+            model_hyper.eval()
+            hyperiqa_available = True
+        else:
+            hyperiqa_available = False
+        tf = transforms.Compose([
+            transforms.CenterCrop(224),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ])
+    except Exception as e:
+        hyperiqa_available = False
+        tf = None
+        print(f"[evaluate_dataset_quality] hyperiqa unavailable: {e}")
+
+    syncnet_available = False
+    try:
+        from eval.syncnet import SyncNetEval
+        from eval.syncnet_detect import SyncNetDetector
+        from eval.eval_sync_conf import syncnet_eval as _sync_eval
+
+        device = "cuda" if torch_available() else "cpu"
+        if (REPO_ROOT / "checkpoints/auxiliary/syncnet_v2.model").exists():
+            _se = SyncNetEval(device=device)
+            _se.loadParameters("checkpoints/auxiliary/syncnet_v2.model")
+            _sd = SyncNetDetector(device=device, detect_results_dir="detect_results")
+            syncnet_available = True
+    except Exception as e:
+        print(f"[evaluate_dataset_quality] syncnet unavailable: {e}")
+
+    for p in candidates:
+        try:
+            from decord import VideoReader
+            vr = VideoReader(str(p))
+            if len(vr) < 16:
+                too_short.append(str(p))
+                continue
+            # sample first/middle/last frame
+            idxs = [0, len(vr) // 2, len(vr) - 1]
+            frames = vr.get_batch(idxs).asnumpy()
+            frames_t = torch_from_numpy(_rearrange(frames, "f h w c -> f c h w")).float() / 255.0
+
+            if hyperiqa_available and tf is not None:
+                paras = model_hyper(tf(frames_t.clone()).to(device))
+                model_target = TargetNet(paras).to(device)
+                for p_ in model_target.parameters():
+                    p_.requires_grad = False
+                score = model_target(paras["target_in_vec"]).mean().item()
+                hyperiqa_scores.append(score)
+
+            if syncnet_available:
+                # write frames as a tiny video? Easier: only eval if video has audio
+                try:
+                    _, conf = _sync_eval(_se, _sd, str(p), "temp")
+                    if conf is not None:
+                        sync_confs.append(conf)
+                except Exception:
+                    pass
+        except Exception as e:
+            broken.append(f"{p}: {e}")
+
+    stats_lines = [
+        f"📁 目录: {data_dir}",
+        f"🎬 扫描视频数: {len(candidates)}",
+        f"✅ 完整视频: {len(candidates) - len(broken) - len(too_short)}",
+        f"❌ 损坏: {len(broken)}",
+        f"⚠️ 太短 (<16 帧): {len(too_short)}",
+    ]
+    if hyperiqa_scores:
+        import statistics
+        stats_lines += [
+            "",
+            "📊 HyperIQA 分数（视觉质量，0-100）:",
+            f"  mean: {statistics.mean(hyperiqa_scores):.2f}",
+            f"  median: {statistics.median(hyperiqa_scores):.2f}",
+            f"  min: {min(hyperiqa_scores):.2f}",
+            f"  max: {max(hyperiqa_scores):.2f}",
+            f"  ≥40 (preprocess 阈值): {sum(1 for s in hyperiqa_scores if s >= 40)} / {len(hyperiqa_scores)}",
+        ]
+    else:
+        stats_lines.append("\n📊 HyperIQA 不可用（检查 checkpoints/auxiliary/koniq_pretrained.pkl）")
+    if sync_confs:
+        import statistics
+        stats_lines += [
+            "",
+            "🎵 SyncNet confidence（音视同步）:",
+            f"  mean: {statistics.mean(sync_confs):.2f}",
+            f"  median: {statistics.median(sync_confs):.2f}",
+            f"  min: {min(sync_confs):.2f}",
+            f"  ≥3 (preprocess 阈值): {sum(1 for s in sync_confs if s >= 3)} / {len(sync_confs)}",
+        ]
+    else:
+        stats_lines.append("\n🎵 SyncNet 不可用（检查 checkpoints/auxiliary/syncnet_v2.model）")
+
+    issues: List[str] = []
+    if broken:
+        issues.append(f"❌ {len(broken)} 个损坏视频，建议先跑 remove_broken_videos")
+        for b in broken[:5]:
+            issues.append(f"   - {b}")
+    if too_short:
+        issues.append(f"⚠️ {len(too_short)} 个视频太短（<16 帧），训练时会被跳")
+    if hyperiqa_scores and statistics.mean(hyperiqa_scores) < 40:
+        issues.append("❌ 平均 HyperIQA < 40：数据质量整体偏低，建议重新跑 filter_visual_quality")
+    if sync_confs and statistics.mean(sync_confs) < 3:
+        issues.append("❌ 平均 SyncNet conf < 3：音视不同步，建议重新跑 sync_av")
+    if not issues:
+        issues.append("✅ 数据集看起来健康")
+
+    # plot
+    fig = None
+    if hyperiqa_scores or sync_confs:
+        fig, ax1 = plt.subplots(figsize=(7, 4))
+        if hyperiqa_scores:
+            ax1.hist(hyperiqa_scores, bins=20, alpha=0.6, label="HyperIQA", color="blue")
+            ax1.axvline(40, color="blue", linestyle="--", label="HyperIQA ≥ 40")
+            ax1.set_xlabel("HyperIQA score (0-100)")
+        if sync_confs:
+            ax2 = ax1.twinx()
+            ax2.hist(sync_confs, bins=20, alpha=0.6, label="SyncNet conf", color="green")
+            ax2.axvline(3, color="green", linestyle="--", label="SyncNet ≥ 3")
+            ax2.set_xlabel("SyncNet confidence")
+        fig.tight_layout()
+
+    return ("\n".join(stats_lines), "\n".join(issues), fig)
+
+
+def torch_available() -> bool:
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def torch_load(path: str, map_location: str = "cpu"):
+    import torch
+    return torch.load(path, map_location=map_location, weights_only=True)
+
+
+def torch_from_numpy(arr):
+    import torch
+    return torch.from_numpy(arr)
+
+
+def _rearrange(tensor, pattern):
+    from einops import rearrange
+    return rearrange(tensor, pattern)
+
+
+# ---------------------------------------------------------------------------
+# Tab 6 helpers: Badcase Checklist
+# ---------------------------------------------------------------------------
+
+def run_badcase_checklist(
+    video_path: str, reference_video_path: Optional[str]
+) -> Tuple[float, float, float, float, str]:
+    """Run all 4 badcase checks on a single generated video.
+
+    Returns (blurry_ratio, flicker_score, sync_conf, identity_sim, report).
+    """
+    if not video_path:
+        return 0.0, 0.0, 0.0, 0.0, "❌ 请先上传视频"
+
+    try:
+        from decord import VideoReader
+        import numpy as np
+        import cv2
+        vr = VideoReader(video_path)
+        frames = [f.asnumpy() for f in vr]
+        if len(frames) < 2:
+            return 0.0, 0.0, 0.0, 0.0, "❌ 视频帧数 < 2"
+
+        # ---- 1. Blurry mouth ratio ----
+        # crude: convert to grayscale, Laplacian variance per frame
+        grays = [cv2.cvtColor(f, cv2.COLOR_RGB2GRAY) for f in frames]
+        laps = [cv2.Laplacian(g, cv2.CV_64F).var() for g in grays]
+        blurry_count = sum(1 for v in laps if v < 50)
+        blurry_ratio = blurry_count / len(laps)
+
+        # ---- 2. Flicker score ----
+        # mean abs difference between consecutive frames
+        diffs = []
+        for i in range(1, len(frames)):
+            d = np.abs(frames[i].astype(float) - frames[i - 1].astype(float)).mean()
+            diffs.append(d)
+        flicker_score = float(np.mean(diffs))
+
+        # ---- 3. SyncNet confidence ----
+        sync_conf = 0.0
+        try:
+            from eval.syncnet import SyncNetEval
+            from eval.syncnet_detect import SyncNetDetector
+            from eval.eval_sync_conf import syncnet_eval as _sync_eval
+
+            device = "cuda" if torch_available() else "cpu"
+            if (REPO_ROOT / "checkpoints/auxiliary/syncnet_v2.model").exists():
+                _se = SyncNetEval(device=device)
+                _se.loadParameters("checkpoints/auxiliary/syncnet_v2.model")
+                _sd = SyncNetDetector(device=device, detect_results_dir="detect_results")
+                _, sync_conf = _sync_eval(_se, _sd, video_path, "temp")
+        except Exception as e:
+            sync_conf_note = f"SyncNet 评估失败: {e}"
+        else:
+            sync_conf_note = None
+
+        # ---- 4. Identity similarity (only if reference provided) ----
+        identity_sim = 0.0
+        if reference_video_path:
+            try:
+                from latentsync.utils.face_detector import FaceDetector
+                det = FaceDetector()
+                _, _, real_emb = det.detect(VideoReader(reference_video_path)[0].asnumpy())
+                _, _, gen_emb = det.detect(frames[0])
+                if real_emb is not None and gen_emb is not None:
+                    cos = float(np.dot(real_emb, gen_emb) / (
+                        np.linalg.norm(real_emb) * np.linalg.norm(gen_emb)
+                    ))
+                    identity_sim = cos
+            except Exception as e:
+                identity_sim_note = f"identity 评估失败: {e}"
+        else:
+            identity_sim_note = "未提供参考视频，跳过 identity sim"
+
+        # ---- Build report ----
+        lines: List[str] = []
+        lines.append(f"📊 视频: {video_path}")
+        lines.append(f"📏 总帧数: {len(frames)}")
+        lines.append(f"🔍 Laplacian sharpness 范围: {min(laps):.1f} ~ {max(laps):.1f}")
+        lines.append("")
+        if blurry_ratio < 0.30:
+            lines.append(f"✅ 嘴糊比例 {blurry_ratio:.1%} < 30% (目标)")
+        else:
+            lines.append(f"⚠️ 嘴糊比例 {blurry_ratio:.1%} ≥ 30%")
+            lines.append("   建议: 升 512 分辨率 / 加 LPIPS weight / 开 CodeFormer")
+        lines.append("")
+        if flicker_score < 8:
+            lines.append(f"✅ 闪烁评分 {flicker_score:.2f} < 8 (目标)")
+        else:
+            lines.append(f"⚠️ 闪烁评分 {flicker_score:.2f} ≥ 8")
+            lines.append("   建议: 恢复 TREPA=10 / Motion Module 训够 / 开时序稳定")
+        lines.append("")
+        if sync_conf > 7:
+            lines.append(f"✅ 唇音同步 {sync_conf:.2f} > 7 (目标)")
+        elif sync_conf > 4:
+            lines.append(f"⚠️ 唇音同步 {sync_conf:.2f} (4-7 中等)")
+            lines.append("   建议: 重训 SyncNet (batch≥1024) / 加大 sync_loss_weight")
+        else:
+            lines.append(f"❌ 唇音同步 {sync_conf:.2f} < 4 (差)")
+            lines.append("   建议: 大概率 SyncNet 没训稳，回去查 5 因素")
+        lines.append("")
+        if reference_video_path:
+            if identity_sim > 0.8:
+                lines.append(f"✅ 身份保持 {identity_sim:.3f} > 0.8 (目标)")
+            elif identity_sim > 0.6:
+                lines.append(f"⚠️ 身份保持 {identity_sim:.3f} (0.6-0.8 中等)")
+                lines.append("   建议: 检查 UNetDataset ref 窗口选择 / 调 identity_similarity 阈值")
+            else:
+                lines.append(f"❌ 身份保持 {identity_sim:.3f} < 0.6 (差)")
+                lines.append("   建议: identity 严重丢失，检查 paste_surrounding_pixels_back 是否生效")
+        else:
+            lines.append("ℹ️ 未提供参考视频，跳过 identity sim 检查")
+        if sync_conf_note:
+            lines.append(f"\n⚠️ {sync_conf_note}")
+        if 'identity_sim_note' in locals() and identity_sim_note:
+            lines.append(f"⚠️ {identity_sim_note}")
+
+        return blurry_ratio, flicker_score, float(sync_conf), identity_sim, "\n".join(lines)
+    except Exception as e:
+        return 0.0, 0.0, 0.0, 0.0, f"❌ 检测失败: {e}"
 
 
 def main() -> None:
