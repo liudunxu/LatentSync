@@ -661,6 +661,29 @@ def stop_training() -> str:
     return f"⏹ 已停止 (pid={pid})"
 
 
+def refresh_training_log() -> Tuple[str, str]:
+    """Return (latest log tail, process status) for the running/last training."""
+    if not _TRAINER.log_path or not _TRAINER.log_path.exists():
+        status = "ℹ️ 暂无训练日志"
+        if _TRAINER.is_running():
+            status = f"🟡 训练已启动但日志尚未写入 (pid={_TRAINER.proc.pid})"
+        return "(log file not found yet)", status
+
+    log_text = tail_file(_TRAINER.log_path, n_lines=80)
+
+    if _TRAINER.is_running():
+        status = f"🟢 训练中 (pid={_TRAINER.proc.pid}, started={_TRAINER.started_at})"
+    else:
+        exit_code = _TRAINER.proc.poll() if _TRAINER.proc else "?"
+        if exit_code == 0:
+            status = f"✅ 训练已正常结束 (exit_code=0)"
+        elif exit_code is None:
+            status = "ℹ️ 无正在运行的训练任务"
+        else:
+            status = f"🔴 训练异常退出 (exit_code={exit_code})，请看下方日志"
+    return log_text, status
+
+
 def ping_backend() -> str:
     """Simple connectivity check."""
     logger.info("[ping_backend] received ping")
@@ -1383,6 +1406,25 @@ def build_ui() -> gr.Blocks:
                     nproc_per_node, master_port, extra_env,
                 ],
                 outputs=debug_status,
+            )
+
+            with gr.Row():
+                training_log_box = gr.Textbox(
+                    label="训练日志 (实时，尾部 80 行)",
+                    lines=20,
+                    interactive=False,
+                    value="(训练日志会在这里显示)",
+                )
+
+            refresh_log_btn = gr.Button("🔄 手动刷新训练日志", variant="secondary")
+            refresh_log_btn.click(
+                fn=refresh_training_log,
+                outputs=[training_log_box, launch_status],
+            )
+            log_timer = gr.Timer(value=3)
+            log_timer.tick(
+                fn=refresh_training_log,
+                outputs=[training_log_box, launch_status],
             )
 
             # preset → fill defaults
