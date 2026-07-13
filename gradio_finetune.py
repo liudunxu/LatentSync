@@ -418,6 +418,7 @@ def build_config_from_form(
             "enable_gradient_checkpointing": bool(enable_gradient_checkpointing),
             "max_train_steps": int(max_train_steps),
             "max_train_epochs": -1,
+            "trainable_modules": ["motion_modules.", "attentions."] if use_motion_module else [],
         },
         "optimizer": {
             "lr": float(learning_rate),
