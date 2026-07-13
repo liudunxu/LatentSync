@@ -3444,14 +3444,14 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    subgraph A[从零训练<br/>Pre-training]
-        A1[SD1.5 UNet<br/>stable-diffusion-v1-5] --> A2[训 Stage 1 + Stage 2<br/>~1-2 周 + ~$1500-3000]
+    subgraph A[从零训练 - Pre-training]
+        A1[SD1.5 UNet<br/>stable-diffusion-v1-5] --> A2[训 Stage 1 + Stage 2<br/>~1-2 周 + 1500-3000 USD]
     end
-    
-    subgraph B[微调 Fine-tuning<br/>最常见]
-        B1[官方 latentsync_unet.pt] --> B2[在你的数据上继续训<br/>~2-24 小时 + ~$10-150]
+
+    subgraph B[微调 Fine-tuning - 最常见]
+        B1[官方 latentsync_unet.pt] --> B2[在你的数据上继续训<br/>~2-24 小时 + 10-150 USD]
     end
-    
+
     subgraph C[继续训练]
         C1[你自己的 ckpt] --> C2[继续训<br/>和 B 类似]
     end
@@ -3557,16 +3557,16 @@ flowchart TD
     START[你有 GPU 吗?] -->|云端 GPU| Q1
     START -->|消费级 GPU| Q2
     START -->|只有 CPU| Q3
-    
+
     Q1{预算?}
-    Q1 -->|< $50| A1[小数据集微调<br/>Stage 2 Efficient<br/>$10-30]
-    Q1 -->|$50-300| A2[中等数据集微调<br/>Stage 2 (256)<br/>$30-150]
-    Q1 -->|$300+| A3[大微调 / 512 / 重新训<br/>$300-3000]
-    
+    Q1 -->|小于 50| A1[小数据集微调<br/>Stage 2 Efficient<br/>10-30]
+    Q1 -->|50-300| A2[中等数据集微调<br/>Stage 2 (256)<br/>30-150]
+    Q1 -->|300+| A3[大微调 / 512 / 重新训<br/>300-3000]
+
     Q2{GPU 显存?}
     Q2 -->|24 GB +| B1[Stage 2 Efficient (256)<br/>几小时 - 几天]
     Q2 -->|12-24 GB| B2[Stage 2 Efficient (256)<br/>几天 - 1 周]
-    Q2 -->|< 12 GB| B3[需补 GPU / 用云端]
+    Q2 -->|小于 12 GB| B3[需补 GPU / 用云端]
     
     Q3[用云端 GPU<br/>价格见 Q1 分支]
 ```
@@ -4389,6 +4389,188 @@ A：不会。LPIPS 衡量"和 GT 像不像"（越低越好），HyperIQA 衡量"
 > **koniq_pretrained.pkl = 预处理过滤低质量视频 + 离线评估整体质量**。
 > **两者都不在推理时加载**——只是把"质量信号"通过训练烧进 UNet 权重里。
 > 训练想优化嘴部质量 → 调 `perceptual_loss_weight`；想过滤差数据 → 调 filter_visual_quality 的 threshold=40。
+
+---
+
+## 20. Badcase 驱动的微调策略选择
+
+> **核心问题**：哪个 badcase 最痛？就选对应的微调方式。
+> **原则**：**没有"一招治百病"**。每种 badcase 需要不同策略，Full fine-tune vs LoRA vs QLoRA 也各有适用场景。
+
+### 20.1 决策总图
+
+```mermaid
+flowchart TD
+    Q[最痛的 badcase 是?] --> M1{嘴糊?}
+    M1 -->|是| F1[升 512 + LPIPS 加大<br/>Full fine-tune]
+    M1 -->|否| M2{嘴音不同步?}
+    M2 -->|是| F2[重训 SyncNet batch=1024<br/>Full Stage 2]
+    M2 -->|否| M3{帧间闪烁?}
+    M3 -->|是| F3[TREPA=10<br/>Full Stage 2 不 LoRA]
+    M3 -->|否| M4{侧脸/大嘴?}
+    M4 -->|是| F4[主要靠数据<br/>+ 推理参数调]
+    M4 -->|否| M5{身份丢失?}
+    M5 -->|是| F5[多身份数据集<br/>Full Stage 2]
+    M5 -->|否| M6[看 13 评估指标<br/>定位具体问题]
+```
+
+### 20.2 7 种 Badcase 完整策略表
+
+| # | Badcase | 根因 | 推荐微调方式 | 关键设置 | 推理侧补充 |
+|---|---|---|---|---|---|
+| 1 | **嘴糊** | 256 分辨率不够 / LPIPS 权小 | **Full Stage 2 (512)** | `resolution=512`, `perceptual_loss_weight=0.3+`, `mask2.png` | 升 512 后 sync 可能微降 |
+| 2 | **侧脸 / 大角度** | landmark 检测 + mask 形状 | **数据为主** + Full Stage 2 | 加侧脸/转头样本到数据集 | Tab 4 调 `dynamic_mask_mode=aggressive` |
+| 3 | **嘴音不同步** | SyncNet 没训稳 / sync_loss 太小 | **重训 SyncNet** + Full Stage 2 | SyncNet `batch_size=1024` | 不要用 LoRA 训 UNet（attn2 会丢能力） |
+| 4 | **帧间闪烁** | TREPA 关 / Motion Module 没训够 | **Full Stage 2** (别用 LoRA) | `trepa_loss_weight=10`, `use_motion_module=true` | LoRA 训时序有退化风险 |
+| 5 | **身份丢失** | ref 窗口差 / identity_similarity 低 | **数据 + Full Stage 2** | 多身份数据集 | Tab 4 调 `ref_strategy=adjacent` |
+| 6 | **Mask 边界接缝** | paste back blur 不够 | 不用微调 | — | Tab 4 调 `paste_back_blur_sigma=10+` |
+| 7 | **大嘴 / 极端表情** | dynamic mask 被 clamp 到 fixed mask | **数据为主**（加大笑样本）| Full Stage 2 | Tab 4 调 `dynamic_mask_mode=aggressive` |
+| 8 | **静音 / 无嘴型** | audio_energy 太低 | 不用微调 | — | 调 `mouth_audio_motion_min_scale=0.7` |
+| 9 | **嘴部嘴角/外翻不自然** | 极端嘴型 + mask 边界 | **Full Stage 2** | `perceptual_loss_weight=0.2+` | Tab 6 检查，**不要在 mask 边界外让 UNet 画** |
+
+### 20.3 Full vs LoRA vs QLoRA 决策表
+
+| 场景 | 推荐方式 | 理由 |
+|---|---|---|
+| 解决 sync / 闪烁 / 嘴糊 | **Full Stage 2** | LoRA 可能损失时序/同步能力 |
+| 个人音色适配（>1h 数据） | **LoRA rank=16** | 够用，省显存 |
+| 显存只有 12-16GB | **QLoRA rank=16** | 唯一选择 |
+| 多任务切换（多语言/多风格）| **LoRA 多 adapter** | 每个 10MB，可热切换 |
+| 从零训（罕见） | **Full Stage 1+2** | LoRA 效果不够 |
+| 行业术语快速适配 | **Full Stage 2 Efficient** | 速度快，效果稳 |
+| 研究 / 实验 | **LoRA 多 rank 试** | 训多组对比快 |
+
+### 20.4 推荐微调配方（按 badcase 优先级）
+
+#### 配方 A：解决嘴糊 + 闪烁（最常见需求）
+
+```yaml
+# configs/unet/stage2_512.yaml 为基础
+run:
+  resolution: 512
+  mask_image_path: latentsync/utils/mask2.png
+  perceptual_loss_weight: 0.3      # 默认 0.1 → 加大
+  trepa_loss_weight: 10.0         # 必须开
+  sync_loss_weight: 0.05
+trainable_modules:
+  - motion_modules.
+  - attentions.                   # 全部 attn，不只是 attn2
+optimizer:
+  lr: 1e-5
+max_train_steps: 10000-30000      # 视数据量
+```
+
+#### 配方 B：解决 sync 差（重训 SyncNet + Stage 2）
+
+```yaml
+# 先重训 SyncNet
+# configs/syncnet/syncnet_16_pixel_attn.yaml
+data:
+  batch_size: 1024               # 论文 5 因素第 1 条
+# 训到 val loss 稳定 ~0.2
+
+# 再训 Stage 2
+# configs/unet/stage2.yaml
+run:
+  use_syncnet: true
+  sync_loss_weight: 0.1          # 默认 0.05 → 加大
+trainable_modules:
+  - motion_modules.
+  - attentions.
+```
+
+#### 配方 C：解决侧脸 / 大嘴（数据驱动）
+
+```bash
+# 1. 数据集加 30%+ 侧脸/转头/大笑样本
+# 2. 用 Full Stage 2 训
+# 3. 推理调 aggressive mask（Tab 4）
+
+# configs/unet/stage2.yaml
+run:
+  sync_loss_weight: 0.05
+trainable_modules:
+  - motion_modules.
+  - attentions.
+```
+
+#### 配方 D：个人音色 + 标准卡（LoRA）
+
+```yaml
+# configs/unet/stage2_lora.yaml
+lora:
+  rank: 16
+  alpha: 32
+  qlora: false
+optimizer:
+  lr: 5e-5                       # LoRA 用更大 LR
+max_train_steps: 2000-5000       # 小数据集不要跑太久
+```
+
+#### 配方 E：显存极限（QLoRA）
+
+```yaml
+# configs/unet/stage2_lora.yaml
+lora:
+  rank: 16
+  alpha: 32
+  qlora: true                    # 4-bit base
+optimizer:
+  lr: 2e-4                       # QLoRA 用最大 LR
+```
+
+### 20.5 4 个最关键决策（做之前先想清楚）
+
+```mermaid
+flowchart TD
+    A[开始微调] --> B{能上 Full<br/>Stage 2 吗?}
+    B -->|能 20GB+| C1[推荐 Full Stage 2<br/>解决 sync/闪烁/嘴糊最稳]
+    B -->|只能 12-16GB| C2[用 QLoRA rank=16<br/>个人音色够用]
+    B -->|只能 8GB| C3[用 QLoRA rank=8<br/>基本只能个人音色]
+    
+    C1 --> D{主要痛点?}
+    D -->|嘴糊| E1[升 512 + LPIPS↑]
+    D -->|sync 差| E2[重训 SyncNet batch=1024]
+    D -->|闪烁| E3[TREPA=10 + Motion 训够]
+    D -->|侧脸/大嘴| E4[加数据集 + aggressive mask]
+    
+    C2 --> F{数据集大小?}
+    F -->|<100 视频| G1[LoRA rank=16<br/>max_steps=2000]
+    F -->|100-1000| G2[LoRA rank=32<br/>max_steps=5000]
+    
+    C3 --> H[只能 LoRA rank=8<br/>效果有限，建议先补 GPU]
+```
+
+### 20.6 决策表速查
+
+| 你有 | 你最痛 | 推荐配方 | 文档章节 |
+|---|---|---|---|
+| 24GB+ GPU | 嘴糊 | A（升 512 + LPIPS） | §20.4 配方 A |
+| 24GB+ GPU | sync 差 | B（重训 SyncNet） | §20.4 配方 B |
+| 24GB+ GPU | 闪烁 | A（TREPA=10） | §20.4 配方 A |
+| 24GB+ GPU | 侧脸/大嘴 | C（加数据） | §20.4 配方 C |
+| 16GB GPU | 个人音色 | D（LoRA） | §20.4 配方 D |
+| 8-12GB GPU | 任何 | E（QLoRA） | §20.4 配方 E |
+| 仅 CPU | — | ❌ 不支持训练 | — |
+
+### 20.7 训练完成后验证清单
+
+无论选哪个配方，训完都要走：
+
+1. **Tab 3.5 单 ckpt 验证**：跑 1 个 ckpt，看质量自检
+2. **Tab 6 Badcase 检查**：4 项指标
+3. **Tab 3 对比 base vs ft**：看差异
+4. **不达标 → 看 [FaceMatch] 日志**（第一步永远是这里）
+5. **仍不达标 → 调整配方 / 加大数据 / 改推理参数**
+
+### 20.8 一句话总结
+
+> **没有"治百病"的微调方式**：
+> - **Full Stage 2** = 解决 sync / 闪烁 / 嘴糊的**唯一可靠选择**
+> - **LoRA / QLoRA** = 个人音色 / 多任务 / 显存不够的**折中**
+> - **数据** = 解决侧脸 / 大嘴 / 身份 / 极端表情的**关键**（比改训练配置更重要）
+> - **推理参数** = Mask 接缝 / 静音 / identity 阈值的**调节器**
+> - **先查 [FaceMatch] 日志**，再决定调哪。
 
 ---
 
