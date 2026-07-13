@@ -76,8 +76,11 @@ pip install lpips scikit-image matplotlib
 ### 1.4 下载额外 checkpoint
 
 ```bash
-# 主模型
+# 主模型 + Whisper（训练/推理必需）
+huggingface-cli download ByteDance/LatentSync-1.6 whisper/tiny.pt --local-dir checkpoints
 huggingface-cli download ByteDance/LatentSync-1.6 latentsync_unet.pt --local-dir checkpoints
+
+# SyncNet 相关（训练 Stage 2 / 评估需要）
 huggingface-cli download ByteDance/LatentSync-1.6 stable_syncnet.pt --local-dir checkpoints
 
 # SyncNet 评估
@@ -90,6 +93,8 @@ huggingface-cli download ByteDance/LatentSync-1.5 koniq_pretrained.pkl --local-d
 checkpoints/
 ├── latentsync_unet.pt
 ├── stable_syncnet.pt
+├── whisper/
+│   └── tiny.pt
 └── auxiliary/
     ├── syncnet_v2.model
     └── koniq_pretrained.pkl

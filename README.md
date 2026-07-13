@@ -103,7 +103,14 @@ If the download is successful, the checkpoints should appear as follows:
 |   `-- tiny.pt
 ```
 
-Or you can download `latentsync_unet.pt` and `tiny.pt` manually from our [HuggingFace repo](https://huggingface.co/ByteDance/LatentSync-1.6)
+Or download them manually with `huggingface-cli`:
+
+```bash
+huggingface-cli download ByteDance/LatentSync-1.6 whisper/tiny.pt --local-dir checkpoints
+huggingface-cli download ByteDance/LatentSync-1.6 latentsync_unet.pt --local-dir checkpoints
+```
+
+You can also download `latentsync_unet.pt` and `tiny.pt` manually from our [HuggingFace repo](https://huggingface.co/ByteDance/LatentSync-1.6).
 
 ## 🚀 Inference
 
