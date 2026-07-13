@@ -204,6 +204,48 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             "qlora": True,
         },
     },
+    "🎯 Badcase Fix (侧脸+运动, LoRA, 12-15GB)": {
+        "config_file": "configs/unet/stage2.yaml",
+        "resume_ckpt": "checkpoints/latentsync_unet.pt",
+        "batch_size": 1,
+        # num_frames 16→24: 更大的时序窗口对快速运动/mouth blur 更友好
+        "num_frames": 24,
+        "resolution": 256,
+        "learning_rate": 5e-5,
+        "use_motion_module": True,
+        "pixel_space_supervise": True,
+        "use_syncnet": True,
+        # sync_loss_weight 0.05→0.12: 侧脸/远嘴同步强化
+        "sync_loss_weight": 0.12,
+        # perceptual_loss_weight 0.10→0.15: 锐化嘴部,治嘴糊
+        "perceptual_loss_weight": 0.15,
+        "recon_loss_weight": 1.0,
+        "trepa_loss_weight": 10.0,
+        "mixed_precision_training": True,
+        "enable_gradient_checkpointing": True,
+        "mask_image_path": "latentsync/utils/mask.png",
+        # save_ckpt_steps 10000→1000: 同次训练产出更多 ckpt,便于挑最佳
+        "save_ckpt_steps": 1000,
+        # max_train_steps 10000→20000: 给 LoRA 足够时间吸收 badcase pattern
+        "max_train_steps": 20000,
+        # lr constant→cosine + warmup 200: 收敛更稳,晚段不卡
+        "lr_scheduler": "cosine",
+        "lr_warmup_steps": 200,
+        "description": (
+            "针对侧脸/嘴糊/快速转动 badcase 调优的 LoRA 微调。"
+            "sync_loss 提到 0.12 推同步,num_frames 24 给时序更多上下文,"
+            "cosine+200 warmup 收敛更稳。每 1k 步存 ckpt,便于挑最佳。"
+            "配合 tools/curate_finetune_samples.py 准备数据。"
+        ),
+        "lora": {
+            "enabled": True,
+            "rank": 32,
+            "alpha": 64,
+            "dropout": 0.05,
+            "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
+            "qlora": False,
+        },
+    },
     "SyncNet 训练": {
         "config_file": "configs/syncnet/syncnet_16_pixel_attn.yaml",
         "resume_ckpt": "",
@@ -276,6 +318,119 @@ def _prune_debug_files(directory: Path, pattern: str, keep: int = 10) -> None:
             old.unlink()
         except OSError:
             pass
+
+
+class InferenceManager:
+    """Track a single background inference subprocess (used by Tab 3 / Tab 3.5).
+
+    Tab 3 inference runs are 5-10 minutes, so blocking the Gradio event
+    loop is unacceptable. We spawn via Popen in a daemon thread, return
+    immediately from the click handler, and update the UI by polling
+    `status` from a Timer. Only one inference at a time (mirrors
+    TrainingProcess).
+    """
+
+    IDLE = "idle"
+    STARTING = "starting"
+    RUNNING = "running"
+    CANCELLING = "cancelling"
+    DONE = "done"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    def __init__(self) -> None:
+        self.proc: Optional[subprocess.Popen] = None
+        self.log_f = None
+        self.log_path: Optional[Path] = None
+        self.status: str = self.IDLE
+        self.exit_code: Optional[int] = None
+        self.result_video: Optional[Path] = None
+        self.result_warning: str = ""
+        self.kind: str = ""  # "compare" / "validate"
+        self.label: str = ""  # human-readable description (e.g. "compare base vs ft")
+        self._lock = threading.Lock()
+
+    def is_busy(self) -> bool:
+        return self.status in (self.STARTING, self.RUNNING, self.CANCELLING)
+
+    def is_running(self) -> bool:
+        return self.status == self.RUNNING and self.proc is not None and self.proc.poll() is None
+
+    def start(
+        self,
+        cmd: List[str],
+        log_path: Path,
+        kind: str,
+        label: str,
+        result_video: Path,
+    ) -> bool:
+        """Spawn the subprocess in a daemon thread.
+
+        Returns True on accept, False if another inference is already busy.
+        """
+        with self._lock:
+            if self.is_busy():
+                return False
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_f = open(log_path, "w")
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(REPO_ROOT),
+                    stdout=log_f,
+                    stderr=subprocess.STDOUT,
+                    preexec_fn=os.setsid,  # so SIGINT kills the whole process group
+                )
+            except FileNotFoundError:
+                log_f.close()
+                self.status = self.FAILED
+                self.exit_code = -1
+                return False
+
+            self.proc = proc
+            self.log_f = log_f
+            self.log_path = log_path
+            self.status = self.STARTING
+            self.exit_code = None
+            self.result_video = result_video
+            self.result_warning = ""
+            self.kind = kind
+            self.label = label
+
+        threading.Thread(
+            target=self._monitor,
+            args=(proc, log_f, log_path),
+            daemon=True,
+        ).start()
+        return True
+
+    def _monitor(self, proc: subprocess.Popen, log_f, log_path: Path) -> None:
+        rc = proc.wait()
+        log_f.close()
+        with self._lock:
+            self.exit_code = rc
+            was_cancelling = self.status == self.CANCELLING
+            if was_cancelling:
+                self.status = self.CANCELLED
+            elif rc == 0:
+                self.status = self.DONE
+            else:
+                self.status = self.FAILED
+
+    def stop(self) -> str:
+        """Send SIGINT to the inference subprocess group. Non-blocking."""
+        with self._lock:
+            if self.proc is None or self.proc.poll() is not None:
+                return "(没有运行的推理)"
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+            except (ProcessLookupError, OSError) as exc:
+                logger.warning("stop() failed: %s", exc)
+            self.status = self.CANCELLING
+        return "⏹ 停止信号已发出,等待子进程退出…"
+
+
+_INFERENCE = InferenceManager()
 
 
 class TrainingProcess:
@@ -433,6 +588,8 @@ def build_config_from_form(
     val_inference_steps: int,
     val_guidance_scale: float,
     val_seed: int,
+    lr_scheduler: str,
+    lr_warmup_steps: int,
 ) -> Dict[str, Any]:
     """Merge user-form values with the chosen preset's defaults."""
     preset = PRESETS[preset_name]
@@ -483,8 +640,8 @@ def build_config_from_form(
             "lr": float(learning_rate),
             "scale_lr": False,
             "max_grad_norm": 1.0,
-            "lr_scheduler": "constant",
-            "lr_warmup_steps": 0,
+            "lr_scheduler": lr_scheduler,
+            "lr_warmup_steps": int(lr_warmup_steps),
         },
         "model": {
             "act_fn": "silu",
@@ -561,6 +718,9 @@ def build_config_from_form(
 def on_preset_change(preset_name: str) -> Tuple[Any, ...]:
     """When user picks a preset, fill the form fields with preset defaults."""
     preset = PRESETS[preset_name]
+    # Fallback for keys older presets don't carry — current form-value semantics
+    # for save_ckpt_steps / max_train_steps / lr_*. Existing Stage 1 / Stage 2
+    # presets still match the form's default behavior.
     return (
         preset["batch_size"],
         preset["num_frames"],
@@ -577,6 +737,10 @@ def on_preset_change(preset_name: str) -> Tuple[Any, ...]:
         preset["enable_gradient_checkpointing"],
         preset["mask_image_path"],
         preset["resume_ckpt"],
+        preset.get("save_ckpt_steps", 10000),
+        preset.get("max_train_steps", 10000),
+        preset.get("lr_scheduler", "constant"),
+        preset.get("lr_warmup_steps", 0),
         preset["description"],
     )
 
@@ -621,6 +785,8 @@ def launch_training(
     val_inference_steps: int,
     val_guidance_scale: float,
     val_seed: int,
+    lr_scheduler: str,
+    lr_warmup_steps: int,
     nproc_per_node: int,
     master_port: int,
     extra_env: str,
@@ -671,6 +837,8 @@ def launch_training(
             val_inference_steps=val_inference_steps,
             val_guidance_scale=val_guidance_scale,
             val_seed=val_seed,
+            lr_scheduler=lr_scheduler,
+            lr_warmup_steps=lr_warmup_steps,
         )
         logger.info("[launch_training] config built, train_output_dir=%s", cfg["data"]["train_output_dir"])
 
@@ -1581,6 +1749,14 @@ def build_ui() -> gr.Blocks:
                     save_ckpt_steps = gr.Slider(500, 50000, value=10000, step=500, label="save_ckpt_steps")
                     max_train_steps = gr.Slider(1000, 100000, value=10000, step=1000, label="max_train_steps (cap: 100k ≈ 1.7 days @1.5s/step)")
                     num_workers = gr.Slider(0, 32, value=12, step=1, label="num_workers")
+                    lr_scheduler = gr.Dropdown(
+                        choices=["constant", "cosine", "cosine_with_restarts", "linear", "polynomial"],
+                        value="constant",
+                        label="lr_scheduler",
+                    )
+                    lr_warmup_steps = gr.Slider(
+                        0, 2000, value=0, step=50, label="lr_warmup_steps (推荐 100-300 for cosine)"
+                    )
                     train_output_dir = gr.Textbox(
                         label=f"train_output_dir (相对于 {FINETUNE_BASE_DIR.name})",
                         value="unet",
@@ -1616,6 +1792,7 @@ def build_ui() -> gr.Blocks:
                     save_ckpt_steps, max_train_steps, num_workers, train_output_dir,
                     freeze_attn2,
                     val_inference_steps, val_guidance_scale, val_seed,
+                    lr_scheduler, lr_warmup_steps,
                     nproc_per_node, master_port, extra_env,
                 ],
                 outputs=[launch_status, log_path_state],
@@ -1666,7 +1843,9 @@ def build_ui() -> gr.Blocks:
                     use_motion_module, pixel_space_supervise, use_syncnet,
                     sync_loss_weight, perceptual_loss_weight, recon_loss_weight, trepa_loss_weight,
                     mixed_precision_training, enable_gradient_checkpointing, mask_image_path,
-                    resume_ckpt, preset_desc,
+                    resume_ckpt,
+                    save_ckpt_steps, max_train_steps, lr_scheduler, lr_warmup_steps,
+                    preset_desc,
                 ],
             )
 
