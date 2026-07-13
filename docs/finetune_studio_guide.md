@@ -518,7 +518,8 @@ python -m scripts.evaluate_checkpoint \
 | **嘴部糊、牙齿不清晰** | 256 分辨率不够 / LPIPS 权小 | Tab 1 选 `Stage 2 512` + `perceptual_loss_weight=0.3` | 准备 720p+ 高清视频 |
 | **嘴型对不上音频** | SyncNet 没训稳 / sync_loss 太小 | Tab 1 选 `Stage 2 (256)` + `sync_loss_weight=0.1` | 准备 1000+ 视频 |
 | **帧间闪烁（牙齿/胡须跳）** | TREPA 关闭 / Motion Module 没训够 | Tab 1 选 `Stage 2 Efficient` 反而**不要选**（关 TREPA）→ 用 `Stage 2 (256)`，TREPA=10 | 高质量视频 |
-| **侧脸 / 大角度失败** | landmark 检测 + mask 形状 | 训练帮助有限，**主要靠数据**：加 30%+ 侧脸样本 | 转头 / 侧脸视频 |
+| **侧脸 / 大角度失败** | landmark 检测 + mask 形状 | Tab 1 选 `💋 Side-Face Lip Quality` | 转头 / 侧脸视频 |
+| **侧脸唇形失真（嘴唇看不清 / 形状不对）** | 侧脸时唇被遮 ~30-50%,纹理不同 | Tab 1 选 `💋 Side-Face Lip Quality`（sync=0.18, perceptual=0.25） | celebv_hq_side recipe（side_face 桶 ≥ 50%）|
 | **身份丢失（不像原人物）** | ref 窗口差 + 训练数据少身份 | Tab 1 选 `Stage 2 (256)` | 多身份数据集 |
 | **Mask 边界接缝** | paste back blur 不够 | **不用微调** → Tab 4 调 `paste_back_blur_sigma=10+` | — |
 | **大笑 / 大嘴 / 极端表情** | dynamic mask 被 clamp | 训练帮助有限，**主要靠数据**：加大笑样本 + Tab 4 `dynamic_mask_mode=aggressive` | 大笑 / 唱歌 / 打哈欠视频 |

@@ -55,7 +55,7 @@ datasets:
     description: |
       CelebV-HQ 含 head pose 标注,侧脸/转头场景丰富。side_face 桶提到 55%,
       适合「侧脸唇形」类 badcase。
-    typical_use: "🧩 Structural Fix / 新增 💋 Side-Face Lip Quality preset"
+    typical_use: "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)"
 
   - id: talkvid_sample
     name: TalkVid (1k, 多语言, 大规模通用)

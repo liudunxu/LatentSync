@@ -263,6 +263,53 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             "qlora": False,
         },
     },
+    "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)": {
+        "config_file": "configs/unet/stage2.yaml",
+        "resume_ckpt": "checkpoints/latentsync_unet.pt",
+        "batch_size": 1,
+        # 长时序上下文 → 唇形连贯
+        "num_frames": 32,
+        "resolution": 256,
+        "learning_rate": 3e-5,
+        "use_motion_module": True,
+        "pixel_space_supervise": True,
+        "use_syncnet": True,
+        # 侧脸时唇被遮 ~30-50%,必须强推 audio-driven 想象
+        "sync_loss_weight": 0.18,
+        # 唇部纹理在侧脸时 shading 不同,提权
+        "perceptual_loss_weight": 0.25,
+        "recon_loss_weight": 1.0,
+        # 稍降 TREPA 让唇部允许更多形状变化(闭嘴 → 张嘴)
+        "trepa_loss_weight": 8.0,
+        "mixed_precision_training": True,
+        "enable_gradient_checkpointing": True,
+        "mask_image_path": "latentsync/utils/mask.png",
+        "save_ckpt_steps": 500,
+        "max_train_steps": 30000,
+        "lr_scheduler": "cosine",
+        "lr_warmup_steps": 300,
+        "description": (
+            "💋 **推荐 — 侧脸唇形质量 (yaw 15-30°)**\n"
+            "针对侧脸时嘴部遮挡 (~30-50%) + 唇纹理变化的双重挑战。\n"
+            "LoRA target 加 conv(11 项,同 Structural),rank=48 留更多 capacity 学唇形。\n"
+            "sync_loss=0.18 强推唇音同步; perceptual=0.25 锐化唇部纹理;\n"
+            "num_frames=32 给时序更长上下文让唇形连贯。\n"
+            "数据:用 celebv_hq_side recipe(side_face 桶 ≥ 50%)。"
+        ),
+        "lora": {
+            "enabled": True,
+            "rank": 48,
+            "alpha": 96,
+            "dropout": 0.10,
+            "target_modules": [
+                "to_q", "to_k", "to_v", "to_out.0",
+                "conv1", "conv2", "conv_shortcut",
+                "proj_in", "proj_out",
+                "conv_in", "conv_out",
+            ],
+            "qlora": False,
+        },
+    },
     "🎬 Short Drama (LoRA+conv, 多说话人, 18-22GB)": {
         "config_file": "configs/unet/stage2.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
