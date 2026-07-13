@@ -670,14 +670,14 @@ def launch_training(
 
         _TRAINER.proc = proc
         _TRAINER.log_path = log_path
-        _TRAINER.run_dir = REPO_ROOT / cfg["data"]["train_output_dir"]  # will be created with timestamp
+        _TRAINER.run_dir = _resolve_output_dir(cfg["data"]["train_output_dir"])
         _TRAINER.started_at = datetime.now().isoformat(timespec="seconds")
         _TRAINER.cmd = cmd
 
         status = (
             f"✅ 已启动 (pid={proc.pid})\n"
-            f"📄 config: {cfg_path.relative_to(REPO_ROOT)}\n"
-            f"📜 log:    {log_path.relative_to(REPO_ROOT)}\n"
+            f"📄 config: {cfg_path}\n"
+            f"📜 log:    {log_path}\n"
             f"📦 产物目录: {cfg['data']['train_output_dir']}/train-<timestamp>\n"
             f"🕐 启动时间: {_TRAINER.started_at}\n\n"
             f"💡 命令行：\n  {' '.join(shlex.quote(c) for c in cmd)}"
