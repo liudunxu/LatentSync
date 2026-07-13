@@ -582,10 +582,14 @@ def _on_page_load():
             except Exception as exc:
                 logger.warning("list_run_dirs failed on page load: %s", exc)
                 runs = []
+            # Make sure dropdown value is in choices (gradio raises
+            # "X is not in the list of choices" otherwise).
+            run_name = _TRAINER.run_dir.name if _TRAINER.run_dir else None
+            value = run_name if run_name in runs else None
             return (
                 trainer_text,
                 launch_text,
-                gr.update(choices=runs, value=_TRAINER.run_dir.name if _TRAINER.run_dir else None),
+                gr.update(choices=runs, value=value),
                 gr.update(interactive=True),
             )
         trainer_text = "🟢 idle — 点 '🚀 启动训练' 开始"
@@ -616,10 +620,16 @@ def _on_page_load():
 # ---------------------------------------------------------------------------
 
 def list_run_dirs(base: Path) -> List[str]:
-    """List timestamped run directories produced by train_unet.py / train_syncnet.py."""
+    """List timestamped run directories produced by train_unet.py / train_unet_lora.py / train_syncnet.py.
+
+    Matches both `train-...` (full training) and `train_lora-...` (LoRA).
+    """
     if not base.exists():
         return []
-    runs = sorted([p for p in base.iterdir() if p.is_dir() and p.name.startswith("train-")])
+    runs = sorted([
+        p for p in base.iterdir()
+        if p.is_dir() and (p.name.startswith("train-") or p.name.startswith("train_lora-"))
+    ])
     # If base is inside REPO_ROOT, keep paths relative for compact display.
     # Otherwise (e.g. /root/autodl-tmp/...), return absolute paths.
     try:
@@ -1242,6 +1252,62 @@ def _run_curate_finetune(
                 f"📜 log: {log_path}\n\n最后 60 行:\n{log_text[-6000:]}"
             )
         return f"✅ 已完成\n📜 log: {log_path}\n\n{log_text[-4000:]}"
+    except FileNotFoundError as exc:
+        return f"❌ 启动失败: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Pre-built dataset initializer (HF Hub auto-download + curate)
+# ---------------------------------------------------------------------------
+
+PREBUILT_DATASETS_YAML = REPO_ROOT / "tools" / "prebuilt_datasets.yaml"
+
+
+def _prebuilt_choices() -> List[str]:
+    """Read tools/prebuilt_datasets.yaml and return a list of `id (name)` strings
+    for the gradio Dropdown."""
+    if not PREBUILT_DATASETS_YAML.exists():
+        return []
+    try:
+        import yaml as _yaml
+        raw = _yaml.safe_load(PREBUILT_DATASETS_YAML.read_text()) or {}
+    except Exception as exc:
+        logger.warning("could not parse %s: %s", PREBUILT_DATASETS_YAML, exc)
+        return []
+    out: List[str] = []
+    for entry in raw.get("datasets", []):
+        if "id" in entry:
+            out.append(f"{entry['id']} — {entry.get('name', '')}")
+    return out
+
+
+def _run_init_prebuilt(dataset_choice: str, output_dir: str) -> str:
+    """Spawn `python -m tools.init_finetune_dataset` and stream output."""
+    dataset_choice = (dataset_choice or "").strip()
+    output_dir = (output_dir or "").strip()
+    if not dataset_choice:
+        return "❌ 请先选一个预制数据集(下拉里选)"
+    if not output_dir:
+        return "❌ 输出目录为空"
+    # Parse `id — name` back to plain id.
+    dataset_id = dataset_choice.split(" — ")[0].strip()
+    cmd = [
+        sys.executable, "-m", "tools.init_finetune_dataset",
+        "--dataset", dataset_id,
+        "--output-dir", output_dir,
+    ]
+    log_path = REPO_ROOT / "debug" / f"init_prebuilt_{datetime.now():%Y%m%d_%H%M%S}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(log_path, "w") as logf:
+            proc = subprocess.run(cmd, cwd=str(REPO_ROOT), stdout=logf, stderr=subprocess.STDOUT)
+        log_text = log_path.read_text()
+        if proc.returncode != 0:
+            return (
+                f"❌ init 退出码 {proc.returncode}\n"
+                f"📜 log: {log_path}\n\n最后 60 行:\n{log_text[-6000:]}"
+            )
+        return f"✅ 完成\n📜 log: {log_path}\n\n{log_text[-6000:]}"
     except FileNotFoundError as exc:
         return f"❌ 启动失败: {exc}"
 
@@ -2102,6 +2168,34 @@ def build_ui() -> gr.Blocks:
                 outputs=[launch_status, log_path_state],
             )
             stop_btn.click(fn=stop_training, outputs=launch_status)
+
+            # ---- 预制数据集 (HF Hub 自动下载 + curate) ----
+            with gr.Accordion("📚 预制数据集 (HF Hub 自动下 + curate)", open=False):
+                gr.Markdown(
+                    "**最省事的入口** — 从 `tools/prebuilt_datasets.yaml` 选一个,"
+                    "一键下载 + face 检测 + 按 yaw/motion 分桶 + 写 fileslist.txt,"
+                    "直接拿来训练。无需自己找数据源。"
+                )
+                with gr.Row():
+                    prebuilt_dd = gr.Dropdown(
+                        choices=_prebuilt_choices(),
+                        label="预制数据集 (HF Hub)",
+                        value=None,
+                        scale=2,
+                    )
+                    prebuilt_target = gr.Textbox(
+                        label="输出目录 (留空默认 data/init_finetune)",
+                        placeholder="data/init_finetune",
+                        value="data/init_finetune",
+                        scale=2,
+                    )
+                prebuilt_btn = gr.Button("⬇ 下载 + Curate", variant="primary")
+                prebuilt_log = gr.Textbox(label="输出", lines=18, interactive=False)
+                prebuilt_btn.click(
+                    fn=_run_init_prebuilt,
+                    inputs=[prebuilt_dd, prebuilt_target],
+                    outputs=prebuilt_log,
+                )
 
             # ---- 数据集一键准备 (download + curate) ----
             with gr.Accordion("📥 数据集一键准备 (download_curated_finetune_set)", open=False):
