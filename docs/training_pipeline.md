@@ -105,6 +105,51 @@ flowchart TB
     BASE -.改造.-> LS
 ```
 
+#### ⚠️ 关键澄清：SD1.5 是"起点"不是"成品"
+
+| 组件 | SD1.5 提供 | LatentSync 是否重训 |
+|---|---|---|
+| **VAE 编码器/解码器** | `stabilityai/sd-vae-ft-mse` | ❌ 冻结不训 |
+| **UNet 骨架结构** | SD UNet 架构 | 复用结构 |
+| **UNet 初始权重** | SD1.5 unet 权重（warm start） | ✅ **全部重训** |
+| **UNet conv_in（13 ch）** | SD 是 4 通道，shape 不兼容 | 🆕 随机初始化 |
+| **Cross-attn（384 dim）** | SD 是 768/1280 维，shape 不兼容 | 🆕 随机初始化 |
+| **Motion Module** | SD 没有 | 🆕 新增、随机初始化 |
+| **Audio 注入路径** | SD 没有 | 🆕 新增 |
+
+**论文 §3.1 原话**：
+> *"At the beginning of training, the model is initialized with the parameters of SD 1.5, except for the first conv_in layer with 13 channels and cross-attention layers of dimension 384, which are randomly initialized."*
+
+**代码层面**（`scripts/train_unet.py`）：
+
+```python
+# VAE 真的直接用 SD 的
+vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", ...)
+
+# UNet 加载时 ckpt_path 默认是 latentsync_unet.pt（不是 SD1.5）
+unet, resume_global_step = UNet3DConditionModel.from_pretrained(
+    OmegaConf.to_container(config.model),
+    config.ckpt.resume_ckpt_path,  # = checkpoints/latentsync_unet.pt
+    device=device,
+)
+```
+
+**关键点**：
+1. 首次跑 Stage 1 之前，需要先把 SD1.5 UNet 的权重塞到 `latentsync_unet.pt` 里（conv_in 和 cross-attn 因为 shape 不对会被 `strict=False` 跳过，留随机初始化）。
+2. Stage 1 训全部 UNet 参数（SD1.5 的 resnet/attn 全部更新）。
+3. Stage 2 冻结 SD1.5 原有 resnet/attn，只训新加的 `motion_modules.` + `attentions.`。
+
+**为什么不直接用 SD1.5 训好的 frozen UNet？**
+
+论文 §2 Fig.2 实验证明：直接把 SD1.5 的 UNet 接上音频 cross-attn、训唇音同步，**会严重 shortcut learning**（从眼睛/脸颊推断嘴型，不听音频）。所以必须用 SyncNet 监督强制学视听关联，并且是在唇音同步数据上完整训练一遍。
+
+**为什么不复用 SD1.5 的 conv_in 和 cross-attn 权重？**
+
+- **conv_in**：SD1.5 接受 4 通道 latent，LatentSync 接受 13 通道（4 noise + 1 mask + 4 masked + 4 ref）。维度对不上，必须随机初始化。
+- **cross-attention**：SD1.5 用 768 维（text encoder）做 cross-attn，LatentSync 用 384 维（whisper-tiny）做 cross-attn，维度对不上，必须随机初始化。
+
+其他 resnet、self-attn、time embedding 等模块 shape 兼容，可以从 SD1.5 权重 warm start 加速收敛。
+
 #### 输入输出
 
 | | 形状 | 含义 |
