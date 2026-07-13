@@ -105,7 +105,7 @@ checkpoints/
 python gradio_finetune.py
 ```
 
-默认监听 `http://0.0.0.0:7861`。
+默认监听 `http://0.0.0.0:6006`。
 
 ### 2.2 自定义端口 / 共享
 
@@ -117,7 +117,7 @@ python gradio_finetune.py --port 8080
 python gradio_finetune.py --share
 
 # 指定 host
-python gradio_finetune.py --host 127.0.0.1 --port 7861
+python gradio_finetune.py --host 127.0.0.1 --port 6006
 ```
 
 ### 2.3 在远程 GPU 机器上启动
@@ -127,10 +127,10 @@ python gradio_finetune.py --host 127.0.0.1 --port 7861
 ssh user@gpu-box
 
 # 2. 启动（绑定所有接口）
-python gradio_finetune.py --host 0.0.0.0 --port 7861 --share
+python gradio_finetune.py --host 0.0.0.0 --port 6006 --share
 
 # 3. 浏览器访问
-# https://gpu-box:7861
+# https://gpu-box:6006
 # 或临时公网 URL
 ```
 

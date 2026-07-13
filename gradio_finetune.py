@@ -2068,7 +2068,7 @@ def run_badcase_checklist(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=7861)
+    parser.add_argument("--port", type=int, default=6006)
     parser.add_argument("--share", action="store_true")
     args = parser.parse_args()
 
