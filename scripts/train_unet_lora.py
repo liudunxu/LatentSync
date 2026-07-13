@@ -36,6 +36,7 @@ import math
 import argparse
 import shutil
 import datetime
+import copy
 import logging
 from typing import List, Optional
 
@@ -322,10 +323,12 @@ def main(config):
     if config.run.trepa_loss_weight != 0 and config.run.pixel_space_supervise:
         trepa_loss_func = TREPALoss(device=device, with_cp=True)
 
-    # ---- Validation pipeline (uses base UNet) ----
-    # Unwrap peft model for the pipeline; the pipeline doesn't know about LoRA
+    # ---- Validation pipeline (uses base UNet with LoRA baked in for this step) ----
+    # merge_and_unload mutates the source in-place, so deep-copy first to
+    # preserve the LoRA-wrapped `unet` for DDP training.
     if hasattr(unet, "merge_and_unload"):
-        unet_for_pipeline = unet.merge_and_unload()
+        unet_for_pipeline = copy.deepcopy(unet)
+        unet_for_pipeline = unet_for_pipeline.merge_and_unload()
     else:
         unet_for_pipeline = unet
     pipeline = LipsyncPipeline(
@@ -335,13 +338,8 @@ def main(config):
         scheduler=noise_scheduler,
     ).to(device)
     pipeline.set_progress_bar_config(disable=True)
-    # Re-wrap for DDP training
-    if hasattr(unet, "base_model"):  # peft model
-        # After merge_and_unload, unet is the original. For training we need
-        # a LoRA-wrapped DDP. Re-apply LoRA: too disruptive. Instead, just
-        # use the merged base for the val pipeline and skip DDP wrapping for
-        # the LoRA model — single-GPU LoRA fine-tuning is the typical use.
-        unet = unet_for_pipeline
+    # Keep the LoRA-wrapped `unet` for DDP training; do NOT overwrite with
+    # the merged pipeline copy (which would lose the LoRA trainable params).
     unet = DDP(unet, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     # ---- Training loop ----
