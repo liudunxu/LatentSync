@@ -392,6 +392,23 @@ def build_config_from_form(
             },
         },
     }
+
+    # If the preset carries a LoRA block, propagate it into the generated
+    # config. train_unet_lora.py will pick it up; train_unet.py will
+    # simply ignore it (it has its own trainable_modules logic).
+    if "lora" in preset:
+        cfg["lora"] = dict(preset["lora"])
+    else:
+        # Default-off block so users can hand-edit the generated yaml
+        cfg["lora"] = {
+            "enabled": False,
+            "rank": 16,
+            "alpha": 32,
+            "dropout": 0.05,
+            "target_modules": ["to_q", "to_k", "to_v", "to_out"],
+            "qlora": False,
+            "freeze_attn2": False,
+        }
     return cfg
 
 
@@ -496,8 +513,17 @@ def launch_training(
         yaml.dump(OmegaConf.to_container(OmegaConf.create(cfg)), f, sort_keys=False)
 
     is_syncnet = "syncnet" in PRESETS[preset_name]["config_file"]
-    script = "scripts.train_syncnet" if is_syncnet else "scripts.train_unet"
-    config_arg = "--config_path" if is_syncnet else "--unet_config_path"
+    is_lora = bool(PRESETS[preset_name].get("lora", {}).get("enabled", False))
+
+    if is_syncnet:
+        script = "scripts.train_syncnet"
+        config_arg = "--config_path"
+    elif is_lora:
+        script = "scripts.train_unet_lora"
+        config_arg = "--unet_config_path"
+    else:
+        script = "scripts.train_unet"
+        config_arg = "--unet_config_path"
 
     cmd = [
         "torchrun",
@@ -511,7 +537,8 @@ def launch_training(
 
     log_dir = REPO_ROOT / "debug" / "training_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{'syncnet' if is_syncnet else 'unet'}_{ts}.log"
+    log_kind = "syncnet" if is_syncnet else ("unet_lora" if is_lora else "unet")
+    log_path = log_dir / f"{log_kind}_{ts}.log"
 
     env = os.environ.copy()
     if extra_env.strip():
