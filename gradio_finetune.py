@@ -52,8 +52,17 @@ CHECKPOINT_DIR = REPO_ROOT / "checkpoints"
 # Fine-tuning intermediates (generated configs, training logs, run outputs,
 # audio embeds/mel caches) go to a separate large-disk directory by default.
 # Can be overridden with LATENTSYNC_FINETUNE_DIR env var.
-FINETUNE_BASE_DIR = Path(os.environ.get("LATENTSYNC_FINETUNE_DIR", "/root/autodl-tmp/latentsync_finetune"))
-FINETUNE_BASE_DIR.mkdir(parents=True, exist_ok=True)
+_FINETUNE_BASE_DIR_STR = os.environ.get("LATENTSYNC_FINETUNE_DIR", "/root/autodl-tmp/latentsync_finetune")
+FINETUNE_BASE_DIR = Path(_FINETUNE_BASE_DIR_STR)
+try:
+    FINETUNE_BASE_DIR.mkdir(parents=True, exist_ok=True)
+except OSError as e:
+    logger.warning(
+        "Cannot create fine-tune base dir %s (%s); falling back to %s",
+        FINETUNE_BASE_DIR, e, REPO_ROOT / "debug",
+    )
+    FINETUNE_BASE_DIR = REPO_ROOT / "debug"
+    FINETUNE_BASE_DIR.mkdir(parents=True, exist_ok=True)
 TRAIN_OUTPUT_DIR = FINETUNE_BASE_DIR
 
 ASSETS_DIR = REPO_ROOT / "assets"
