@@ -1185,22 +1185,32 @@ def tail_log(log_path: Optional[str], n_lines: int = 80) -> str:
 
 
 def parse_loss_chart(run_dir_path: Optional[str]) -> Optional[str]:
-    """LatentSync plots loss charts via plot_loss_chart(); we surface the
-    latest PNG from loss_charts/ or sync_conf_results/."""
-    if not run_dir_path:
+    """Surface the latest PNG from the run's loss_charts/ directory.
+
+    Separate from sync_conf so the UI can show two side-by-side charts.
+    Returns the path to the most-recent PNG, or None.
+    """
+    return _latest_png_in_subdir(run_dir_path, "loss_charts")
+
+
+def parse_sync_conf_chart(run_dir_path: Optional[str]) -> Optional[str]:
+    """Surface the latest PNG from the run's sync_conf_results/ directory."""
+    return _latest_png_in_subdir(run_dir_path, "sync_conf_results")
+
+
+def _latest_png_in_subdir(run_dir_path: Optional[str], sub: str) -> Optional[str]:
+    rd = Path(run_dir_path) if run_dir_path else None
+    if rd is None:
         return None
-    rd = Path(run_dir_path)
     if not rd.is_absolute():
         rd = _resolve_run_dir(run_dir_path)
         if rd is None:
             return None
-    for sub in ("loss_charts", "sync_conf_results"):
-        d = rd / sub
-        if d.exists():
-            pngs = sorted(d.glob("*.png"), key=lambda p: p.stat().st_mtime)
-            if pngs:
-                return str(pngs[-1])
-    return None
+    d = rd / sub
+    if not d.exists():
+        return None
+    pngs = sorted(d.glob("*.png"), key=lambda p: p.stat().st_mtime)
+    return str(pngs[-1]) if pngs else None
 
 
 def list_validation_videos(run_dir_path: Optional[str]) -> List[str]:
@@ -1556,17 +1566,19 @@ def monitor_refresh(
     train_output_dir: str,
     selected_run: Optional[str],
     log_path: Optional[str],
-) -> Tuple[Any, str, Any, str, str, str, str, float, str]:
+) -> Tuple[Any, str, Any, Any, str, str, str, str, float, str]:
     """Pull the latest snapshot. Returns: (run_dir_choices, selected_run_disp,
-    loss_chart, val_video_choices, log_tail, ckpt_info, trainer_status,
-    progress_pct, progress_text)."""
+    loss_chart, sync_conf_chart, val_video_choices, log_tail, ckpt_info,
+    trainer_status, progress_pct, progress_text)."""
     base = _resolve_output_dir(train_output_dir)
     run_choices = list_run_dirs(base)
     run_dir = _resolve_run_dir(selected_run)
-    chart = parse_loss_chart(str(run_dir) if run_dir else None)
-    val_videos = list_validation_videos(str(run_dir) if run_dir else None)
+    run_path = str(run_dir) if run_dir else None
+    chart = parse_loss_chart(run_path)
+    sync_chart = parse_sync_conf_chart(run_path)
+    val_videos = list_validation_videos(run_path)
     log_text = tail_log(log_path, n_lines=80)
-    ckpts = list_checkpoints_in_run(str(run_dir) if run_dir else None)
+    ckpts = list_checkpoints_in_run(run_path)
     if ckpts:
         ckpt_path = Path(ckpts[-1])
         if not ckpt_path.is_absolute():
@@ -1586,6 +1598,7 @@ def monitor_refresh(
         gr.update(choices=run_choices),
         str(run_dir) if run_dir else "",
         chart,
+        sync_chart,
         val_videos,
         log_text,
         ckpt_info,
@@ -2509,13 +2522,15 @@ def build_ui() -> gr.Blocks:
 
             with gr.Row():
                 with gr.Column():
-                    loss_chart_img = gr.Image(label="Loss / Sync_conf 曲线", type="filepath")
+                    loss_chart_img = gr.Image(label="Loss 曲线 (lr + total + recon + lpips)", type="filepath")
+                    sync_conf_img = gr.Image(label="Sync_conf 曲线 (finetune 核心信号)", type="filepath")
                 with gr.Column():
                     val_video_dd = gr.Dropdown(label="Validation 视频", choices=[])
                     val_video_player = gr.Video(label="预览", interactive=False)
 
             def _on_run_change(run_path):
                 chart = parse_loss_chart(run_path)
+                sync_chart = parse_sync_conf_chart(run_path)
                 vids = list_validation_videos(run_path)
                 ckpts = list_checkpoints_in_run(run_path)
                 if ckpts:
@@ -2525,12 +2540,17 @@ def build_ui() -> gr.Blocks:
                     ck_info = read_loss_from_checkpoint(str(ckpt_path))
                 else:
                     ck_info = "(no checkpoint yet)"
-                return chart, gr.update(choices=vids, value=vids[0] if vids else None), ck_info
+                return (
+                    chart,
+                    sync_chart,
+                    gr.update(choices=vids, value=vids[0] if vids else None),
+                    ck_info,
+                )
 
             run_dd.change(
                 fn=_on_run_change,
                 inputs=run_dd,
-                outputs=[loss_chart_img, val_video_dd, ckpt_info_box],
+                outputs=[loss_chart_img, sync_conf_img, val_video_dd, ckpt_info_box],
             )
             val_video_dd.change(
                 fn=_safe_video_update,
@@ -2553,7 +2573,7 @@ def build_ui() -> gr.Blocks:
                 fn=monitor_refresh,
                 inputs=[monitor_output_dir, run_dd, log_path_state],
                 outputs=[
-                    run_dd, gr.Textbox(visible=False), loss_chart_img,
+                    run_dd, gr.Textbox(visible=False), loss_chart_img, sync_conf_img,
                     val_video_dd, log_box, ckpt_info_box, trainer_status,
                     progress_bar, progress_text,
                 ],
@@ -2564,7 +2584,7 @@ def build_ui() -> gr.Blocks:
                 fn=monitor_refresh,
                 inputs=[monitor_output_dir, run_dd, log_path_state],
                 outputs=[
-                    run_dd, gr.Textbox(visible=False), loss_chart_img,
+                    run_dd, gr.Textbox(visible=False), loss_chart_img, sync_conf_img,
                     val_video_dd, log_box, ckpt_info_box, trainer_status,
                     progress_bar, progress_text,
                 ],
@@ -2633,7 +2653,9 @@ def build_ui() -> gr.Blocks:
                 cmp_guidance = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="guidance_scale")
                 cmp_seed = gr.Number(value=1247, label="seed", precision=0)
 
-            cmp_btn = gr.Button("🎬 生成对比", variant="primary")
+            with gr.Row():
+                cmp_btn = gr.Button("🎬 生成对比", variant="primary", scale=3)
+                cmp_cancel_btn = gr.Button("⏹ 取消当前推理", variant="stop", scale=1)
 
             with gr.Row():
                 cmp_out_base = gr.Video(label="Base 输出")
@@ -2647,6 +2669,7 @@ def build_ui() -> gr.Blocks:
                 ],
                 outputs=[cmp_out_base, cmp_out_ft],
             )
+            cmp_cancel_btn.click(fn=stop_inference, outputs=val_report)
 
         # =========================================================
         # Tab 3.5: Validation - run inference with a single ckpt
@@ -2691,7 +2714,9 @@ def build_ui() -> gr.Blocks:
                 val_deepcache = gr.Checkbox(value=True, label="enable_deepcache (快 2x)")
                 val_skip_qc = gr.Checkbox(value=False, label="跳过质量自检（更快）")
 
-            val_btn = gr.Button("🚀 推理 + 质量自检", variant="primary")
+            with gr.Row():
+                val_btn = gr.Button("🚀 推理 + 质量自检", variant="primary", scale=3)
+                val_cancel_btn = gr.Button("⏹ 取消当前推理", variant="stop", scale=1)
 
             val_compat = gr.Textbox(label="ckpt 兼容性检查", lines=4, interactive=False)
             val_output = gr.Video(label="生成结果", interactive=False)
@@ -2707,6 +2732,7 @@ def build_ui() -> gr.Blocks:
                 ],
                 outputs=[val_output, val_compat, val_report, val_saved],
             )
+            val_cancel_btn.click(fn=stop_inference, outputs=val_report)
 
         # =========================================================
         # Tab 4: Identity Protection Strategy
