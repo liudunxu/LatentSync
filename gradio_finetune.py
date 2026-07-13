@@ -1020,7 +1020,10 @@ def run_validation(
             f"📜 完整 log: {log_path.relative_to(REPO_ROOT)}\n\n"
             f"最后 30 行:\n{tail_file(log_path, 30)}"
         )
-        return ("", warnings_text, err_text, str(out_mp4))
+        # Return None for the video output (gr.Video can't handle empty
+        # string; None makes it show the previous video, which is the
+        # desired UX on failure).
+        return (None, warnings_text, err_text, str(out_mp4))
 
     # Quality self-check
     if skip_quality_check:
@@ -1364,6 +1367,7 @@ def build_ui() -> gr.Blocks:
                         choices=list_checkpoints(),
                         label="Checkpoint（base / fine-tuned）",
                         value="checkpoints/latentsync_unet.pt" if (REPO_ROOT / "checkpoints/latentsync_unet.pt").exists() else None,
+                        allow_custom_value=True,
                     )
                     val_config = gr.Dropdown(
                         choices=[
