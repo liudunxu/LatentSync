@@ -14,6 +14,8 @@
 ## [Unreleased] — 微调工具与文档体系
 
 ### ✨ Added
+- **`start.sh`** — 一键启动 Fine-tune Studio（自动选 venv python，缺依赖时自动装）
+- **`README.md` 文档索引** — 指向 `finetune_studio_guide.md` / `training_pipeline.md` / 等所有 docs
 - **PEFT / LoRA / QLoRA 微调**（`scripts/train_unet_lora.py` + `merge_lora.py` + `configs/unet/stage2_lora.yaml` + `train_unet_lora.sh`）
   - `Stage 2 LoRA (256, 12-15GB)` 和 `Stage 2 QLoRA (256, 8-10GB)` presets
   - 推理侧合并工具（LoRA adapter → 标准 .pt）
@@ -57,6 +59,8 @@
   - §26 Scene Detection（训练 vs 推理）
 
 ### 🐛 Fixed
+- `gradio_finetune.py` — `val_ckpt` 默认值不在 choices 时报 UserWarning（加 `allow_custom_value=True`）
+- `gradio_finetune.py` — 推理失败时返回 `""` 给 `gr.Video` 触发 ValueError（改返回 `None`）
 - `latentsync/data/unet_dataset.py` — `train_data_dir` 从 `os.listdir` 改为 `Path.rglob("*.mp4")`，**支持嵌套目录**（如 `data/train/<speaker>/<video>.mp4`）
 
 ### 🔧 Changed

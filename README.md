@@ -163,7 +163,7 @@ Before training, you should process the data as described above. We released a p
 huggingface-cli download ByteDance/LatentSync-1.6 stable_syncnet.pt --local-dir checkpoints
 ```
 
-If all the preparations are complete, you can train the U-Net with the following script:
+If all the preparations are complete, you can train the U-Net with the following command:
 
 ```bash
 ./train_unet.sh
@@ -176,6 +176,7 @@ We prepared several UNet configuration files in the ``configs/unet`` directory, 
 - `stage2_efficient.yaml`: Efficient Stage 2 training, requires **20 GB** VRAM. It may lead to slight degradation in visual quality and temporal consistency compared with `stage2.yaml`, suitable for users with consumer-grade GPUs, such as the RTX 3090.
 - `stage1_512.yaml`: Stage1 training on 512 $\times$ 512 resolution videos, requires **30 GB** VRAM.
 - `stage2_512.yaml`: Stage2 training on 512 $\times$ 512 resolution videos, requires **55 GB** VRAM.
+- `stage2_lora.yaml`: **LoRA** fine-tuning (12-15 GB VRAM, adapter only ~10MB). See `train_unet_lora.sh` and `scripts/merge_lora.py`.
 
 Also remember to change the parameters in U-Net config file to specify the data directory, checkpoint save path, and other training hyperparameters. For convenience, we prepared a script for writing a data files list. Run the following command:
 
@@ -192,6 +193,53 @@ In case you want to train SyncNet on your own datasets, you can run the followin
 ```
 
 After `validations_steps` training, the loss charts will be saved in `train_output_dir`. They contain both the training and validation loss. If you want to customize the architecture of SyncNet for different image resolutions and input frame lengths, please follow the [guide](docs/syncnet_arch.md).
+
+## 🛠️ LoRA / QLoRA Fine-tuning
+
+For cheap, fast fine-tuning on consumer GPUs (12-15 GB for LoRA, 8-10 GB for QLoRA):
+
+```bash
+# 1. Train
+./train_unet_lora.sh          # uses configs/unet/stage2_lora.yaml
+
+# 2. Merge adapter (10 MB) back into a standard ckpt
+python -m scripts.merge_lora \
+    --base_ckpt checkpoints/latentsync_unet.pt \
+    --adapter_dir debug/unet_lora/train_lora-.../checkpoints/checkpoint-5000 \
+    --out_ckpt debug/merged.pt
+
+# 3. Use the merged ckpt like any other
+python -m scripts.inference --inference_ckpt_path debug/merged.pt ...
+```
+
+The adapter file is ~10 MB (vs 1.3 GB for the full UNet), so you can ship many task-specific adapters from a single base model.
+
+## 🖥️ Gradio Fine-tune Studio
+
+A web UI that wraps training, monitoring, evaluation, and badcase debugging into a single interface:
+
+```bash
+pip install gradio peft bitsandbytes  # + wandb / tensorboard for tracking
+python gradio_finetune.py                # http://0.0.0.0:6006
+```
+
+7 tabs: configure & launch · monitor · compare · **validate** · identity protection · dataset quality · badcase checklist.
+
+See [`docs/finetune_studio_guide.md`](docs/finetune_studio_guide.md) for the full user guide.
+
+## 📚 Documentation
+
+| Doc | Audience | What's in it |
+|---|---|---|
+| [`docs/finetune_studio_guide.md`](docs/finetune_studio_guide.md) | End users of `gradio_finetune.py` | How to start the UI, walk through every tab, CLI equivalents, FAQ, troubleshooting |
+| [`docs/training_pipeline.md`](docs/training_pipeline.md) | Engineers | 26-section deep dive: architecture, every loss function, badcase→fix mapping, Stage 1 vs Stage 2, vs MuseTalk / HeyGen, dataset formats, v1.5 vs v1.6 |
+| [`docs/syncnet_arch.md`](docs/syncnet_arch.md) | Engineers customizing SyncNet | Architecture knobs for different resolutions / frame counts |
+| [`docs/lipsync_strategy.md`](docs/lipsync_strategy.md) | Production deployers | Pre-filters, post-processing, identity / color match, EMA smoothing |
+| [`docs/lipsync_optimization_roadmap.md`](docs/lipsync_optimization_roadmap.md) | Performance tuners | Pre-filter thresholds, adaptive quality fallback, shot passthrough |
+| [`docs/changelog_v1.5.md`](docs/changelog_v1.5.md) | Curious | What 1.5 added (Motion Module, 中文, 20GB VRAM) |
+| [`docs/changelog_v1.6.md`](docs/changelog_v1.6.md) | Curious | What 1.6 added (512×512 training) |
+| [`CHANGELOG.md`](CHANGELOG.md) | Maintainers | Centralised changelog of this repo |
+| [`AGENTS.md`](AGENTS.md) | AI agents | Repo conventions, lock baseline mask, naturalness defaults |
 
 ## 📊 Evaluation
 
