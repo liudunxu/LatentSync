@@ -510,13 +510,12 @@ def launch_training(
     nproc_per_node: int,
     master_port: int,
     extra_env: str,
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str]:
     """Build a config yaml, spawn the training subprocess, return status."""
 
     if _TRAINER.is_running():
         return (
             f"❌ 训练已在运行中 (pid={_TRAINER.proc.pid}, run={_TRAINER.run_dir.name})",
-            "",
             "",
         )
 
@@ -604,7 +603,6 @@ def launch_training(
         return (
             f"❌ 启动失败：{e}\n请确保 torchrun 在 PATH 中",
             str(log_path),
-            "",
         )
 
     _TRAINER.proc = proc
@@ -621,7 +619,7 @@ def launch_training(
         f"🕐 启动时间: {_TRAINER.started_at}\n\n"
         f"💡 命令行：\n  {' '.join(shlex.quote(c) for c in cmd)}"
     )
-    return status, str(log_path), gr.update(choices=list_run_dirs(REPO_ROOT / cfg["data"]["train_output_dir"]))
+    return status, str(log_path)
 
 
 def stop_training() -> str:
@@ -1314,7 +1312,7 @@ def build_ui() -> gr.Blocks:
                     save_ckpt_steps, max_train_steps, num_workers, train_output_dir,
                     nproc_per_node, master_port, extra_env,
                 ],
-                outputs=[launch_status, log_path_state, gr.State()],
+                outputs=[launch_status, log_path_state],
             )
             stop_btn.click(fn=stop_training, outputs=launch_status)
 
