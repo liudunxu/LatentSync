@@ -2,6 +2,7 @@
 
 from .whisper import load_model
 import hashlib
+import logging
 import numpy as np
 import torch
 import os
@@ -27,6 +28,18 @@ class Audio2Feature:
         num_frames=16,
         audio_feat_length=[2, 2],
     ):
+        # If the provided path does not exist but its basename (e.g. "tiny")
+        # matches an official Whisper model name, let whisper auto-download it.
+        if not os.path.isfile(model_path):
+            from .whisper import available_models
+            model_name = Path(model_path).stem
+            if model_name in available_models():
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    "Local Whisper checkpoint %s not found; falling back to official model name '%s' (will auto-download)",
+                    model_path, model_name,
+                )
+                model_path = model_name
         self.model = load_model(model_path, device)
         self.audio_embeds_cache_dir = audio_embeds_cache_dir
         if audio_embeds_cache_dir is not None and audio_embeds_cache_dir != "":
