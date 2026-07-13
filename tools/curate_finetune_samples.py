@@ -1,0 +1,455 @@
+# Copyright (c) 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+"""Curate a finetune dataset from a candidate pool (URLs or local files).
+
+For each candidate video, run face detection (yaw) and motion scoring,
+categorize into one of {frontal, side_face, fast_motion, reject}, then
+sample to the target distribution (default 45% frontal / 35% side_face /
+20% fast_motion) and write the result to:
+
+    <output-dir>/
+        frontal/<n>.mp4
+        side_face/<n>.mp4
+        fast_motion/<n>.mp4
+        fileslist.txt         # one path per line, used as train_data_dir/fileslist
+        curation_report.json  # per-video scores + chosen bucket
+
+Usage:
+    # 1. Put URLs (one per line) in a text file or pass --url inline.
+    # 2. python tools/curate_finetune_samples.py \\
+    #        --urls examples_finetune_urls.txt \\
+    #        --output-dir data/finetune_samples \\
+    #        --target-count 60
+
+    # OR with local files:
+    python tools/curate_finetune_samples.py \\
+        --source-dir /path/to/candidate_videos \\
+        --output-dir data/finetune_samples
+
+Each candidate URL is downloaded via yt-dlp (if not already present in
+<output-dir>/_raw); local files are scanned in place.
+
+Bucket definitions (per-video aggregates):
+    frontal:     max(|yaw|) <= 20  AND  motion score <= 30
+    side_face:   max(|yaw|)  in (20, 45]
+    fast_motion: motion score > 30  (any yaw)
+    reject:      yaw > 45 (extreme), or no face detected, or sync_conf < 2
+
+Where:
+    yaw        = average InsightFace pose[1] across detected frames (degrees)
+    motion     = median per-frame inter-frame bbox-center displacement
+                 in the aligned 512-crop pixel space, **excluding** yaw-rotated
+                 motion (so motion captures translation, not head-turn).
+    sync_conf  = optional; loaded from <output-dir>/_raw/<name>.sync_conf.json
+                 if produced by tools/compute_sync_conf.py. Skipped if absent.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import shutil
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+from tqdm import tqdm
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Bucket boundaries
+# ---------------------------------------------------------------------------
+
+YAW_FRONTAL_MAX = 20.0          # deg | yaw | <= this → frontal eligibility
+YAW_SIDE_MIN = 20.0
+YAW_SIDE_MAX = 45.0             # beyond this → reject
+MOTION_FAST_THRESHOLD = 30.0    # motion score > this → fast_motion tag
+MIN_FRAMES = 30                 # skip videos shorter than ~1.2s @ 25fps
+SAMPLE_FRAMES = 64              # frames to subsample for face detection
+SYNC_CONF_MIN = 2.0             # below this → reject (if sync_conf available)
+TARGET_RATIO = {"frontal": 0.45, "side_face": 0.35, "fast_motion": 0.20}
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class VideoScore:
+    """Per-candidate aggregates used for bucketing."""
+    path: str
+    yaw_mean: float = 0.0
+    yaw_max_abs: float = 0.0
+    motion_score: float = 0.0
+    frame_count: int = 0
+    face_detected_ratio: float = 0.0  # % of sampled frames with a face
+    sync_conf: Optional[float] = None
+    bucket: str = ""
+    rejected_reason: str = ""
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        return d
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — Download
+# ---------------------------------------------------------------------------
+
+
+def _download_urls(urls: List[str], raw_dir: Path, num_workers: int) -> List[Path]:
+    """Download each URL via yt-dlp into raw_dir. Skip if file exists."""
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    paths: List[Path] = []
+    for url in tqdm(urls, desc="download"):
+        # Use a stable filename (sha1 of url, first 16 hex).
+        import hashlib
+        h = hashlib.sha1(url.encode()).hexdigest()[:16]
+        out = raw_dir / f"{h}.mp4"
+        if out.exists() and out.stat().st_size > 1024:
+            paths.append(out)
+            continue
+        cmd = [
+            "yt-dlp",
+            "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best",
+            "--merge-output-format", "mp4",
+            "--no-warnings",
+            "--output", str(out),
+            url,
+        ]
+        try:
+            subprocess.run(cmd, timeout=600, check=False)
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout downloading %s", url)
+            continue
+        if out.exists() and out.stat().st_size > 1024:
+            paths.append(out)
+    return paths
+
+
+def _materialize_local(source_dir: Path, raw_dir: Path) -> List[Path]:
+    """Find video files under source_dir and symlink (or copy) them into raw_dir.
+
+    Symlinks keep storage low; if --copy is passed we copy instead.
+    """
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    exts = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
+    paths: List[Path] = []
+    for p in sorted(source_dir.rglob("*")):
+        if p.suffix.lower() in exts and p.is_file():
+            out = raw_dir / p.name
+            if not out.exists():
+                try:
+                    os.symlink(p, out)
+                except OSError:
+                    shutil.copy2(p, out)
+            paths.append(out)
+    return paths
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — Score
+# ---------------------------------------------------------------------------
+
+
+def _score_one(
+    video_path: Path,
+    detector,
+    sample_frames: int = SAMPLE_FRAMES,
+) -> VideoScore:
+    """Run face detection + motion scoring on a single video.
+
+    Returns a VideoScore; bucket/reject fields are still empty.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    if total < MIN_FRAMES:
+        cap.release()
+        return VideoScore(path=str(video_path), frame_count=total, rejected_reason="too_short")
+
+    # Sample uniformly across the video.
+    indices = np.linspace(0, total - 1, sample_frames).astype(int)
+
+    yaws: List[float] = []
+    face_centers: List[Tuple[float, float]] = []
+    face_detected = 0
+
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+        try:
+            bbox, _ = detector(frame)
+        except Exception:
+            bbox = None
+        if bbox is None:
+            continue
+        face_detected += 1
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        face_centers.append((cx, cy))
+        yaw = detector.last_pose_yaw
+        if yaw is not None:
+            yaws.append(float(yaw))
+
+    cap.release()
+
+    if not yaws or not face_centers:
+        return VideoScore(
+            path=str(video_path),
+            frame_count=total,
+            face_detected_ratio=face_detected / max(1, sample_frames),
+            rejected_reason="no_face",
+        )
+
+    yaw_arr = np.array(yaws)
+    centers = np.array(face_centers)
+    diffs = np.diff(centers, axis=0)
+    motion = float(np.median(np.linalg.norm(diffs, axis=1)))
+
+    return VideoScore(
+        path=str(video_path),
+        frame_count=total,
+        face_detected_ratio=face_detected / max(1, sample_frames),
+        yaw_mean=float(yaw_arr.mean()),
+        yaw_max_abs=float(np.max(np.abs(yaw_arr))),
+        motion_score=motion,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — Bucket + select
+# ---------------------------------------------------------------------------
+
+
+def _bucket(score: VideoScore) -> str:
+    """Assign a single bucket to a VideoScore. Sets `rejected_reason` if rejected."""
+    if score.rejected_reason:
+        return "reject"
+    if score.frame_count < MIN_FRAMES:
+        score.rejected_reason = "too_short"
+        return "reject"
+    if score.face_detected_ratio < 0.4:
+        score.rejected_reason = "low_face_ratio"
+        return "reject"
+    if score.yaw_max_abs > YAW_SIDE_MAX:
+        score.rejected_reason = "extreme_yaw"
+        return "reject"
+    if score.sync_conf is not None and score.sync_conf < SYNC_CONF_MIN:
+        score.rejected_reason = "low_sync_conf"
+        return "reject"
+    # Bucketing: side_face wins over fast_motion only if motion is below threshold.
+    if score.yaw_max_abs >= YAW_SIDE_MIN:
+        return "side_face"
+    if score.motion_score >= MOTION_FAST_THRESHOLD:
+        return "fast_motion"
+    return "frontal"
+
+
+def _select(scored: List[VideoScore], target_count: int) -> Dict[str, List[VideoScore]]:
+    """Pick the top-N per bucket per TARGET_RATIO."""
+    buckets: Dict[str, List[VideoScore]] = defaultdict(list)
+    for s in scored:
+        s.bucket = _bucket(s)
+        if s.bucket != "reject":
+            buckets[s.bucket].append(s)
+
+    selected: Dict[str, List[VideoScore]] = {}
+    leftovers: Dict[str, List[VideoScore]] = {}
+
+    for cat, ratio in TARGET_RATIO.items():
+        n_target = max(1, round(target_count * ratio))
+        pool = sorted(
+            buckets.get(cat, []),
+            key=lambda x: (x.yaw_max_abs if cat == "side_face" else x.motion_score),
+            reverse=(cat == "side_face"),
+        )
+        selected[cat] = pool[:n_target]
+        leftovers[cat] = pool[n_target:]
+
+    # Backfill from other categories if any is short, to hit target_count total.
+    have = sum(len(v) for v in selected.values())
+    if have < target_count:
+        flat = [s for cat, vs in leftovers.items() for s in vs]
+        flat.sort(key=lambda x: x.yaw_max_abs, reverse=True)
+        for s in flat:
+            if have >= target_count:
+                break
+            if s.bucket not in selected:
+                s.bucket = "side_face"  # treat as side_face for backfill
+                selected["side_face"].append(s)
+                have += 1
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — Materialize
+# ---------------------------------------------------------------------------
+
+
+def _copy_selected(
+    selected: Dict[str, List[VideoScore]],
+    out_dir: Path,
+) -> List[Path]:
+    """Copy (link) each kept video into out_dir/<bucket>/<idx>.mp4 and return the new paths."""
+    written: List[Path] = []
+    for cat, videos in selected.items():
+        sub = out_dir / cat
+        sub.mkdir(parents=True, exist_ok=True)
+        for i, v in enumerate(videos):
+            src = Path(v.path)
+            dst = sub / f"{i:03d}_{src.stem}.mp4"
+            if dst.exists() or dst.resolve() == src.resolve():
+                # Idempotent: skip if already linked in place.
+                if dst.exists():
+                    written.append(dst)
+                continue
+            try:
+                os.symlink(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+            written.append(dst)
+    return written
+
+
+def _write_fileslist(written: List[Path], fileslist_path: Path) -> None:
+    """One path per line, no header. Readable by LatentSync dataset loaders."""
+    with open(fileslist_path, "w") as f:
+        for p in sorted(written):
+            f.write(str(p.resolve()) + "\n")
+
+
+def _write_report(scored: List[VideoScore], selected: Dict[str, List[VideoScore]], out_dir: Path) -> None:
+    report = {
+        "total_candidates": len(scored),
+        "kept": sum(len(v) for v in selected.values()),
+        "by_bucket": {cat: [s.to_dict() for s in vs] for cat, vs in selected.items()},
+        "rejected": [s.to_dict() for s in scored if s.bucket == "reject"],
+        "thresholds": {
+            "yaw_frontal_max": YAW_FRONTAL_MAX,
+            "yaw_side_max": YAW_SIDE_MAX,
+            "motion_fast_threshold": MOTION_FAST_THRESHOLD,
+            "min_frames": MIN_FRAMES,
+        },
+    }
+    with open(out_dir / "curation_report.json", "w") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Curate a finetune dataset by yaw/motion buckets.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--urls", type=str, default=None,
+                        help="text file with one URL per line")
+    parser.add_argument("--url", type=str, action="append", default=None,
+                        help="single URL (repeat for multiple)")
+    parser.add_argument("--source-dir", type=str, default=None,
+                        help="local directory to scan for candidate video files")
+    parser.add_argument("--output-dir", type=str, required=True,
+                        help="where to put curated buckets, fileslist, and report")
+    parser.add_argument("--target-count", type=int, default=60,
+                        help="target total number of kept videos")
+    parser.add_argument("--max-candidates", type=int, default=300,
+                        help="hard cap on videos to scan (after download)")
+    parser.add_argument("--sample-frames", type=int, default=SAMPLE_FRAMES,
+                        help="frames subsampled per video for face detection")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="face detector device (cuda/cpu)")
+    parser.add_argument("--log", type=str, default="INFO")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=getattr(logging, args.log.upper()), format="%(asctime)s %(levelname)s %(message)s")
+
+    out_dir = Path(args.output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = out_dir / "_raw"
+
+    # ---- collect candidates ----
+    urls: List[str] = []
+    if args.urls:
+        with open(args.urls) as f:
+            urls.extend(line.strip() for line in f if line.strip())
+    if args.url:
+        urls.extend(args.url)
+    candidates: List[Path] = []
+    if urls:
+        logger.info("Downloading %d URLs via yt-dlp ...", len(urls))
+        candidates = _download_urls(urls, raw_dir, num_workers=4)
+    if args.source_dir:
+        candidates.extend(_materialize_local(Path(args.source_dir), raw_dir))
+    candidates = list(dict.fromkeys(candidates))  # de-dup
+    candidates = candidates[: args.max_candidates]
+    logger.info("Scoring %d candidate videos ...", len(candidates))
+
+    # ---- load face detector ----
+    try:
+        from latentsync.utils.face_detector import FaceDetector
+        detector = FaceDetector(device=args.device)
+    except Exception as exc:
+        logger.error("Could not load FaceDetector: %s", exc)
+        logger.error("Install insightface + run `python tools/download_checkpoints.py` first.")
+        sys.exit(1)
+
+    # ---- score ----
+    scored: List[VideoScore] = []
+    for p in tqdm(candidates, desc="score"):
+        try:
+            s = _score_one(p, detector, sample_frames=args.sample_frames)
+        except Exception as exc:
+            logger.warning("Failed to score %s: %s", p, exc)
+            s = VideoScore(path=str(p), rejected_reason="score_error")
+        scored.append(s)
+
+    # ---- select ----
+    selected = _select(scored, args.target_count)
+    kept_total = sum(len(v) for v in selected.values())
+    logger.info(
+        "Kept %d / %d (target=%d): %s",
+        kept_total, len(scored), args.target_count,
+        {k: len(v) for k, v in selected.items()},
+    )
+
+    # ---- materialize ----
+    written = _copy_selected(selected, out_dir)
+    _write_fileslist(written, out_dir / "fileslist.txt")
+    _write_report(scored, selected, out_dir)
+    logger.info(
+        "Done. fileslist at %s, report at %s/curation_report.json",
+        out_dir / "fileslist.txt", out_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()

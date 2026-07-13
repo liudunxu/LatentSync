@@ -1,0 +1,22 @@
+# Sample finetune curation URLs
+#
+# One URL per line. Lines beginning with '#' are ignored.
+# These are placeholders — fill in with real sources you have rights to use
+# (your own footage, CC0/CC-BY media, or internal datasets).
+#
+# Format hints:
+#   - YouTube links (youtube.com/watch?v=..., youtu.be/...)
+#   - Bilibili links (bilibili.com/video/...)
+#   - Douyin links (douyin.com/video/...)
+#
+# Badcase categories you likely want to cover:
+#   - Interviews with head turns  (side_face candidates)
+#   - Talk shows with gestures    (fast_motion candidates)
+#   - News anchors, formal speech  (frontal candidates)
+#   - 360° or selfie footage      (often extreme yaw → will be rejected)
+
+# --- To uncomment and edit ---
+
+# https://www.youtube.com/watch?v=XXXXXXXXXXX       # interview, side_face
+# https://www.youtube.com/watch?v=YYYYYYYYYYY       # news, frontal
+# https://www.youtube.com/watch?v=ZZZZZZZZZZZ       # vlog, fast_motion
