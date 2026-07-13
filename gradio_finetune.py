@@ -243,7 +243,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             "LoRA target 加 conv1/conv2/conv_shortcut/proj_in/proj_out/conv_in/conv_out\n"
             "(11 项,~25-30M params,3x capacity,够 cover 侧脸几何错位)。\n"
             "VRAM 占用 18-22GB(Lower lr 防过拟合; perceptual↑保细节)。\n"
-            "内容型嘴错见 🎯 Badcase Fix; 通用 baseline 见 ⚪ Stage 2 LoRA。"
+            "内容型嘴错见 🎯 Badcase Fix; 短剧多说话人见 🎬 Short Drama; 通用 baseline 见 ⚪ Stage 2 LoRA。"
         ),
         "lora": {
             "enabled": True,
@@ -258,6 +258,56 @@ PRESETS: Dict[str, Dict[str, Any]] = {
                 # Attention 1×1 conv re-mappers (latentsync/models/attention.py)
                 "proj_in", "proj_out",
                 # UNet input/output gates (latentsync/models/unet.py)
+                "conv_in", "conv_out",
+            ],
+            "qlora": False,
+        },
+    },
+    "🎬 Short Drama (LoRA+conv, 多说话人, 18-22GB)": {
+        "config_file": "configs/unet/stage2.yaml",
+        "resume_ckpt": "checkpoints/latentsync_unet.pt",
+        "batch_size": 1,
+        # Short drama 单段短(5-15s),长上下文稀释信号 — 回到 16
+        "num_frames": 16,
+        "resolution": 256,
+        "learning_rate": 3e-5,
+        "use_motion_module": True,
+        "pixel_space_supervise": True,
+        "use_syncnet": True,
+        # 短剧容错低,口型必须跟得紧
+        "sync_loss_weight": 0.18,
+        "perceptual_loss_weight": 0.20,
+        "recon_loss_weight": 1.0,
+        "trepa_loss_weight": 10.0,
+        "mixed_precision_training": True,
+        "enable_gradient_checkpointing": True,
+        "mask_image_path": "latentsync/utils/mask.png",
+        # 短剧 ckpt 多 — 频繁切 → 多存点
+        "save_ckpt_steps": 500,
+        "max_train_steps": 25000,
+        "lr_scheduler": "cosine",
+        "lr_warmup_steps": 300,
+        "description": (
+            "🟣 **推荐 — 短剧 (多说话人/频繁切场景)**\n"
+            "LoRA target 加 conv(同 Structural Fix 11 项),\n"
+            "sync_loss=0.18 容错低,save_ckpt_steps=500 短段多存。\n"
+            "数据准备:用 tools/preprocess_short_drama.py 把剧按场景切,\n"
+            "再走 curate_finetune_samples.py 分桶。\n"
+            "通用 baseline 见 ⚪ Stage 2 LoRA,单人 badcase 见 🟢 🎯 Badcase Fix。"
+        ),
+        "lora": {
+            "enabled": True,
+            "rank": 16,
+            "alpha": 32,
+            "dropout": 0.10,
+            "target_modules": [
+                # attention projections
+                "to_q", "to_k", "to_v", "to_out.0",
+                # Resnet convs
+                "conv1", "conv2", "conv_shortcut",
+                # Attention 1×1 conv re-mappers
+                "proj_in", "proj_out",
+                # UNet input/output gates
                 "conv_in", "conv_out",
             ],
             "qlora": False,
@@ -2582,6 +2632,20 @@ pipe(
                     outputs=bc_recommendation,
                 )
 
+            with gr.Accordion("🎬 短剧专项诊断 (多说话人 / 频繁切场景)", open=False):
+                gr.Markdown(
+                    "对短剧类输入做额外的场景/说话人数量估计。"
+                    "基于 HSV histogram(场景切点)+ face bbox 聚类(说话人数),"
+                    "无新依赖;若有 face_recognition,会进一步用 embedding 精确聚类。"
+                )
+                drama_btn = gr.Button("🎬 跑短剧场景诊断", variant="primary")
+                drama_report = gr.Textbox(label="短剧诊断", lines=10, interactive=False)
+                drama_btn.click(
+                    fn=_diagnose_short_drama,
+                    inputs=[bc_video],
+                    outputs=drama_report,
+                )
+
             # On page (re)load: repopulate trainer status + run dropdown
             # from the in-process _TRAINER singleton. This survives browser
             # refreshes — the Python process keeps the training subprocess
@@ -2998,6 +3062,117 @@ def _recommend_finetune_preset(
         f"   {metric_summary}\n"
         "   四个指标都在合理范围内。生成质量可用,需要换风格/换脸再调 preset。"
     )
+
+
+def _diagnose_short_drama(
+    video_path: str,
+) -> str:
+    """Quick offline heuristic for short-drama scene/speaker counts.
+
+    Uses only cv2 + the existing face_detector (no new deps). Two
+    signals:
+
+      1. Shot count via HSV-histogram Bhattacharyya distance between
+         sampled frames (>0.4 ⇒ cut).
+      2. Speaker count via clustering of detected face-bbox centroids
+         across frames (KMeans K in [1, 5]). Crude but works without
+         face_recognition.
+
+    Pure-python; runs in a few seconds on CPU.
+    """
+    import numpy as np
+    import cv2
+    if not video_path:
+        return "❌ 请先上传视频"
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return f"❌ 视频无法打开: {video_path}"
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    if total < 30:
+        cap.release()
+        return f"❌ 视频太短 ({total} 帧)"
+
+    # Sample frames evenly
+    sample_n = min(64, max(20, total // 50))
+    indices = np.linspace(0, total - 1, sample_n).astype(int)
+
+    try:
+        from latentsync.utils.face_detector import FaceDetector
+        detector = FaceDetector(device="cpu")
+    except Exception as exc:
+        cap.release()
+        return f"❌ face_detector 加载失败: {exc}"
+
+    frames = []
+    bboxes = []  # list of [cx, cy, w, h]
+    yaws = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+        frames.append(frame)
+        bbox, _ = detector(frame)
+        if bbox is not None:
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            bboxes.append([cx / frame.shape[1], cy / frame.shape[0],
+                           (x2 - x1) / frame.shape[1], (y2 - y1) / frame.shape[0]])
+            if detector.last_pose_yaw is not None:
+                yaws.append(float(detector.last_pose_yaw))
+    cap.release()
+
+    # ---- shot count ----
+    shots = 1
+    for i in range(1, len(frames)):
+        a = cv2.cvtColor(frames[i - 1], cv2.COLOR_BGR2HSV)
+        b = cv2.cvtColor(frames[i], cv2.COLOR_BGR2HSV)
+        ha = cv2.calcHist([a], [0, 1], None, [8, 8], [0, 180, 0, 256])
+        hb = cv2.calcHist([b], [0, 1], None, [8, 8], [0, 180, 0, 256])
+        cv2.normalize(ha, ha); cv2.normalize(hb, hb)
+        if cv2.compareHist(ha, hb, cv2.HISTCMP_BHATTACHARYYA) > 0.4:
+            shots += 1
+
+    # ---- speaker count via greedy centroid clustering ----
+    speaker_count = 1
+    centroids: list = []
+    for bb in bboxes:
+        cx, cy, w, h = bb
+        placed = False
+        for c in centroids:
+            if (abs(cx - c[0]) < 0.18 and abs(cy - c[1]) < 0.18
+                    and abs(w - c[2]) < 0.15 and abs(h - c[3]) < 0.15):
+                placed = True
+                break
+        if not placed:
+            centroids.append([cx, cy, w, h])
+            speaker_count += 1
+        if speaker_count >= 5:
+            break
+
+    # ---- summary text ----
+    avg_yaw = float(np.mean(np.abs(yaws))) if yaws else 0.0
+    duration_s = total / fps
+    print_lines = [
+        f"🎬 短剧场景诊断",
+        f"   时长:           {duration_s:.1f}s  ({total} 帧 @ {fps:.1f}fps)",
+        f"   估计场景数:     {shots}",
+        f"   估计说话人数:   {speaker_count}",
+        f"   平均 yaw:       {avg_yaw:.1f}°",
+        f"   检出 face 帧:   {len(bboxes)} / {len(frames)}",
+        "",
+    ]
+    if speaker_count >= 2 or shots >= 3:
+        print_lines.extend([
+            "📋 推荐路径:",
+            "   数据:python tools/preprocess_short_drama.py --input <video> ...",
+            "   训练:Tab 1 preset 选 '🎬 Short Drama (LoRA+conv, 多说话人, 18-22GB)'",
+            "   数据集:先 preprocess_short_drama 切场景,再 curate_finetune_samples 分桶",
+        ])
+    elif speaker_count == 1 and shots <= 2:
+        print_lines.append("📋 这条看起来是单场景单人,常规 🎯 Badcase Fix 就够。")
+    return "\n".join(print_lines)
 
 
 def run_badcase_checklist(
