@@ -1,0 +1,648 @@
+# LatentSync Fine-tune Studio 用户指南
+
+> 配套代码：`gradio_finetune.py`
+> 配套文档：[training_pipeline.md](training_pipeline.md)
+> 目标读者：第一次使用 LatentSync 微调 UI 的工程师 / 研究员
+
+---
+
+## 0. 这是什么？
+
+**LatentSync Fine-tune Studio** = `gradio_finetune.py` 启动的 **Gradio Web 界面**，把 LatentSync 的"微调 UNet"全流程包成 6 个 Tab，**让你不用手写命令行**就能：
+
+```
+配数据集 → 选 preset → 启动训练 → 看曲线 → 验证效果 → 调推理参数
+```
+
+支持：
+- 6 个 UNet 训练 preset（Stage 1 / Stage 2 / Stage 2 Efficient / Stage 2 512 / **LoRA** / **QLoRA**）
+- 1 个 SyncNet 训练 preset
+- LoRA / QLoRA 微调（显存省 30-40%）
+- 实时 loss 监控、validation 视频预览、日志
+- 单 ckpt 推理 + 自动质量自检
+- 4 层 Identity 保护参数调节
+- HyperIQA / SyncNet 数据集质量分布
+
+**注意**：本 UI 只为**微调 UNet** 服务（也支持单独训 SyncNet）。
+
+---
+
+## 1. 安装与依赖
+
+### 1.1 系统要求
+
+| 组件 | 最低 | 推荐 |
+|---|---|---|
+| Python | 3.9+ | 3.10 |
+| PyTorch | 2.0+ | 2.1+ |
+| CUDA | 11.7+ | 12.x |
+| GPU 显存 | **12 GB**（QLoRA 256）| 24 GB（Stage 2 Efficient）|
+| 磁盘 | 20 GB（cache + checkpoint）| 50 GB+ |
+
+### 1.2 安装 LatentSync 本身
+
+按 `README.md` 标准流程：
+
+```bash
+cd LatentSync
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+source setup_env.sh   # 下载 whisper / VAE / SD ckpt
+```
+
+### 1.3 安装微调 / 验证额外依赖
+
+```bash
+# 基础（默认就要装）
+pip install gradio omegaconf pyyaml
+
+# LoRA / QLoRA 微调（必须）
+pip install peft bitsandbytes accelerate
+
+# 实验追踪（可选，二选一）
+pip install wandb             # 优先用 wandb
+# 或
+pip install tensorboard       # 备选
+
+# 评估（离线评测 / 质量自检需要）
+pip install lpips scikit-image matplotlib
+```
+
+### 1.4 下载额外 checkpoint
+
+```bash
+# 主模型
+huggingface-cli download ByteDance/LatentSync-1.6 latentsync_unet.pt --local-dir checkpoints
+huggingface-cli download ByteDance/LatentSync-1.6 stable_syncnet.pt --local-dir checkpoints
+
+# SyncNet 评估
+huggingface-cli download ByteDance/LatentSync-1.5 syncnet_v2.model --local-dir checkpoints/auxiliary
+huggingface-cli download ByteDance/LatentSync-1.5 koniq_pretrained.pkl --local-dir checkpoints/auxiliary
+```
+
+最终目录：
+```
+checkpoints/
+├── latentsync_unet.pt
+├── stable_syncnet.pt
+└── auxiliary/
+    ├── syncnet_v2.model
+    └── koniq_pretrained.pkl
+```
+
+---
+
+## 2. 启动 UI
+
+### 2.1 标准启动
+
+```bash
+python gradio_finetune.py
+```
+
+默认监听 `http://0.0.0.0:7861`。
+
+### 2.2 自定义端口 / 共享
+
+```bash
+# 改端口
+python gradio_finetune.py --port 8080
+
+# 远程访问（生成 72h 临时公网 URL）
+python gradio_finetune.py --share
+
+# 指定 host
+python gradio_finetune.py --host 127.0.0.1 --port 7861
+```
+
+### 2.3 在远程 GPU 机器上启动
+
+```bash
+# 1. ssh 到 GPU 机器
+ssh user@gpu-box
+
+# 2. 启动（绑定所有接口）
+python gradio_finetune.py --host 0.0.0.0 --port 7861 --share
+
+# 3. 浏览器访问
+# https://gpu-box:7861
+# 或临时公网 URL
+```
+
+### 2.4 启动后看到什么
+
+打开浏览器后：
+
+```
+🎛 LatentSync Fine-tune Studio
+
+[6 个 Tab]  1. 配置 & 启动 | 2. 训练监控 | 3. 推理对比
+            3.5 验证 | 4. Identity 保护 | 5. 数据集质量评估 | 6. Badcase 检查
+```
+
+---
+
+## 3. 完整工作流（推荐路径）
+
+```mermaid
+flowchart LR
+    S1[Tab 1: 选 preset<br/>配数据<br/>启动训练] --> S2[Tab 2: 看曲线<br/>查 val 视频]
+    S2 --> S3[Tab 3.5: 单 ckpt 推理<br/>质量自检]
+    S3 --> S4[Tab 3: 对比<br/>base vs ft]
+    S4 --> S5{效果满意?}
+    S5 -->|否| S6[Tab 4: 调 Identity<br/>Tab 6: 查 Badcase]
+    S5 -->|是| S7[✅ 发布]
+    S6 --> S7
+```
+
+---
+
+## 4. 6 个 Tab 详解
+
+### Tab 1：配置 & 启动（训练入口）
+
+**作用**：选 preset、填数据集、点"启动训练"。
+
+#### 4.1.1 选 Preset
+
+| Preset | 显存 | 用途 |
+|---|---|---|
+| **Stage 1 (256, 全量训练)** | 23 GB | 从零训视觉特征（少用） |
+| **Stage 2 (256, 推荐)** | 30 GB | 完整 Stage 2（默认） |
+| **Stage 2 Efficient (256, 20GB)** | 20 GB | 显存不够时的妥协（关 TREPA） |
+| **Stage 2 512 (高分辨率)** | 55 GB | 高分辨率（需要大卡） |
+| **Stage 2 LoRA (256, 12-15GB)** | **12-15 GB** | **推荐入门** |
+| **Stage 2 QLoRA (256, 8-10GB)** | **8-10 GB** | 显存极限（16GB 卡） |
+| **SyncNet 训练** | 12 GB | 单独训 SyncNet |
+
+**改 preset 时**：所有超参滑块自动填好默认值，可微调。
+
+#### 4.1.2 配数据集
+
+三种方式选数据集：
+
+**方式 A：填 train_data_dir**
+```
+textbox: /data/my_high_quality_videos
+```
+- 目录下所有 .mp4 都会被加载
+- 适合"我有一堆处理好的视频"
+
+**方式 B：填 train_fileslist**
+```
+textbox: /data/my_high_quality_videos/fileslist.txt
+```
+- 文件每行一个绝对路径
+- 适合"我有自定义文件列表"
+
+**方式 C：从下拉框选**
+```
+dropdown: 选 preprocess/high_visual_quality/...
+```
+- 自动填到 train_data_dir
+
+#### 4.1.3 关键超参
+
+| 字段 | 默认 | 何时调 |
+|---|---|---|
+| batch_size | 1 | 多卡时改大 |
+| num_frames | 16 | 改 8 / 32 试 |
+| resolution | 256 | 512 需大卡 |
+| learning_rate | 1e-5 | LoRA 用 5e-5，QLoRA 用 2e-4 |
+| use_motion_module | true | Stage 1 时关 |
+| pixel_space_supervise | true | Stage 1 时关 |
+| use_syncnet | true | Stage 1 时关 |
+| sync_loss_weight | 0.05 | sync 差时调到 0.1 |
+| perceptual_loss_weight | 0.1 | 嘴糊时调到 0.3 |
+| recon_loss_weight | 1.0 | 通常不动 |
+| trepa_loss_weight | 10.0 | efficient 关 |
+| enable_gradient_checkpointing | true | 显存不够时必须开 |
+| save_ckpt_steps | 10000 | 调小能多存几个 |
+| max_train_steps | 10000000 | **必调**，按数据集大小算 |
+
+#### 4.1.4 高级设置
+
+| 字段 | 用途 |
+|---|---|
+| mask_image_path | 256 用 mask.png，512 用 mask2.png |
+| nproc_per_node | torchrun 卡数（多卡时改大） |
+| master_port | 端口，避免冲突 |
+| extra_env | 临时环境变量，如 `LATENTSYNC_TRACKER=wandb` |
+
+#### 4.1.5 启动
+
+点 **🚀 启动训练** 按钮：
+1. 生成 yaml 到 `debug/generated_configs/`
+2. 用 `torchrun` 启动训练（后台进程）
+3. 日志写到 `debug/training_logs/`
+4. 弹出状态条显示 pid / log path / 命令
+
+#### 4.1.6 停止
+
+点 **⏹ 停止训练** 按钮，会发 SIGINT 让训练优雅退出（10s 后 SIGKILL）。
+
+---
+
+### Tab 2：训练监控
+
+**作用**：实时看 loss 曲线、validation 视频、日志。
+
+#### 4.2.1 怎么看
+
+1. 填 `train_output_dir`（一般 `debug/unet`）
+2. 点 **🔄 刷新 run 列表**
+3. 从下拉框选 `train-2024-10-29-20:13:43/` 这种目录
+4. 自动加载：
+   - Loss / sync_conf 曲线（最新 PNG）
+   - Validation 视频列表（可点播放）
+   - 训练日志尾部 80 行
+   - 最新 checkpoint 信息
+5. **每 15 秒自动刷新**（用 gr.Timer）
+
+#### 4.2.2 跑了好几个 run 怎么对比
+
+切到不同 run 即可。所有 run 都保留，不会被覆盖。
+
+#### 4.2.3 找不到 run 怎么办
+
+- 检查 `train_output_dir` 路径对不对
+- 看 `debug/training_logs/` 有没有 log（log 写了但 run dir 还没建好时常见）
+
+---
+
+### Tab 3：推理对比（base vs fine-tuned）
+
+**作用**：用同一个输入视频，分别用 base 和 fine-tuned 两个 ckpt 跑，并排对比。
+
+#### 4.3.1 用法
+
+1. 上传 Input Video
+2. 上传 Input Audio
+3. 选 **Base checkpoint**（如官方 `latentsync_unet.pt`）
+4. 选 **Fine-tuned checkpoint**（如自己训的 `debug/unet/train-.../checkpoints/checkpoint-5000.pt`）
+5. 调 inference 参数（默认就够）
+6. 点 **🎬 生成对比**
+
+输出：两个 mp4，左右并排。
+
+---
+
+### Tab 3.5：验证（单 ckpt 推理 + 质量自检）⭐ 推荐
+
+**作用**：选 1 个 ckpt 直接推理，**自动做质量检查**（嘴糊/闪烁/人脸检测）。
+
+#### 4.3.1 用法
+
+1. 上传视频 + 音频
+2. 选 Checkpoint（你刚训的）
+3. 选 UNet config（必须和 ckpt 匹配）
+   - **256 ckpt** → `stage2.yaml`
+   - **512 ckpt** → `stage2_512.yaml`
+   - **LoRA-merged ckpt** → `stage2_lora.yaml`
+4. 调 inference 参数
+5. 勾选 `enable_deepcache`（推荐，快 2 倍）
+6. 点 **🚀 推理 + 质量自检**
+
+#### 4.3.2 输出三块
+
+**块 1：ckpt 兼容性检查**
+- 256/512 是否匹配
+- mask.png/mask2.png 是否匹配
+- LoRA adapter 是否未 merge
+
+**块 2：生成视频**（mp4 预览）
+
+**块 3：质量报告**
+```
+📦 Checkpoint: debug/unet/.../checkpoint-5000.pt
+⏱ 推理耗时: 12.3 秒
+🎞 总帧数: 240
+
+✅ 清晰度 156.7 (良好)
+   嘴糊比例: 12.0% (目标 < 30%)
+✅ 闪烁 3.45 (优秀)
+✅ 人脸检测 95% (绝大多数帧检测到)
+
+=== 建议 ===
+✅ 整体质量良好，可以用！
+```
+
+**调优建议**：
+- 嘴糊比例 > 30% → 升 512 / 加 LPIPS / 开 CodeFormer
+- 闪烁 > 8 → 开 TREPA / 加时序稳定
+- 人脸检测 < 70% → 查 [FaceMatch] 日志
+
+---
+
+### Tab 4：Identity 保护策略
+
+**作用**：调 LatentSync 的 4 层身份保持参数（L1/L3/L4），生成可粘贴的 Python kwargs。
+
+#### 4.4.1 三块参数
+
+| 层 | 控件 | 默认 | 何时调 |
+|---|---|---|---|
+| **L1** | ref 策略（random/adjacent/fixed_first_frame） | random | 想要 identity 更稳：adjacent |
+| **L3** | dynamic mask 大小（conservative/standard/aggressive） | standard | 大嘴 / 极端表情：aggressive |
+| **L4** | detail_strength + color_match_strength | 0.65 + 0.60 | 想要更贴皮肤：detail ↑ |
+
+#### 4.4.2 输出
+
+点 **📝 生成推理 kwargs / yaml** 按钮，得到：
+
+```python
+inference_kwargs = {
+    'dynamic_mask_pad_width_ratio': 1.5,
+    'dynamic_mask_pad_height_top_ratio': 1.3,
+    'dynamic_mask_pad_height_bottom_ratio': 2.2,
+    'paste_back_feather_sigma_px': 7.0,
+    'mouth_detail_strength': 0.65,
+    'color_match_strength': 0.60,
+}
+# 直接 pipe(video=..., audio=..., **inference_kwargs)
+```
+
+也能复用到 `gradio_app.py` / `api.py` 里。
+
+---
+
+### Tab 5：数据集质量评估
+
+**作用**：训前看你的数据集质量分布（HyperIQA + SyncNet_conf）。
+
+#### 4.5.1 用法
+
+1. 填 `high_visual_quality/` 目录路径
+2. 选采样数（默认 100）
+3. 点 **🔍 开始评估**
+
+#### 4.5.2 输出
+
+- 统计摘要（损坏数 / 太短数 / 平均 HyperIQA / 平均 SyncNet_conf）
+- 潜在问题列表
+- 分布直方图（HyperIQA 蓝、SyncNet_conf 绿）
+
+#### 4.5.3 何时用
+
+- **训前必跑**：先评估，再决定用多少数据训
+- 数据质量差（HyperIQA < 40）→ 重新跑 preprocess
+- sync 差（SyncNet_conf < 3）→ 重新跑 sync_av
+
+---
+
+### Tab 6：Badcase 检查清单
+
+**作用**：对单个生成视频跑全套质量检查（参考 §13 评估指标）。
+
+#### 4.6.1 用法
+
+1. 上传生成结果视频
+2. （可选）上传原始参考视频（用于 identity sim）
+3. 点 **🔍 跑 Badcase 检测**
+
+#### 4.6.2 输出 4 个指标
+
+| 指标 | 目标 | 不达标怎么办 |
+|---|---|---|
+| 嘴糊比例 | < 30% | 升 512 / 加 LPIPS / 开 CodeFormer |
+| 闪烁评分 | < 8 | 开 TREPA / Motion Module 训够 |
+| 唇音同步 | > 7 | 重训 SyncNet / 加大 sync_loss |
+| 身份保持 | > 0.8 | 检查 ref 窗口 / 调 identity_similarity |
+
+---
+
+## 5. 实际使用案例
+
+### 5.1 案例 1：个人数字分身（消费级 GPU）
+
+**目标**：用自己的脸 + 声音生成 5 分钟视频
+**硬件**：RTX 4090（24GB）
+**数据**：自己录 30 分钟说话视频
+**预计时间**：2-4 小时
+
+```bash
+# 1. 数据预处理（按 docs/training_pipeline.md §3）
+./data_processing_pipeline.sh
+# 产出 data/high_visual_quality/ 下几十个 mp4
+
+# 2. 启动 UI
+python gradio_finetune.py
+
+# 3. 在 Tab 1：
+#    - Preset: Stage 2 LoRA (256, 12-15GB)
+#    - train_data_dir: data/high_visual_quality
+#    - max_train_steps: 3000
+#    - 启动
+
+# 4. 在 Tab 2 监控，等跑完
+
+# 5. 在 Tab 3.5：
+#    - 选训好的 checkpoint
+#    - 上传自己的视频测试
+#    - 看质量报告
+
+# 6. 满意了：合并 LoRA，部署到 api.py
+python -m scripts.merge_lora \
+    --base_ckpt checkpoints/latentsync_unet.pt \
+    --adapter_dir debug/unet_lora/.../checkpoints/checkpoint-3000 \
+    --out_ckpt debug/my_avatar.pt
+```
+
+### 5.2 案例 2：行业术语适配（云端 A100）
+
+**目标**：让 LatentSync 在医学/法律视频上表现更好
+**硬件**：1-2× A100
+**数据**：500 段领域视频
+**预计时间**：1-2 天
+
+```bash
+# 1. Tab 1：
+#    - Preset: Stage 2 (256, 推荐)
+#    - max_train_steps: 8000
+#    - nproc_per_node: 2 (双卡)
+#    - sync_loss_weight: 0.1（提高）
+
+# 2. Tab 3 对比 base vs ft
+
+# 3. Tab 6 检查 badcase，针对性调整
+```
+
+### 5.3 案例 3：完整评估
+
+```bash
+# 1. 训练完成后，用 scripts/evaluate_checkpoint.py
+python -m scripts.evaluate_checkpoint \
+    --ckpt_path debug/unet/.../checkpoint-5000.pt \
+    --unet_config configs/unet/stage2.yaml \
+    --test_fileslist data/test/fileslist.txt \
+    --out_dir debug/eval_results/ckpt-5000
+
+# 产出：
+#   debug/eval_results/ckpt-5000/
+#   ├── evaluation_report.json    # 所有指标聚合
+#   ├── report.html               # 可分享的 HTML 报告
+#   └── fake_videos/              # 生成的视频
+```
+
+---
+
+## 6. 常见问题 FAQ
+
+### Q：训练启动后立刻报错 torchrun not found？
+A：`pip install torch` 没装全。重装或 `which torchrun` 确认在 PATH。
+
+### Q：Tab 1 启动后状态条显示 pid 但 Tab 2 看不到 run？
+A：训练刚启动，run 目录要第一个 save_ckpt_steps 之后才建。可以先去 `debug/training_logs/` 看 log。
+
+### Q：Tab 3.5 报 "inference failed" 怎么查？
+A：去看 `debug/validation_outputs/validation_*.log`，最后 30 行会有 traceback。
+
+### Q：怎么知道 LoRA 训好了没？
+A：Tab 6 跑 badcase 检查，嘴糊比例 < 30% 算合格。或 Tab 3.5 看自动质量报告。
+
+### Q：LoRA 训完的 adapter 怎么用？
+A：必须先 merge：
+```bash
+python -m scripts.merge_lora \
+    --base_ckpt checkpoints/latentsync_unet.pt \
+    --adapter_dir <adapter_dir> \
+    --out_ckpt <output.pt>
+```
+否则 Tab 3.5 会报 "ckpt 是 peft adapter" 警告。
+
+### Q：WandB 怎么开？
+A：装 `pip install wandb`，然后启动时设 `extra_env: LATENTSYNC_TRACKER=wandb`，或在训练前 `wandb login`。
+
+### Q：想跑 512 但只有 24GB 卡？
+A：不行。Stage 2 512 需要 55GB。要么用 256，要么换 QLoRA（仅 8-10GB）。
+
+### Q：可以同时跑多个训练吗？
+A：可以，但同一张卡只能跑一个（显存冲突）。多卡时每个训练占不同卡。
+
+### Q：训练中断了怎么续？
+A：本 UI 已集成 `TrainingState`，会自动从 `training_state.pt` 恢复 optimizer / scaler / RNG / step。**直接重新启动训练**即可（同名 run dir 即可，会自动续）。
+
+### Q：怎么对比多个 ckpt？
+A：Tab 3 支持两两对比。如果要批量对比，循环用 `scripts/evaluate_checkpoint.py`。
+
+---
+
+## 7. 文件位置速查
+
+| 内容 | 路径 |
+|---|---|
+| UI 主入口 | `gradio_finetune.py` |
+| 训练 yaml（生成） | `debug/generated_configs/*.yaml` |
+| 训练日志 | `debug/training_logs/unet_<ts>.log` |
+| 训练 run | `debug/unet/train-<ts>/` |
+|   ↳ checkpoints | `debug/unet/train-<ts>/checkpoints/checkpoint-<step>.pt` |
+|   ↳ validation 视频 | `debug/unet/train-<ts>/val_videos/val_video_<step>.mp4` |
+|   ↳ 训练 state（resume 用）| `debug/unet/train-<ts>/training_state.pt` |
+|   ↳ loss / sync_conf 图 | `debug/unet/train-<ts>/{loss_charts,sync_conf_results}/` |
+| LoRA 训练 | `debug/unet_lora/train_lora-<ts>/checkpoints/checkpoint-<step>/` |
+| 验证输出 | `debug/validation_outputs/validation_<ts>.mp4` |
+| 对比输出 | `debug/compare_outputs/{base,finetuned}_<ts>.mp4` |
+| 评估报告 | `debug/eval_results/<ckpt>/report.html` |
+
+---
+
+## 8. 进阶：CLI 等价命令
+
+UI 按钮对应的实际命令，方便复制粘贴到脚本：
+
+### 8.1 启动训练（对应 Tab 1）
+
+```bash
+# Stage 2 (256)
+torchrun --nnodes=1 --nproc_per_node=1 --master_port=25679 \
+    -m scripts.train_unet \
+    --unet_config_path configs/unet/stage2.yaml
+
+# LoRA
+torchrun --nnodes=1 --nproc_per_node=1 --master_port=25680 \
+    -m scripts.train_unet_lora \
+    --unet_config_path configs/unet/stage2_lora.yaml
+
+# SyncNet
+torchrun --nnodes=1 --nproc_per_node=1 --master_port=25678 \
+    -m scripts.train_syncnet \
+    --config_path configs/syncnet/syncnet_16_pixel_attn.yaml
+```
+
+### 8.2 推理（对应 Tab 3.5 / Tab 3）
+
+```bash
+python -m scripts.inference \
+    --unet_config_path configs/unet/stage2.yaml \
+    --inference_ckpt_path checkpoints/latentsync_unet.pt \
+    --video_path input.mp4 \
+    --audio_path input.wav \
+    --video_out_path output.mp4 \
+    --inference_steps 20 \
+    --guidance_scale 1.5 \
+    --enable_deepcache
+```
+
+### 8.3 评估（对应"跑全套评估"）
+
+```bash
+python -m scripts.evaluate_checkpoint \
+    --ckpt_path checkpoints/latentsync_unet.pt \
+    --unet_config configs/unet/stage2.yaml \
+    --test_fileslist data/test/fileslist.txt \
+    --out_dir debug/eval_results/baseline
+```
+
+### 8.4 Merge LoRA（训练完成后必做）
+
+```bash
+python -m scripts.merge_lora \
+    --base_ckpt checkpoints/latentsync_unet.pt \
+    --adapter_dir debug/unet_lora/train_lora-.../checkpoints/checkpoint-5000 \
+    --out_ckpt debug/merged_5k.pt
+```
+
+### 8.5 数据预处理（Tab 5 之前）
+
+```bash
+./data_processing_pipeline.sh
+# input_dir 在脚本里改
+```
+
+---
+
+## 9. 安全 / 资源
+
+| 资源 | 限额 | 备注 |
+|---|---|---|
+| GPU 显存 | < 60 GB | 多任务会 OOM |
+| 磁盘 | 每个 run ~5-10 GB（checkpoint + val） | 定期清理 `debug/eval_results/` |
+| checkpoint 数量 | 默认无限 | 改 `save_ckpt_steps` 或加 top-k 清理 |
+| 训练时长 | 任意 | 但 ulimit 建议 1-3 天 |
+
+---
+
+## 10. 故障排查清单
+
+| 症状 | 可能原因 | 怎么查 |
+|---|---|---|
+| 启动 Tab 1 没反应 | GPU 进程冲突 | `nvidia-smi` 看占用 |
+| 训练秒挂 | ckpt 路径错 | 看 `debug/training_logs/` |
+| WandB 没曲线 | 没装 wandb | `pip install wandb` |
+| Tab 2 一直 0 run | 路径填错 | 检查 `train_output_dir` |
+| Tab 3.5 报 mask 错 | 256/512 混用 | 改 `unet_config` 选 stage2_512 |
+| 推理出来的脸不像 | ref 策略差 | Tab 4 改 ref_strategy |
+| sync 差 | SyncNet 没训稳 | 加大 batch_size 重训 |
+
+---
+
+## 11. 反馈 / 改进
+
+UI 是 100% Python + Gradio，跑得动就 OK。改坏就回滚：
+
+```bash
+git checkout main -- gradio_finetune.py
+```
+
+新功能建议直接提 PR。
