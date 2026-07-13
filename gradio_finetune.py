@@ -1020,10 +1020,16 @@ def run_validation(
             f"📜 完整 log: {log_path.relative_to(REPO_ROOT)}\n\n"
             f"最后 30 行:\n{tail_file(log_path, 30)}"
         )
-        # Return None for the video output (gr.Video can't handle empty
-        # string; None makes it show the previous video, which is the
-        # desired UX on failure).
-        return (None, warnings_text, err_text, str(out_mp4))
+        # Return gr.update(value=None) for the video output (Gradio >= 5
+        # postprocesses None / empty list as a (path, subtitle) tuple
+        # which gr.Video can't parse. gr.update keeps the previous value
+        # in the UI and avoids the ValueError).
+        return (
+            gr.update(value=None),
+            gr.update(value=warnings_text),
+            gr.update(value=err_text),
+            gr.update(value=str(out_mp4)),
+        )
 
     # Quality self-check
     if skip_quality_check:
@@ -1050,6 +1056,23 @@ def tail_file(path: Path, n_lines: int = 30) -> str:
         return "\n".join(data.splitlines()[-n_lines:])
     except Exception as e:
         return f"(log read failed: {e})"
+
+
+def _safe_video_update(value):
+    """Coerce arbitrary value to a gr.update that's safe for gr.Video in
+    Gradio 5.x.
+
+    Newer Gradio runs gr.Video.postprocess() on every value bound to
+    a Video component. If the value is None / "" / [] / a stale dict,
+    the postprocess raises 'Expected lists of length 2 or tuples of
+    length 2. Received: []'. This wrapper routes any unsafe value to
+    gr.update(value=None) which keeps the previous video on screen.
+    """
+    if not value:
+        return gr.update(value=None)
+    if isinstance(value, (list, tuple)) and len(value) == 0:
+        return gr.update(value=None)
+    return gr.update(value=value)
 
 
 # ---------------------------------------------------------------------------
@@ -1136,6 +1159,22 @@ def build_ui() -> gr.Blocks:
                         label="val_audio_path",
                         value="assets/demo1_audio.wav",
                     )
+
+                    # Quick-pick presets so the user can verify the full
+                    # launch path before plugging in their own data.
+                    gr.Markdown("#### 📌 常用路径示例（点击填入）")
+                    gr.Examples(
+                        examples=[
+                            ["preprocess/high_visual_quality", "preprocess/high_visual_quality/fileslist.txt"],
+                            ["data/train", "data/train/fileslist.txt"],
+                            ["data/my_avatar", "data/my_avatar/fileslist.txt"],
+                            ["data/multilingual", "data/multilingual/fileslist.txt"],
+                            ["assets", ""],
+                        ],
+                        inputs=[train_data_dir, train_fileslist],
+                        label=None,
+                    )
+
                     dataset_choices = gr.Dropdown(
                         choices=list_datasets(),
                         label="或从已有数据集选 (click 后填到 train_data_dir)",
@@ -1278,7 +1317,7 @@ def build_ui() -> gr.Blocks:
                 outputs=[loss_chart_img, val_video_dd, ckpt_info_box],
             )
             val_video_dd.change(
-                fn=lambda x: x,
+                fn=_safe_video_update,
                 inputs=val_video_dd,
                 outputs=val_video_player,
             )
