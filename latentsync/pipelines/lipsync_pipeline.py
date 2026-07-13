@@ -4462,7 +4462,49 @@ class LipsyncPipeline(DiffusionPipeline):
                     else:
                         audio_norm = 1.0
                     strength_scales[k] = 0.4 + 0.6 * float(min(max(audio_norm, 0.0), 1.0))  # 0.4x weak .. 1x strong
+
+                # ---- Vectorized precompute of mouth_deltas + continuity ----
+                # The per-frame loop below depends on the previous frame's
+                # stabilized output, so we cannot fully fuse it. But we can
+                # move ALL the GPU↔CPU syncs out of the per-frame loop:
+                # compute per-frame mouth_deltas in one batched op using
+                # decoded[k-1] as a proxy for stabilized[k-1] (error ≤ strength·delta,
+                # well inside the smoothstep knee width), then a single .tolist()
+                # yields both deltas and continuity. Replaces ~3 syncs/frame
+                # (32 syncs/batch) with one (per batch).
                 batch_mouth_deltas: List[Optional[float]] = [None] * decoded_latents.shape[0]
+                if prev_mouth_stabilized_valid and prev_mouth_stabilized is not None:
+                    prev_proxy_first = prev_mouth_stabilized.to(
+                        device=decoded_latents.device, dtype=decoded_latents.dtype
+                    )
+                else:
+                    # No valid prev: first frame's delta is undefined; pad
+                    # with zeros so continuity == 1 (no taper) for k=0 only.
+                    prev_proxy_first = decoded_latents[0]
+                if batch_len > 1:
+                    prev_proxy_rest = decoded_latents[:-1].detach()
+                    prev_proxy = torch.cat([prev_proxy_first.unsqueeze(0), prev_proxy_rest], dim=0)
+                else:
+                    prev_proxy = prev_proxy_first.unsqueeze(0)
+                mask_sum_per_frame = mouth_stabilize_mask.sum(dim=(1, 2, 3)).clamp_min(1e-6)
+                per_frame_deltas = (
+                    (decoded_latents - prev_proxy).abs() * mouth_stabilize_mask
+                ).sum(dim=(1, 2, 3)) / mask_sum_per_frame  # (B,)
+                if mouth_temporal_stabilization_max_delta > 0:
+                    eff_max_delta_tensor = torch.tensor(
+                        [mouth_temporal_stabilization_max_delta * s for s in max_delta_scales],
+                        device=decoded_latents.device,
+                        dtype=decoded_latents.dtype,
+                    )  # (B,)
+                    per_frame_continuity = (
+                        1.0 - (per_frame_deltas / eff_max_delta_tensor).clamp(0.0, 1.0)
+                    ) ** 2  # (B,)
+                else:
+                    per_frame_continuity = torch.ones_like(per_frame_deltas)
+                # ONE GPU→CPU sync for the whole batch.
+                deltas_list = per_frame_deltas.tolist()
+                continuity_list = per_frame_continuity.tolist()
+
                 for k in range(decoded_latents.shape[0]):
                     if inference_skip_mask[k] or inference_continuity_break_mask[k]:
                         prev_mouth_stabilized = None
@@ -4481,13 +4523,9 @@ class LipsyncPipeline(DiffusionPipeline):
                             mouth_temporal_stabilization_max_delta * max_delta_scales[k]
                         ) if mouth_temporal_stabilization_max_delta > 0 else 0.0
                         if eff_max_delta > 0:
-                            mask_k = mouth_stabilize_mask[k]
-                            mask_sum = mask_k.sum().clamp_min(1e-6)
-                            mouth_delta = (
-                                (current_frame - prev_frame).abs() * mask_k
-                            ).sum() / mask_sum
-                            mouth_delta_values.append(float(mouth_delta.item()))
-                            batch_mouth_deltas[k] = float(mouth_delta.item())
+                            mouth_delta = deltas_list[k]
+                            mouth_delta_values.append(mouth_delta)
+                            batch_mouth_deltas[k] = mouth_delta
                             # Smoothstep taper: full blend at delta==0, zero at
                             # delta>=eff_max_delta. The hard "continue" was removed so
                             # very large mouth motion (head turn / scene cut) now
@@ -4496,14 +4534,11 @@ class LipsyncPipeline(DiffusionPipeline):
                             # carry-state reset (prev_mouth_stabilized := current)
                             # is still applied so the next frame blends from a
                             # fresh baseline.
-                            continuity = 1.0 - (
-                                mouth_delta / eff_max_delta
-                            ).clamp(0.0, 1.0)
-                            continuity = continuity * continuity
+                            continuity = continuity_list[k]
                             effective_stabilization_strength = (
-                                mouth_temporal_stabilization_strength * strength_scales[k] * float(continuity.item())
+                                mouth_temporal_stabilization_strength * strength_scales[k] * continuity
                             )
-                            if float(mouth_delta.item()) > eff_max_delta:
+                            if mouth_delta > eff_max_delta:
                                 mouth_stabilization_delta_skip_count += 1
                                 prev_mouth_stabilized = current_frame.detach()
                                 prev_mouth_stabilized_valid = True
