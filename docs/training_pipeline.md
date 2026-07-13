@@ -61,6 +61,34 @@ flowchart LR
 #### 它解决什么问题？
 在训练 UNet 时充当"判官"——如果 UNet 画的嘴型和音频不匹配，SyncNet 会通过梯度"骂"UNet，让它必须听音频而不是偷懒看视觉。
 
+#### 推理阶段用不用 SyncNet？
+**不用。** SyncNet 是"训练阶段的老师"，不是"推理阶段的裁判"。
+
+UNet 训好之后，唇音同步的能力已经通过 SyncNet 的梯度反向传播烧进了 UNet 权重。推理时只需要 UNet + VAE + Whisper 三件套，SyncNet 完全不加载。
+
+```python
+# api.py / gradio_app.py / predict.py 实际加载
+vae     = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
+unet    = UNet3DConditionModel.from_config(...).to(device)
+unet.load_state_dict(ckpt["state_dict"])
+audio_encoder = Audio2Feature(model_path="checkpoints/whisper/tiny.pt")
+# 就这三个，没有 SyncNet
+```
+
+代码层面验证：`scripts/inference.py`、`api.py`、`gradio_app.py`、`predict.py`、`latentsync/pipelines/lipsync_pipeline.py` 里 **0 处引用** `StableSyncNet`。`AGENTS.md:147` 也明确标注 `stable_syncnet.py # SyncNet (lip-sync confidence, training only)`。
+
+#### 仓库里其实有两个 SyncNet，别搞混
+
+| 名称 | 文件 | 作用 | 推理用吗 |
+|---|---|---|---|
+| **StableSyncNet** | `latentsync/models/stable_syncnet.py` | UNet Stage 2 训练的 `L_sync` 监督者 | ❌ 仅训练 |
+| **SyncNetEval** | `eval/syncnet.py` | Joon Son Chung 原始 SyncNet（`syncnet_v2.model`） | ❌ 仅离线评估 |
+
+SyncNetEval 用在：
+- 数据预处理算 AV offset（`preprocess/sync_av.py`）
+- 训练时验证生成的 val_video（`scripts/train_unet.py:489`）
+- 离线评估（`eval/eval_sync_conf.sh`）
+
 #### 能不能独立训练？
 **能。** SyncNet 完全独立于 UNet，本质就是一个二分类器，论文甚至把它当通用工具贡献了出来。
 - 数据：任意带人脸的视频 + 内嵌音频（必须先做音视频对齐，详见 §3）。
