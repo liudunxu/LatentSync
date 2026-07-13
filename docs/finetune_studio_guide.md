@@ -524,6 +524,7 @@ python -m scripts.evaluate_checkpoint \
 | **大笑 / 大嘴 / 极端表情** | dynamic mask 被 clamp | 训练帮助有限，**主要靠数据**：加大笑样本 + Tab 4 `dynamic_mask_mode=aggressive` | 大笑 / 唱歌 / 打哈欠视频 |
 | **静音段还在动嘴** | 音频 RMS 太低 | **不用微调** → 调 `mouth_audio_motion_min_scale=0.7`（推理参数）| — |
 | **嘴角 / 外翻不自然** | 极端嘴型 + mask 边界 | Tab 1 选 `Stage 2 512` + `perceptual_loss_weight=0.2+` | 极端表情样本 |
+| **短剧多说话人 / 频繁切场** | 单人 pipeline 假设, 多脸 + 切点都退化 | Tab 1 选 `🎬 Short Drama` + §6.4 整流程 | 先 `tools/preprocess_short_drama.py` 切场景 |
 
 ### 6.2 按你的 GPU 显存选配方
 
@@ -684,6 +685,149 @@ flowchart TD
 3. 用 Tab 4 调 `dynamic_mask_mode=aggressive` 试一下
 4. 看 `_estimate_yaw_degrees` 是否需要本地化调
 5. **别动 mask**（AGENTS.md 警告）
+
+### 6.4 短剧微调专项（多说话人 + 频繁切场景）🎬
+
+> **本节针对**短剧/有声漫画/对谈类视频**:同一画面经常有 2-4 个说话人,场景切得很频繁(每 3-10 秒一次)**。默认的 LatentSync pipeline 假设一帧一主角,套到短剧上会有:第 2 张脸被当成 paste-back 糊掉、audio 跟错人、场景切后第一帧触发 face_jump 跳到原帧。本节给出**端到端流程**,全部基于现有工具,无需改 model。**
+
+#### 6.4.1 为什么不能直接用现有 🎯 / 🧩 preset?
+
+| preset | 设计场景 | 短剧失败点 |
+|---|---|---|
+| 🎯 Badcase Fix | 单人内容型 badcase | num_frames=24 对短段(5-15s)太长,稀释信号 |
+| 🧩 Structural Fix | 单人结构性侧脸 | 不覆盖多说话人路由、scene cut |
+| 🎬 Short Drama | **专为多说话人/切场景设计** | ✅ 推荐 |
+
+🎬 preset 的关键调整:
+- `target_modules` 加 conv(同 Structural Fix,11 项),capacity 够 cover 切点附近的脸几何漂
+- `sync_loss_weight=0.18`(短剧容错低,口型必须跟紧)
+- `num_frames=16`(单段短,长上下文稀释信号)
+- `save_ckpt_steps=500`(短段多,多存点方便挑最佳)
+
+#### 6.4.2 端到端流程(6 步)
+
+**前提:** 你有一段或多段**未切分的短剧 mp4**(每段几分钟到几十分钟),每段含 2-4 个说话人,场景频繁切换。
+
+##### Step 1:切场景 + 提单人 (`tools/preprocess_short_drama.py`)
+
+```bash
+python tools/preprocess_short_drama.py \
+    --input data/raw/ep01.mp4 \
+    --output-dir data/drama/ep01 \
+    --threshold 0.35 \
+    --min-shot-frames 24
+```
+
+做了什么:
+- HSV 直方图切场景(`threshold=0.35` 是短剧默认,可按切点多少调 0.25-0.40)
+- 每场景中间帧跑 face_detector,无人脸的扔掉
+- ffmpeg 切 mp4 + 切 wav(16000Hz mono)
+- 输出 `shots.json` 记录每场景 metadata(起止帧、fps、face bbox、yaw)
+
+可选:`--cluster-speakers` 用 face_recognition 给每场景打说话人 ID(需 `pip install face_recognition`)。
+
+产物:
+```
+data/drama/ep01/
+├── shots/shot000_f000xxx-f000yyy.mp4   # 单场景视频(可能仍有多脸,但通常 1-2 张)
+├── shots/shot000_f000xxx-f000yyy.wav   # 对应音频
+├── fileslist.txt                         # 所有 .mp4 路径,一行一个
+└── shots.json                            # 每场景的 meta + (可选)speaker_cluster
+```
+
+##### Step 2:逐桶分类 (`tools/curate_finetune_samples.py`)
+
+```bash
+python tools/curate_finetune_samples.py \
+    --source-dir data/drama/ep01 \
+    --output-dir data/drama/ep01_curated \
+    --target-count 1000 \
+    --scale medium
+```
+
+做什么:对 Step 1 切好的每个 shot 跑 face detection + motion 评分,按 yaw / motion 分到 `frontal` / `side_face` / `fast_motion` 三个桶。每跑过一次会 cache 到 `score_cache.jsonl`,re-curate 直接读 cache,几秒完成。
+
+产物:`data/drama/ep01_curated/{frontal,side_face,fast_motion}/<n>_<name>.mp4` + `fileslist.txt` + `curation_report.json`。
+
+⚠️ **注意:** cache key 是文件绝对路径,Step 1 重跑会改 shot 命名 → cache 失效。如果想保留 cache,Step 1 加 `--reuse-shots` (后续实现)。当前版本直接重跑 curate 即可。
+
+##### Step 3:数据准备完成度自检
+
+```bash
+cat data/drama/ep01_curated/curation_report.json | python -m json.tool | head -40
+```
+
+期望:
+- `kept >= 800`(scale=medium 目标 1000,允许 20% reject)
+- `by_bucket.frontal >= 300`
+- `by_bucket.side_face >= 250`(短剧切场景多,侧脸样本天然丰富)
+- `by_bucket.fast_motion >= 200`(场景硬切 → bbox 跳变)
+
+如果某个桶特别少,考虑:
+- `side_face` 少 → 数据里侧脸场景不够,回 Step 1 调 `--threshold` 切更细,或加更多原始素材
+- `fast_motion` 少 → 数据太静,可能不是真短剧
+
+##### Step 4:在 gradio Tab 1 配置训练
+
+1. 启动 gradio:
+   ```bash
+   python gradio_finetune.py --port 6006
+   ```
+2. Tab 1 顶部 preset 下拉,选 **`🎬 Short Drama (LoRA+conv, 多说话人, 18-22GB)`**。
+3. preset 自动填充:`num_frames=16, sync_loss=0.18, save_ckpt_steps=500, max_train_steps=25000, lr=cosine warmup=300`。
+4. **手动覆盖 `train_data_dir`** 为 Step 2 的 `data/drama/ep01_curated`。
+5. **手动覆盖 `train_fileslist`** 为 Step 2 的 `data/drama/ep01_curated/fileslist.txt`。
+6. 其余按需调:`batch_size`(显存够就 2)、`nproc_per_node`(多卡)。
+7. **🚀 启动训练**。
+
+训练时间参考(scale=medium, 单卡 A100):
+- ~6-12 小时完成 25000 步
+- 每 500 步存一个 ckpt,共约 50 个中间 ckpt
+
+##### Step 5:Tab 2 监控 + 选 ckpt
+
+1. Tab 2 选 run 目录,看 loss / sync_conf 曲线。
+2. **挑 ckpt 的标准**(短剧专项):
+   - 优先看 sync_conf 曲线**整体水平**(不是单点)
+   - **val_video 每 1k 步的 mp4** 用手机/平板快放,听+看:
+     - 说话人口型有没有跟音频
+     - 另一张脸有没有被错误驱动
+     - 切场景后第一帧有没有跳回原帧(face_jump 痕迹)
+3. 把候选 ckpt(2-3 个)记下来,下一步逐个验证。
+
+##### Step 6:Tab 3 / 3.5 / 6 验证 + merge + 推理
+
+1. **Tab 3.5 验证**:上传一段**全新的短剧片段**(训练集没见过的),选最佳 ckpt 推理,看 inference 输出。
+   - 看推理输出:说话人口型 / 另一张脸是否原样保留 / 切场景是否平滑
+2. **Tab 6 🎬 短剧专项诊断**:点开 accordion,跑「🎬 跑短剧场景诊断」。
+   - 看 `估计说话人数`:≥2 表示确实是多说话人
+   - 看 `估计场景数`:越大越接近"切场多"
+   - 系统会提示用 🎬 preset(若已识别为多说话人)
+3. **Tab 6 4 个核心指标**:blurry / flicker / sync / identity,重点看 `身份保持` 是否 ≥ 0.85(脸没漂)。
+4. **Tab 2 「🔀 合并 LoRA」accordion**:把最佳 LoRA adapter 折回 base,产物 `latentsync_unet.pt` 可独立部署。
+5. **批量推理**:把同一集的多个场景用 `preprocess_short_drama` 切好,逐段用 merged ckpt 跑 `scripts/inference.py` 推理,后用 ffmpeg concat。
+
+#### 6.4.3 故障排查
+
+| 症状 | 原因 | 修法 |
+|---|---|---|
+| Step 1 切出大量 1-2 帧的 micro-shot | `--threshold` 太低 | 提到 0.40-0.50 |
+| Step 1 漏掉大段切换 | `--threshold` 太高 | 降到 0.25 |
+| Step 1 大量 shot 无 face | 原始视频有大量纯文字/特效镜头 | 这些 shot 直接被丢,可以接受 |
+| Step 2 三个桶里 fast_motion=0 | 数据全是静态访谈 | 不是真短剧,走单人 🎯 preset |
+| 训练中 sync_conf 退化 | attn2 也在被 LoRA 改 | 勾 Tab 1 顶部 `freeze_attn2=True`(默认就是) |
+| 推理输出第二张脸被驱动 | audio diarization 失败,选了错的脸 | 当前版本无 fix;最简 workaround:每段 inference 前手动确认 active face |
+| 切场景后第一帧跳原图 | face_jump filter 触发 | 推理参数 `face_jump_threshold` 调高,或接受现状 |
+
+#### 6.4.4 局限(诚实声明)
+
+当前流程**没有改 model**,以下场景还没 cover:
+
+- **多说话人同时开口**(罕见但短剧里有):当前 Step 6 的 fallback 只选"最大脸"。
+- **密集场景** (>2 人同时入画):face_detector 跟踪容易丢。
+- **复杂切场**(镜头快速 zoom):直方图切场景可能误判。
+
+完整 multi-speaker routing(model 内置 audio→face 路由)是 Step 4,目前**未实现**(model 改动风险高,需要专门的 2-speaker 合成测试集验证)。
 
 ---
 
