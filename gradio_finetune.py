@@ -394,9 +394,9 @@ def build_config_from_form(
             "video_fps": 25,
             "audio_feat_length": [2, 2],
             "train_output_dir": train_output_dir or str(FINETUNE_BASE_DIR / "unet"),
-            "syncnet_config_path": preset["config_file"]
-            if "syncnet" not in preset["config_file"]
-            else preset["config_file"],
+            # train_unet.py loads this to get the StableSyncNet checkpoint path.
+            # It must point to a syncnet config, not the UNet config.
+            "syncnet_config_path": str(SYNCNET_CONFIG_DIR / "syncnet_16_pixel_attn.yaml"),
         },
         "ckpt": {
             "resume_ckpt_path": resume_ckpt or preset["resume_ckpt"],
