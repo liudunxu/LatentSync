@@ -1281,16 +1281,24 @@ def _prebuilt_choices() -> List[str]:
     return out
 
 
-def _run_init_prebuilt(dataset_choice: str, output_dir: str) -> str:
-    """Spawn `python -m tools.init_finetune_dataset` and stream output."""
+def _run_init_prebuilt(
+    dataset_choice: str, output_dir: str,
+) -> Tuple[str, str, str]:
+    """Spawn `python -m tools.init_finetune_dataset` and stream output.
+
+    On success, also returns (log_text, train_data_dir_value,
+    train_fileslist_value) so the gradio button handler can autofill
+    the launch form.
+    """
     dataset_choice = (dataset_choice or "").strip()
     output_dir = (output_dir or "").strip()
     if not dataset_choice:
-        return "❌ 请先选一个预制数据集(下拉里选)"
+        return ("❌ 请先选一个预制数据集(下拉里选)",
+                gr.update(), gr.update())
     if not output_dir:
-        return "❌ 输出目录为空"
-    # Parse `id — name` back to plain id.
+        return ("❌ 输出目录为空", gr.update(), gr.update())
     dataset_id = dataset_choice.split(" — ")[0].strip()
+
     cmd = [
         sys.executable, "-m", "tools.init_finetune_dataset",
         "--dataset", dataset_id,
@@ -1305,11 +1313,27 @@ def _run_init_prebuilt(dataset_choice: str, output_dir: str) -> str:
         if proc.returncode != 0:
             return (
                 f"❌ init 退出码 {proc.returncode}\n"
-                f"📜 log: {log_path}\n\n最后 60 行:\n{log_text[-6000:]}"
+                f"📜 log: {log_path}\n\n最后 60 行:\n{log_text[-6000:]}",
+                gr.update(), gr.update(),
             )
-        return f"✅ 完成\n📜 log: {log_path}\n\n{log_text[-6000:]}"
+        # Auto-fill paths for the launch form. The init script puts the
+        # curated buckets under <output-dir>/<id>/curated/.
+        curated_dir = (Path(output_dir).resolve() / dataset_id / "curated")
+        fileslist = curated_dir / "fileslist.txt"
+        summary = (
+            f"✅ 完成 — 已自动填到 launch 表单\n"
+            f"   train_data_dir:  {curated_dir}\n"
+            f"   train_fileslist: {fileslist}\n"
+            f"📜 log: {log_path}\n\n"
+            f"{log_text[-4000:]}"
+        )
+        return (
+            summary,
+            str(curated_dir),
+            str(fileslist),
+        )
     except FileNotFoundError as exc:
-        return f"❌ 启动失败: {exc}"
+        return (f"❌ 启动失败: {exc}", gr.update(), gr.update())
 
 
 def _run_merge_lora(
@@ -2194,7 +2218,7 @@ def build_ui() -> gr.Blocks:
                 prebuilt_btn.click(
                     fn=_run_init_prebuilt,
                     inputs=[prebuilt_dd, prebuilt_target],
-                    outputs=prebuilt_log,
+                    outputs=[prebuilt_log, train_data_dir, train_fileslist],
                 )
 
             # ---- 数据集一键准备 (download + curate) ----
