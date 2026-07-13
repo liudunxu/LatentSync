@@ -8,6 +8,10 @@
 
 ## 0. 这是什么？
 
+> **配套文档**：
+> - 本指南（**用户视角**）：怎么启动、怎么用 UI 各个 Tab、怎么用 CLI
+> - [training_pipeline.md](training_pipeline.md)（**技术深度**）：架构、损失函数、训练 pipeline、badcase 根因
+
 **LatentSync Fine-tune Studio** = `gradio_finetune.py` 启动的 **Gradio Web 界面**，把 LatentSync 的"微调 UNet"全流程包成 6 个 Tab，**让你不用手写命令行**就能：
 
 ```
@@ -487,7 +491,108 @@ python -m scripts.evaluate_checkpoint \
 
 ---
 
-## 6. 常见问题 FAQ
+## 6. Badcase 驱动的微调方式选择
+
+> **核心问题**：你遇到哪个 badcase → 该选哪种微调方式 / 数据集 / 推理参数？
+> 详细技术原理见 [training_pipeline.md §20](../training_pipeline.md#20-badcase-驱动的微调策略选择)；本节是**用户视角的速查表**。
+
+### 6.1 速查总表（用户视角）
+
+| 你看到的坏现象 | 根因 | 选哪个 Tab | 用什么数据/设置 |
+|---|---|---|---|
+| **嘴部糊、牙齿不清晰** | 256 分辨率不够 / LPIPS 权小 | Tab 1 选 `Stage 2 512` + `perceptual_loss_weight=0.3` | 准备 720p+ 高清视频 |
+| **嘴型对不上音频** | SyncNet 没训稳 / sync_loss 太小 | Tab 1 选 `Stage 2 (256)` + `sync_loss_weight=0.1` | 准备 1000+ 视频 |
+| **帧间闪烁（牙齿/胡须跳）** | TREPA 关闭 / Motion Module 没训够 | Tab 1 选 `Stage 2 Efficient` 反而**不要选**（关 TREPA）→ 用 `Stage 2 (256)`，TREPA=10 | 高质量视频 |
+| **侧脸 / 大角度失败** | landmark 检测 + mask 形状 | 训练帮助有限，**主要靠数据**：加 30%+ 侧脸样本 | 转头 / 侧脸视频 |
+| **身份丢失（不像原人物）** | ref 窗口差 + 训练数据少身份 | Tab 1 选 `Stage 2 (256)` | 多身份数据集 |
+| **Mask 边界接缝** | paste back blur 不够 | **不用微调** → Tab 4 调 `paste_back_blur_sigma=10+` | — |
+| **大笑 / 大嘴 / 极端表情** | dynamic mask 被 clamp | 训练帮助有限，**主要靠数据**：加大笑样本 + Tab 4 `dynamic_mask_mode=aggressive` | 大笑 / 唱歌 / 打哈欠视频 |
+| **静音段还在动嘴** | 音频 RMS 太低 | **不用微调** → 调 `mouth_audio_motion_min_scale=0.7`（推理参数）| — |
+| **嘴角 / 外翻不自然** | 极端嘴型 + mask 边界 | Tab 1 选 `Stage 2 512` + `perceptual_loss_weight=0.2+` | 极端表情样本 |
+
+### 6.2 按你的 GPU 显存选配方
+
+```mermaid
+flowchart TD
+    Q[你有多少显存?] -->|24GB+| F1[Full Stage 2<br/>解决 sync/闪烁/嘴糊最稳]
+    Q -->|16-20GB| F2[Full Stage 2 Efficient<br/>20GB, 关 TREPA]
+    Q -->|12-16GB| F3[QLoRA rank=16<br/>8-10GB, 4-bit base]
+    Q -->|8-12GB| F4[QLoRA rank=8<br/>基本只够个人音色]
+    Q -->|<8GB| F5[❌ 不支持训练]
+```
+
+### 6.3 选 Full 还是 LoRA？
+
+**决策表**：
+
+| 场景 | 推荐 | 理由 |
+|---|---|---|
+| 解决 sync 差 | **Full Stage 2** | LoRA 可能损失 attn2 能力 |
+| 解决闪烁 | **Full Stage 2** | LoRA 训时序有退化风险 |
+| 解决嘴糊 | **Full Stage 2 (512)** | LoRA adapter 表达力有限 |
+| 个人音色 | LoRA / QLoRA | 够用，省显存 |
+| 多任务（多语言/多风格）| LoRA 多 adapter | 每个 10MB，可热切换 |
+| 行业术语快速适配 | **Full Stage 2 Efficient** | 速度 + 效果平衡 |
+
+### 6.4 4 个万能起步配方
+
+#### 配方 A：解决嘴糊 + 闪烁（最常见需求）
+
+**Tab 1 配置**：
+- Preset: `Stage 2 512 (高分辨率)`
+- `perceptual_loss_weight`: 0.3
+- `trepa_loss_weight`: 10
+- `max_train_steps`: 10000-30000
+
+#### 配方 B：解决 sync 差
+
+**Tab 1 配置**：
+- Preset: `Stage 2 (256, 推荐)`
+- `sync_loss_weight`: 0.1
+- `max_train_steps`: 10000
+
+**前置**：如果 sync 极差，先单独重训 SyncNet（preset 选 `SyncNet 训练`，batch=1024）。
+
+#### 配方 C：个人音色（消费级 GPU）
+
+**Tab 1 配置**：
+- Preset: `Stage 2 LoRA (256, 12-15GB)`
+- 数据：30-60 分钟自己说话视频
+- `max_train_steps`: 2000-3000
+
+#### 配方 D：显存极限
+
+**Tab 1 配置**：
+- Preset: `Stage 2 QLoRA (256, 8-10GB)`
+- `max_train_steps`: 3000-5000
+
+### 6.5 训练后自检流程
+
+无论选哪个配方，训完都按这个顺序自检：
+
+```mermaid
+flowchart LR
+    A[训完] --> B[Tab 3.5 单 ckpt 推理]
+    B --> C[Tab 6 Badcase 检查]
+    C --> D{达标?}
+    D -->|是| E[Tab 3 对比 base vs ft]
+    D -->|否| F[查 FaceMatch 日志]
+    F --> G[针对性调]
+    G --> A
+```
+
+### 6.6 必读：完整技术原理
+
+本节是**用户视角的速查**。如果你想知道：
+- 为什么 Full Stage 2 解决 sync/闪烁最稳？
+- LoRA 为什么有 attn2 退化风险？
+- 各个 badcase 的根因到底是什么？
+
+请看 [training_pipeline.md §20](../training_pipeline.md#20-badcase-驱动的微调策略选择)（技术深度版）。
+
+---
+
+## 7. 常见问题 FAQ
 
 ### Q：训练启动后立刻报错 torchrun not found？
 A：`pip install torch` 没装全。重装或 `which torchrun` 确认在 PATH。
@@ -528,7 +633,7 @@ A：Tab 3 支持两两对比。如果要批量对比，循环用 `scripts/evalua
 
 ---
 
-## 7. 文件位置速查
+## 8. 文件位置速查
 
 | 内容 | 路径 |
 |---|---|
@@ -547,7 +652,7 @@ A：Tab 3 支持两两对比。如果要批量对比，循环用 `scripts/evalua
 
 ---
 
-## 8. 进阶：CLI 等价命令
+## 9. 进阶：CLI 等价命令
 
 UI 按钮对应的实际命令，方便复制粘贴到脚本：
 
@@ -612,7 +717,7 @@ python -m scripts.merge_lora \
 
 ---
 
-## 9. 安全 / 资源
+## 10. 安全 / 资源
 
 | 资源 | 限额 | 备注 |
 |---|---|---|
@@ -623,7 +728,7 @@ python -m scripts.merge_lora \
 
 ---
 
-## 10. 故障排查清单
+## 11. 故障排查清单
 
 | 症状 | 可能原因 | 怎么查 |
 |---|---|---|
@@ -637,7 +742,7 @@ python -m scripts.merge_lora \
 
 ---
 
-## 11. 反馈 / 改进
+## 12. 反馈 / 改进
 
 UI 是 100% Python + Gradio，跑得动就 OK。改坏就回滚：
 

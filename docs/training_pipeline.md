@@ -4396,6 +4396,8 @@ A：不会。LPIPS 衡量"和 GT 像不像"（越低越好），HyperIQA 衡量"
 
 > **核心问题**：哪个 badcase 最痛？就选对应的微调方式。
 > **原则**：**没有"一招治百病"**。每种 badcase 需要不同策略，Full fine-tune vs LoRA vs QLoRA 也各有适用场景。
+>
+> **用户视角速查**：见 [finetune_studio_guide.md §6](finetune_studio_guide.md#6-badcase-驱动的微调方式选择)。本节是**技术深度版**。
 
 ### 20.1 决策总图
 
