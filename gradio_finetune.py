@@ -201,6 +201,38 @@ PRESETS: Dict[str, Dict[str, Any]] = {
 
 
 # ---------------------------------------------------------------------------
+# Dataset path presets - real example files so the UI can be exercised end-to-end
+# ---------------------------------------------------------------------------
+
+DATASET_PRESETS: Dict[str, Dict[str, str]] = {
+    "assets 演示数据 (3 videos，可完整跑通)": {
+        "train_data_dir": "assets",
+        "train_fileslist": "data/demo_fileslist.txt",
+        "val_video_path": "assets/demo1_video.mp4",
+        "val_audio_path": "assets/demo1_audio.wav",
+    },
+    "assets 演示数据 (仅目录，自动生成 fileslist)": {
+        "train_data_dir": "assets",
+        "train_fileslist": "",
+        "val_video_path": "assets/demo1_video.mp4",
+        "val_audio_path": "assets/demo1_audio.wav",
+    },
+    "preprocess/high_visual_quality (示例路径)": {
+        "train_data_dir": "preprocess/high_visual_quality",
+        "train_fileslist": "preprocess/high_visual_quality/fileslist.txt",
+        "val_video_path": "assets/demo1_video.mp4",
+        "val_audio_path": "assets/demo1_audio.wav",
+    },
+    "data/train (示例路径)": {
+        "train_data_dir": "data/train",
+        "train_fileslist": "data/train/fileslist.txt",
+        "val_video_path": "assets/demo1_video.mp4",
+        "val_audio_path": "assets/demo1_audio.wav",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Process management for background training
 # ---------------------------------------------------------------------------
 
@@ -436,6 +468,17 @@ def on_preset_change(preset_name: str) -> Tuple[Any, ...]:
         preset["mask_image_path"],
         preset["resume_ckpt"],
         preset["description"],
+    )
+
+
+def apply_dataset_preset(preset_name: str) -> Tuple[str, str, str, str]:
+    """Fill train_data_dir / train_fileslist / val paths from a dataset preset."""
+    preset = DATASET_PRESETS.get(preset_name, {})
+    return (
+        preset.get("train_data_dir", ""),
+        preset.get("train_fileslist", ""),
+        preset.get("val_video_path", "assets/demo1_video.mp4"),
+        preset.get("val_audio_path", "assets/demo1_audio.wav"),
     )
 
 
@@ -1143,13 +1186,20 @@ def build_ui() -> gr.Blocks:
             with gr.Row():
                 with gr.Column():
                     gr.Markdown("### 📂 数据集")
+                    dataset_preset_dd = gr.Dropdown(
+                        choices=list(DATASET_PRESETS.keys()),
+                        value="assets 演示数据 (3 videos，可完整跑通)",
+                        label="数据集预设 (Dataset Preset)",
+                    )
                     train_data_dir = gr.Textbox(
                         label="train_data_dir (目录)",
                         placeholder="data/my_high_quality_videos",
+                        value="assets",
                     )
                     train_fileslist = gr.Textbox(
                         label="train_fileslist (文件列表，一行一个 mp4)",
                         placeholder="data/my_high_quality_videos/fileslist.txt",
+                        value="data/demo_fileslist.txt",
                     )
                     val_video_path = gr.Textbox(
                         label="val_video_path",
@@ -1165,11 +1215,11 @@ def build_ui() -> gr.Blocks:
                     gr.Markdown("#### 📌 常用路径示例（点击填入）")
                     gr.Examples(
                         examples=[
+                            ["assets", "data/demo_fileslist.txt"],
                             ["preprocess/high_visual_quality", "preprocess/high_visual_quality/fileslist.txt"],
                             ["data/train", "data/train/fileslist.txt"],
                             ["data/my_avatar", "data/my_avatar/fileslist.txt"],
                             ["data/multilingual", "data/multilingual/fileslist.txt"],
-                            ["assets", ""],
                         ],
                         inputs=[train_data_dir, train_fileslist],
                         label=None,
@@ -1184,6 +1234,12 @@ def build_ui() -> gr.Blocks:
                         lambda x: x,
                         inputs=dataset_choices,
                         outputs=train_data_dir,
+                    )
+
+                    dataset_preset_dd.change(
+                        fn=apply_dataset_preset,
+                        inputs=dataset_preset_dd,
+                        outputs=[train_data_dir, train_fileslist, val_video_path, val_audio_path],
                     )
 
                 with gr.Column():
