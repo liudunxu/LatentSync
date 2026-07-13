@@ -65,6 +65,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -167,6 +168,54 @@ def _materialize_local(source_dir: Path, raw_dir: Path) -> List[Path]:
                     shutil.copy2(p, out)
             paths.append(out)
     return paths
+
+
+# ---------------------------------------------------------------------------
+# Score cache — persists per-video yaw/motion to JSONL so re-curating with
+# different (target_count, scale) skips face detection on already-scored
+# videos. Cache key = absolute resolved path; entries carry a fingerprint
+# of sample_frames + min_frames so a different scoring config invalidates.
+# ---------------------------------------------------------------------------
+
+
+def _load_score_cache(path: Path) -> Dict[str, dict]:
+    if not path.exists():
+        return {}
+    cache: Dict[str, dict] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = entry.get("path")
+                if key:
+                    cache[key] = entry
+    except OSError as exc:
+        logger.warning("could not read score cache %s: %s", path, exc)
+    return cache
+
+
+def _save_score_cache(path: Path, cache: Dict[str, dict]) -> None:
+    """Append-mode write with a short temp-write-replace; safe under SIGINT."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(tmp, "w") as f:
+            for entry in cache.values():
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("could not persist score cache to %s: %s", path, exc)
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — Score
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -425,15 +474,51 @@ def main():
         logger.error("Install insightface + run `python tools/download_checkpoints.py` first.")
         sys.exit(1)
 
-    # ---- score ----
+    # ---- score (with on-disk cache) ----
+    cache_path = out_dir / "score_cache.jsonl"
+    cache: Dict[str, dict] = _load_score_cache(cache_path)
     scored: List[VideoScore] = []
+    n_cache_hits = 0
     for p in tqdm(candidates, desc="score"):
+        key = str(p.resolve())
+        cached = cache.get(key)
+        if (
+            cached is not None
+            and cached.get("sample_frames") == args.sample_frames
+            and cached.get("min_frames") == args.min_frames
+        ):
+            vs = VideoScore(**{k: cached[k] for k in [
+                "path", "yaw_mean", "yaw_max_abs", "motion_score",
+                "frame_count", "face_detected_ratio", "sync_conf",
+            ] if k in cached})
+            vs.path = key
+            scored.append(vs)
+            n_cache_hits += 1
+            continue
         try:
             s = _score_one(p, detector, sample_frames=args.sample_frames, min_frames=args.min_frames)
         except Exception as exc:
             logger.warning("Failed to score %s: %s", p, exc)
             s = VideoScore(path=str(p), rejected_reason="score_error")
+        # best-effort: persist to cache (skip error rows)
+        if not s.rejected_reason:
+            cache[s.path] = {
+                "path": s.path,
+                "yaw_mean": s.yaw_mean,
+                "yaw_max_abs": s.yaw_max_abs,
+                "motion_score": s.motion_score,
+                "frame_count": s.frame_count,
+                "face_detected_ratio": s.face_detected_ratio,
+                "sync_conf": s.sync_conf,
+                "sample_frames": args.sample_frames,
+                "min_frames": args.min_frames,
+                "_cached_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            _save_score_cache(cache_path, cache)
         scored.append(s)
+
+    logger.info("Cache hits: %d / %d (rest freshly scored)",
+                n_cache_hits, len(candidates))
 
     # ---- select ----
     selected = _select(scored, args.target_count)

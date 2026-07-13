@@ -167,13 +167,99 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "mixed_precision_training": True,
         "enable_gradient_checkpointing": True,
         "mask_image_path": "latentsync/utils/mask.png",
-        "description": "LoRA 微调：adapter 仅 ~10MB，可多任务切换。需 pip install peft。",
+        "description": (
+            "⚪ Baseline LoRA。只 wrap 注意力投影(4 项),~10MB adapter。"
+            "适合泛用 finetune 或快速试训。结构性脸变形不 cover。"
+        ),
         "lora": {
             "enabled": True,
             "rank": 32,
             "alpha": 64,
             "dropout": 0.05,
             "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
+            "qlora": False,
+        },
+    },
+    "🎯 Badcase Fix (侧脸+运动, LoRA, 12-15GB)": {
+        "config_file": "configs/unet/stage2.yaml",
+        "resume_ckpt": "checkpoints/latentsync_unet.pt",
+        "batch_size": 1,
+        "num_frames": 24,
+        "resolution": 256,
+        "learning_rate": 5e-5,
+        "use_motion_module": True,
+        "pixel_space_supervise": True,
+        "use_syncnet": True,
+        "sync_loss_weight": 0.12,
+        "perceptual_loss_weight": 0.15,
+        "recon_loss_weight": 1.0,
+        "trepa_loss_weight": 10.0,
+        "mixed_precision_training": True,
+        "enable_gradient_checkpointing": True,
+        "mask_image_path": "latentsync/utils/mask.png",
+        "save_ckpt_steps": 1000,
+        "max_train_steps": 20000,
+        "lr_scheduler": "cosine",
+        "lr_warmup_steps": 200,
+        "description": (
+            "🟢 **推荐 — 内容型 badcase**\n"
+            "只 wrap 注意力,但 sync_loss↑到 0.12, num_frames=24,"
+            "cosine+200 warmup, 每 1k 步存 ckpt。\n"
+            "适用:嘴型/audio 同步、嘴糊、paste-back 外溢。\n"
+            "结构性脸变形见 🧩 Structural Fix。"
+        ),
+        "lora": {
+            "enabled": True,
+            "rank": 32,
+            "alpha": 64,
+            "dropout": 0.05,
+            "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
+            "qlora": False,
+        },
+    },
+    "🧩 Structural Fix (LoRA + conv, 18-22GB)": {
+        "config_file": "configs/unet/stage2.yaml",
+        "resume_ckpt": "checkpoints/latentsync_unet.pt",
+        "batch_size": 1,
+        "num_frames": 16,
+        "resolution": 256,
+        "learning_rate": 3e-5,
+        "use_motion_module": True,
+        "pixel_space_supervise": True,
+        "use_syncnet": True,
+        "sync_loss_weight": 0.05,
+        "perceptual_loss_weight": 0.20,
+        "recon_loss_weight": 1.0,
+        "trepa_loss_weight": 10.0,
+        "mixed_precision_training": True,
+        "enable_gradient_checkpointing": True,
+        "mask_image_path": "latentsync/utils/mask.png",
+        "save_ckpt_steps": 1000,
+        "max_train_steps": 30000,
+        "lr_scheduler": "cosine",
+        "lr_warmup_steps": 300,
+        "description": (
+            "🔴 **推荐 — 结构性 badcase**\n"
+            "LoRA target 加 conv1/conv2/conv_shortcut/proj_in/proj_out/conv_in/conv_out\n"
+            "(11 项,~25-30M params,3x capacity,够 cover 侧脸几何错位)。\n"
+            "VRAM 占用 18-22GB(Lower lr 防过拟合; perceptual↑保细节)。\n"
+            "内容型嘴错见 🎯 Badcase Fix; 通用 baseline 见 ⚪ Stage 2 LoRA。"
+        ),
+        "lora": {
+            "enabled": True,
+            "rank": 16,
+            "alpha": 32,
+            "dropout": 0.10,
+            "target_modules": [
+                # attention projections (latentsync/models/attention.py)
+                "to_q", "to_k", "to_v", "to_out.0",
+                # Resnet convs (latentsync/models/resnet.py)
+                "conv1", "conv2", "conv_shortcut",
+                # Attention 1×1 conv re-mappers (latentsync/models/attention.py)
+                "proj_in", "proj_out",
+                # UNet input/output gates (latentsync/models/unet.py)
+                "conv_in", "conv_out",
+            ],
             "qlora": False,
         },
     },
@@ -202,48 +288,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             "dropout": 0.05,
             "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
             "qlora": True,
-        },
-    },
-    "🎯 Badcase Fix (侧脸+运动, LoRA, 12-15GB)": {
-        "config_file": "configs/unet/stage2.yaml",
-        "resume_ckpt": "checkpoints/latentsync_unet.pt",
-        "batch_size": 1,
-        # num_frames 16→24: 更大的时序窗口对快速运动/mouth blur 更友好
-        "num_frames": 24,
-        "resolution": 256,
-        "learning_rate": 5e-5,
-        "use_motion_module": True,
-        "pixel_space_supervise": True,
-        "use_syncnet": True,
-        # sync_loss_weight 0.05→0.12: 侧脸/远嘴同步强化
-        "sync_loss_weight": 0.12,
-        # perceptual_loss_weight 0.10→0.15: 锐化嘴部,治嘴糊
-        "perceptual_loss_weight": 0.15,
-        "recon_loss_weight": 1.0,
-        "trepa_loss_weight": 10.0,
-        "mixed_precision_training": True,
-        "enable_gradient_checkpointing": True,
-        "mask_image_path": "latentsync/utils/mask.png",
-        # save_ckpt_steps 10000→1000: 同次训练产出更多 ckpt,便于挑最佳
-        "save_ckpt_steps": 1000,
-        # max_train_steps 10000→20000: 给 LoRA 足够时间吸收 badcase pattern
-        "max_train_steps": 20000,
-        # lr constant→cosine + warmup 200: 收敛更稳,晚段不卡
-        "lr_scheduler": "cosine",
-        "lr_warmup_steps": 200,
-        "description": (
-            "针对侧脸/嘴糊/快速转动 badcase 调优的 LoRA 微调。"
-            "sync_loss 提到 0.12 推同步,num_frames 24 给时序更多上下文,"
-            "cosine+200 warmup 收敛更稳。每 1k 步存 ckpt,便于挑最佳。"
-            "配合 tools/curate_finetune_samples.py 准备数据。"
-        ),
-        "lora": {
-            "enabled": True,
-            "rank": 32,
-            "alpha": 64,
-            "dropout": 0.05,
-            "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
-            "qlora": False,
         },
     },
     "SyncNet 训练": {
