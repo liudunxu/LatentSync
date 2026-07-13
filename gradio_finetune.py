@@ -1262,6 +1262,111 @@ def read_loss_from_checkpoint(ckpt_path: str) -> str:
         return f"(could not read checkpoint: {e})"
 
 
+def _compute_progress(run_dir: Optional[Path]) -> Dict[str, Any]:
+    """Pull step / max_step / elapsed / throughput / ETA for the run.
+
+    Returns a dict; missing data fields fall back to None / 0 so the
+    UI doesn't crash on freshly-started or stale runs.
+    """
+    if not run_dir or not Path(run_dir).exists():
+        return {"step": None, "max_step": None, "elapsed_s": 0,
+                "throughput": 0.0, "eta_s": None, "progress_pct": 0.0,
+                "latest_loss": None}
+
+    try:
+        ckpts = list_checkpoints_in_run(str(run_dir))
+        latest_ckpt = Path(ckpts[-1]) if ckpts else None
+        if latest_ckpt and not latest_ckpt.is_absolute():
+            latest_ckpt = REPO_ROOT / latest_ckpt
+        import torch as _torch
+        ckpt = _torch.load(str(latest_ckpt), map_location="cpu", weights_only=False)
+        step = int(ckpt.get("global_step", 0) or 0)
+        latest_loss = None
+        if ckpt.get("train_loss_list"):
+            latest_loss = float(ckpt["train_loss_list"][-1])
+    except Exception:
+        return {"step": None, "max_step": None, "elapsed_s": 0,
+                "throughput": 0.0, "eta_s": None, "progress_pct": 0.0,
+                "latest_loss": None}
+
+    # max_step from the yaml config that train_unet*.py copied into the
+    # run dir at startup.
+    max_step = None
+    try:
+        yamls = list(Path(run_dir).glob("*.yaml"))
+        if yamls:
+            cfg = OmegaConf.load(str(yamls[0]))
+            max_step = int(cfg.run.max_train_steps)
+    except Exception:
+        pass
+
+    # elapsed = wall-clock since _TRAINER.started_at (ISO string) OR
+    # from filesystem mtime of the run dir if trainer not registered.
+    elapsed_s = 0.0
+    try:
+        if _TRAINER.started_at:
+            from datetime import datetime as _dt
+            started = _dt.fromisoformat(_TRAINER.started_at)
+            elapsed_s = max(0.0, (_dt.now() - started).total_seconds())
+        elif Path(run_dir).exists():
+            elapsed_s = max(0.0, time.time() - Path(run_dir).stat().st_mtime)
+    except Exception:
+        pass
+
+    throughput = step / elapsed_s if elapsed_s > 0 else 0.0
+    eta_s = None
+    progress_pct = 0.0
+    if max_step and max_step > 0 and step > 0:
+        progress_pct = min(100.0, 100.0 * step / max_step)
+        if throughput > 0:
+            remaining = max(0, max_step - step)
+            eta_s = remaining / throughput
+        elif elapsed_s > 0 and progress_pct > 0:
+            # No throughput yet — best-effort linear extrapolation.
+            eta_s = (elapsed_s / (progress_pct / 100.0)) - elapsed_s
+
+    return {
+        "step": step,
+        "max_step": max_step,
+        "elapsed_s": elapsed_s,
+        "throughput": throughput,
+        "eta_s": eta_s,
+        "progress_pct": progress_pct,
+        "latest_loss": latest_loss,
+    }
+
+
+def _format_progress_text(p: Dict[str, Any]) -> str:
+    """Pretty-print progress dict for the gradio Textbox."""
+    if p["step"] is None:
+        return "⏸ 未启动 / 没有 checkpoint 可读"
+    step = p["step"]
+    max_step = p["max_step"] or "?"
+    pct = p["progress_pct"]
+    elapsed = p["elapsed_s"]
+    throughput = p["throughput"]
+    eta = p["eta_s"]
+    loss = p["latest_loss"]
+    loss_str = f", loss={loss:.4f}" if loss is not None else ""
+    throughput_str = f"{throughput:.2f} step/s" if throughput > 0 else "—"
+    if eta is None:
+        eta_str = "—"
+    elif eta < 60:
+        eta_str = f"{eta:.0f}s"
+    elif eta < 3600:
+        eta_str = f"{eta/60:.1f}min"
+    else:
+        eta_str = f"{eta/3600:.1f}h"
+    elapsed_str = (
+        f"{int(elapsed//3600)}h{int((elapsed%3600)//60)}m{int(elapsed%60)}s"
+        if elapsed >= 60 else f"{int(elapsed)}s"
+    )
+    return (
+        f"📈 step {step} / {max_step}  ({pct:.1f}%){loss_str}\n"
+        f"⏱ 已运行: {elapsed_str} | 速度: {throughput_str} | ETA: {eta_str}"
+    )
+
+
 def _run_curate_finetune(
     urls: str,
     source_dir: str,
@@ -1451,9 +1556,10 @@ def monitor_refresh(
     train_output_dir: str,
     selected_run: Optional[str],
     log_path: Optional[str],
-) -> Tuple[str, str, Any, str, str, Any]:
+) -> Tuple[Any, str, Any, str, str, str, str, float, str]:
     """Pull the latest snapshot. Returns: (run_dir_choices, selected_run_disp,
-    loss_chart, val_video_choices, log_tail, ckpt_info)."""
+    loss_chart, val_video_choices, log_tail, ckpt_info, trainer_status,
+    progress_pct, progress_text)."""
     base = _resolve_output_dir(train_output_dir)
     run_choices = list_run_dirs(base)
     run_dir = _resolve_run_dir(selected_run)
@@ -1473,6 +1579,9 @@ def monitor_refresh(
         f"pid: {_TRAINER.proc.pid if _TRAINER.proc else '-'} | "
         f"started: {_TRAINER.started_at or '-'}"
     )
+    progress = _compute_progress(run_dir)
+    progress_pct = float(progress["progress_pct"])
+    progress_text = _format_progress_text(progress)
     return (
         gr.update(choices=run_choices),
         str(run_dir) if run_dir else "",
@@ -1481,6 +1590,8 @@ def monitor_refresh(
         log_text,
         ckpt_info,
         status,
+        progress_pct,
+        progress_text,
     )
 
 
@@ -2043,6 +2154,18 @@ def build_ui() -> gr.Blocks:
 
 > ⚠️ **GPU 提示**：本页会本地拉起 `torchrun`。如果没有 CUDA，会启动失败。
 > 推荐在带 GPU 的机器上启动；如果在 CPU 机器上启动，至少能在 **Tab 1** 配置并保存 yaml 供远程训练使用。
+
+## 📚 文档导航
+
+| 文档 | 何时读 |
+|---|---|
+| [`docs/README.md`](docs/README.md) | 所有文档的总索引 |
+| [`docs/finetune_studio_guide.md`](docs/finetune_studio_guide.md) | 完整 finetune 操作手册 (preset 选择 / 数据准备 / badcase 排查 / 短剧 / 预制数据集) |
+| [`docs/short_drama_workflow.md`](docs/short_drama_workflow.md) | 短剧 1 页速查卡 |
+| [`docs/training_pipeline.md`](docs/training_pipeline.md) | 训练 deep reference (改 model 时看) |
+| [`docs/lipsync_optimization_roadmap.md`](docs/lipsync_optimization_roadmap.md) | 优化 roadmap + 已知瓶颈 |
+
+> 路径相对 `gradio_finetune.py` 启动目录;若用 systemd / docker 跑,改 `LATENTSYNC_FINETUNE_DIR` env 或软链 docs。
             """
         )
 
@@ -2416,12 +2539,23 @@ def build_ui() -> gr.Blocks:
             )
 
             monitor_btn = gr.Button("🔄 手动刷新", variant="primary")
+            with gr.Row():
+                progress_bar = gr.Slider(
+                    0, 100, value=0, step=0.1, interactive=False,
+                    label="📈 训练进度 (step / max_step, %)",
+                )
+                progress_text = gr.Textbox(
+                    label="⏱ 耗时 / 速度 / ETA",
+                    interactive=False,
+                    scale=2,
+                )
             monitor_btn.click(
                 fn=monitor_refresh,
                 inputs=[monitor_output_dir, run_dd, log_path_state],
                 outputs=[
                     run_dd, gr.Textbox(visible=False), loss_chart_img,
                     val_video_dd, log_box, ckpt_info_box, trainer_status,
+                    progress_bar, progress_text,
                 ],
             )
 
@@ -2432,6 +2566,7 @@ def build_ui() -> gr.Blocks:
                 outputs=[
                     run_dd, gr.Textbox(visible=False), loss_chart_img,
                     val_video_dd, log_box, ckpt_info_box, trainer_status,
+                    progress_bar, progress_text,
                 ],
             )
 
