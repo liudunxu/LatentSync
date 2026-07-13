@@ -2558,12 +2558,29 @@ pipe(
                     bc_identity = gr.Number(label="身份保持 (目标 > 0.8)")
                 with gr.Column():
                     bc_report = gr.Textbox(label="诊断报告", lines=20)
+                    bc_recommendation = gr.Textbox(
+                        label="🎯 finetune preset 推荐 (基于上面 4 个数字自动判定)",
+                        lines=4,
+                        interactive=False,
+                        value="跑完上方 🔍 检测后,这里会自动出推荐 preset。",
+                    )
 
             bc_check_btn.click(
                 fn=run_badcase_checklist,
                 inputs=[bc_video, bc_reference],
                 outputs=[bc_blurry, bc_flicker, bc_sync, bc_identity, bc_report],
             )
+
+            # Whenever any of the 4 metric numbers change, refresh the
+            # preset recommendation. Tab 6 re-run fills them all in one
+            # .click event, so the user sees the recommendation update
+            # immediately after the numbers settle.
+            for bc_metric in (bc_blurry, bc_flicker, bc_sync, bc_identity):
+                bc_metric.change(
+                    fn=_recommend_finetune_preset,
+                    inputs=[bc_blurry, bc_flicker, bc_sync, bc_identity],
+                    outputs=bc_recommendation,
+                )
 
             # On page (re)load: repopulate trainer status + run dropdown
             # from the in-process _TRAINER singleton. This survives browser
@@ -2904,6 +2921,84 @@ def _rearrange(tensor, pattern):
 # ---------------------------------------------------------------------------
 # Tab 6 helpers: Badcase Checklist
 # ---------------------------------------------------------------------------
+
+# Thresholds for the 🎯 vs 🧩 recommendation. Tweak if the heuristics misfire.
+_RECO_THRESHOLDS = {
+    "identity_critical": 0.70,   # < 0.70 → face geometry distorted
+    "identity_soft":    0.85,   # < 0.85 → suspicious, helps the multiplier
+    "sync_critical":     5.0,    # < 5.0 → audio-visual sync weak
+    "blurry_critical":   0.40,   # > 0.40 → 40%+ frames mouth-blurred
+    "flicker_critical":  12.0,   # > 12 → temporal flicker severe
+}
+
+
+def _recommend_finetune_preset(
+    blurry: Optional[float], flicker: Optional[float],
+    sync: Optional[float], identity: Optional[float],
+) -> str:
+    """Return a multi-line recommendation string given the 4 badcase metrics.
+
+    Rules (in order):
+      1. identity < 0.70                         → 🧩 Structural Fix
+      2. content issue AND identity 0.70-0.85    → 🧩 Structural Fix (cover both)
+      3. content issue AND identity >= 0.85     → 🎯 Content Fix
+      4. flicker > 12 alone (identity OK)       → 🎯 Content Fix
+      5. identity 0.70-0.85 alone (no content)   → 🧩 Structural Fix (mild drift)
+      6. all metrics OK                           → ⚪ no finetune needed
+    """
+    s = _RECO_THRESHOLDS
+    parts = []
+    if identity is not None:
+        parts.append(f"id={identity:.3f}")
+    if blurry is not None:
+        parts.append(f"blurry={blurry*100:.0f}%")
+    if flicker is not None:
+        parts.append(f"flicker={flicker:.1f}")
+    if sync is not None:
+        parts.append(f"sync={sync:.2f}")
+    metric_summary = ", ".join(parts) if parts else "(no metrics yet)"
+
+    if identity is not None and identity < s["identity_critical"]:
+        return (
+            "🧩 Structural Fix (LoRA + conv, 18-22GB)\n"
+            f"   {metric_summary}\n"
+            f"   身份保持 = {identity:.3f} < {s['identity_critical']:.2f} — "
+            "脸几何/五官位置异常,须 wrap 卷积层才能修。"
+        )
+    has_content_issue = (
+        (sync is not None and sync < s["sync_critical"])
+        or (blurry is not None and blurry > s["blurry_critical"])
+        or (flicker is not None and flicker > s["flicker_critical"])
+    )
+    structural_suspect = (
+        identity is not None
+        and s["identity_critical"] <= identity < s["identity_soft"]
+    )
+    if has_content_issue:
+        if structural_suspect:
+            return (
+                "🧩 Structural Fix (LoRA + conv, 18-22GB) — recommended (cover both)\n"
+                f"   {metric_summary}\n"
+                f"   内容型问题 + 身份保持 = {identity:.3f} 区间异常 → "
+                "先攻结构,顺带 cover 内容。"
+            )
+        return (
+            "🎯 Badcase Fix (LoRA, 12-15GB)\n"
+            f"   {metric_summary}\n"
+            f"   脸型 OK (id={identity:.3f}),内容指标越界 → att-only LoRA 就够。"
+        )
+    if identity is not None and identity < s["identity_soft"]:
+        return (
+            "🧩 Structural Fix (LoRA + conv, 18-22GB)\n"
+            f"   {metric_summary}\n"
+            f"   内容型指标正常,但身份保持 = {identity:.3f} 偏低 → 脸轮廓漂,加 conv wrap。"
+        )
+    return (
+        "⚪ 不需要 finetune / 用 Stage 2 LoRA baseline\n"
+        f"   {metric_summary}\n"
+        "   四个指标都在合理范围内。生成质量可用,需要换风格/换脸再调 preset。"
+    )
+
 
 def run_badcase_checklist(
     video_path: str, reference_video_path: Optional[str]
