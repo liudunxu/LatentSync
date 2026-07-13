@@ -1105,6 +1105,196 @@ trepa_loss_weight: 10
 > **本质：从"让单帧好看"升级到"让 16 帧作为一个整体好看"。**
 > **配合 Mixed Noise + Motion Module，是 LatentSync 解决"帧间闪烁"问题的三件套。**
 
+#### 5.8.13 TREPA 输入输出速查
+
+> 这一节单独讲 TREPA 的接口签名，方便快速复用 / 离线评估。
+
+##### 5.8.13.1 输入详解
+
+| 参数 | 形状 | 来源 | 值域 | dtype |
+|---|---|---|---|---|
+| `videos_fake` | `(B, 3, 16, 256, 256)` | UNet 输出 → VAE decode | `[-1, 1]` | fp16 |
+| `videos_real` | `(B, 3, 16, 256, 256)` | 数据集 `gt_pixel_values` | `[-1, 1]` | fp16 |
+
+> B 一般 = 1（UNet 训练时 batch_size），256 = 训练分辨率，16 = `num_frames`。
+
+##### 5.8.13.2 内部 5 步处理
+
+```python
+# latentsync/trepa/loss.py:33
+def __call__(self, videos_fake, videos_real):
+    # 1. 拆 batch 和帧
+    videos_fake = rearrange(videos_fake, "b c f h w -> (b f) c h w")
+    videos_real = rearrange(videos_real, "b c f h w -> (b f) c h w")
+
+    # 2. resize 到 224×224（VideoMAE-v2 预训练分辨率）
+    videos_fake = F.interpolate(videos_fake, size=(224, 224), mode="bicubic")
+    videos_real = F.interpolate(videos_real, size=(224, 224), mode="bicubic")
+
+    # 3. 还原 batch 维度
+    videos_fake = rearrange(videos_fake, "(b f) c h w -> b c f h w", f=16)
+    videos_real = rearrange(videos_real, "(b f) c h w -> b c f h w", f=16)
+
+    # 4. 像素范围 [-1,1] → [0,1]（VideoMAE 预训练范围）
+    videos_fake = (videos_fake / 2 + 0.5).clamp(0, 1)
+    videos_real = (videos_real / 2 + 0.5).clamp(0, 1)
+
+    # 5. VideoMAE-v2 提特征 → L2 norm → MSE
+    feats_fake = self.model.forward_features(videos_fake)  # (B, D)
+    feats_real = self.model.forward_features(videos_real)
+    feats_fake = F.normalize(feats_fake, p=2, dim=1)
+    feats_real = F.normalize(feats_real, p=2, dim=1)
+    return F.mse_loss(feats_fake, feats_real)
+```
+
+##### 5.8.13.3 输出详解
+
+| 输出 | 形状 | 类型 | 数值范围 | 含义 |
+|---|---|---|---|---|
+| `trepa_loss` | 标量 | `float` | 0 ~ 0.1+ | 时序特征距离，越小越一致 |
+
+**后续处理**（`scripts/train_unet.py:419`）：
+
+```python
+loss = (
+    recon_loss * config.run.recon_loss_weight        # 通常 1
+    + sync_loss * config.run.sync_loss_weight        # 通常 0.05
+    + lpips_loss * config.run.perceptual_loss_weight # 通常 0.1
+    + trepa_loss * config.run.trepa_loss_weight      # 通常 10
+)
+```
+
+**典型 loss 值范围**：
+- < 0.001：极好（16 帧时序特征几乎一致）
+- 0.001-0.01：好
+- 0.01-0.05：一般
+- 0.05+：差（明显时序不一致）
+
+##### 5.8.13.4 训练时的调用方式
+
+```python
+# scripts/train_unet.py:381-388
+if config.run.trepa_loss_weight != 0 and config.run.pixel_space_supervise:
+    # UNet 输出是 (B*16, 3, 256, 256)，reshape 回 (B, 3, 16, 256, 256)
+    trepa_pred_pixel_values = rearrange(pred_pixel_values, "(b f) c h w -> b c f h w", f=16)
+    trepa_gt_pixel_values   = rearrange(gt_pixel_values,   "(b f) c h w -> b c f h w", f=16)
+    trepa_loss = trepa_loss_func(trepa_pred_pixel_values, trepa_gt_pixel_values)
+```
+
+##### 5.8.13.5 离线评估用法（§13 提到的 TREPA score）
+
+```python
+from latentsync.trepa.loss import TREPALoss
+
+trepa = TREPALoss(device="cuda", with_cp=True)
+
+def trepa_score(real_video, gen_video):
+    """
+    输入 shape: (B, 3, 16, 256, 256) 范围的张量
+    像素值范围: [0, 1]
+    """
+    return trepa(gen_video, real_video).item()
+
+# 判读
+# < 0.001: 极好
+# 0.001-0.01: 好
+# 0.01-0.05: 一般
+# > 0.05: 差
+```
+
+> ⚠️ **注意**：训练时 `pred_pixel_values` / `gt_pixel_values` 是 `[-1, 1]` 范围；离线评估时如果直接用 `latentsync.trepa.loss.TREPALoss`，会做 `(/2 + 0.5).clamp(0, 1)` 自动转。如果你自己写评估代码，确保输入在 `[0, 1]` 范围或自己转换。
+
+#### 5.8.14 TREPA 推理阶段用不用？——**完全不用**
+
+> **直答**：TREPA **只在训练阶段**用，**推理阶段完全不用**。
+
+##### 5.8.14.1 代码验证
+
+```bash
+# 训练用 TREPA
+$ grep -rn "TREPALoss\|trepa_loss" scripts/ | head
+scripts/train_unet.py:50:from latentsync.trepa.loss import TREPALoss
+scripts/train_unet.py:212:        trepa_loss_func = TREPALoss(device=device, with_cp=True)
+scripts/train_unet.py:382:                trepa_loss = trepa_loss_func(...)
+scripts/train_unet.py:419:                + trepa_loss * config.run.trepa_loss_weight
+```
+
+```bash
+# 推理 / pipeline 完全不引用 TREPA
+$ grep -rn "TREPALoss\|trepa_loss" latentsync/pipelines/ api.py gradio_app.py scripts/inference.py
+# 无结果
+```
+
+##### 5.8.14.2 为什么推理不需要？
+
+| 原因 | 解释 |
+|---|---|
+| **训练时是 teacher** | TREPA 教 UNet "时序特征要对齐 GT" |
+| **训完能力已烧进 UNet 权重** | UNet 通过反传学会了"如何让 16 帧时序一致" |
+| **推理不需要 teacher** | 推理时只要 UNet 前向，不需要再"教"它 |
+| **省 VideoMAE-v2 加载** | ~2GB VRAM + 数秒启动时间 |
+
+**直觉类比**：
+> TREPA 像驾校教练。**学车时需要**（教你时序一致性），**上路后不需要**（你已会开）。
+
+##### 5.8.14.3 推理时用什么代替 TREPA 监督时序一致性？
+
+| 机制 | 在哪 | 替代 TREPA 的哪部分 |
+|---|---|---|
+| **Motion Module** | UNet 内部 | 跨帧时序建模（structural） |
+| **Mixed Noise** | 训练时加到 noise | 强制 UNet 学时序平滑（perceptual） |
+| **EMA smoothing** | 推理后处理 | 帧间像素级平滑 |
+| **mouth_temporal_stabilization** | 推理后处理 | 嘴部帧间稳定 |
+
+```mermaid
+flowchart LR
+    subgraph TRAIN[训练时 - 用 TREPA]
+        T1[UNet 生成] --> T2[TREPA 监督]
+        T2 --> T3[学到了]
+    end
+
+    subgraph INFER[推理时 - 不用 TREPA]
+        I1[Motion Module<br/>内建时序] --> I2[EMA smoothing<br/>嘴部稳定]
+        I2 --> I3[输出]
+    end
+
+    T3 -.能力已烧进.-> I1
+```
+
+##### 5.8.14.4 推理阶段用的 4 个时序相关后处理
+
+虽然 TREPA 不用，推理时**确实**有时序后处理，详见 §16 推理独有组件：
+
+| 后处理 | 作用 | 默认参数 |
+|---|---|---|
+| `_smooth_face_sequence` | 帧间 EMA（3-tap 三角核） | 默认开 |
+| `mouth_temporal_stabilization` | 嘴部 1-order EMA | strength=0.15 |
+| `mouth_motion_preserve` | 音频 RMS 自适应 | strength=0.45 |
+| `dynamic_region_mask` | 嘴部椭圆 mask | pad_width=1.5 |
+
+但这些是**像素级**处理，不是**特征级**监督。TREPA 走的是特征空间；后处理走的是像素空间。
+
+##### 5.8.14.5 想离线测"时序一致性"怎么办？
+
+虽然推理不跑 TREPA，**离线评估**可以单独加载 TREPA 算指标（参考 §13.3.3）：
+
+```python
+# eval/evaluate_checkpoint.py 风格的离线测
+from latentsync.trepa.loss import TREPALoss
+from decord import VideoReader
+import numpy as np
+
+trepa = TREPALoss(device="cuda", with_cp=True)
+vr = VideoReader("generated.mp4")
+frames = np.stack([f.asnumpy() for f in vr[:16]])
+# 注意：(3, 16, 256, 256) 范围 [0, 1]
+videos = torch.from_numpy(frames).permute(3, 0, 1, 2).unsqueeze(0).float() / 255.0
+videos = videos * 2 - 1  # 转到 [-1, 1]
+score = trepa(videos, videos_groundtruth).item()
+```
+
+但这只在离线评估时跑，**不进入推理流程**。
+
 ### 5.9 LPIPS & Pixel-Space Supervision：把嘴部"画清楚"
 
 > **一句话**：LPIPS 让 UNet 生成的嘴部**看起来像嘴**（像素级感知相似），pixel-space supervision 是 LPIPS / TREPA / Sync 三大损失能算的前提（因为它们都在像素空间算）。
