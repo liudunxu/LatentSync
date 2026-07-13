@@ -48,7 +48,14 @@ REPO_ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = REPO_ROOT / "configs" / "unet"
 SYNCNET_CONFIG_DIR = REPO_ROOT / "configs" / "syncnet"
 CHECKPOINT_DIR = REPO_ROOT / "checkpoints"
-TRAIN_OUTPUT_DIR = REPO_ROOT / "debug"
+
+# Fine-tuning intermediates (generated configs, training logs, run outputs,
+# audio embeds/mel caches) go to a separate large-disk directory by default.
+# Can be overridden with LATENTSYNC_FINETUNE_DIR env var.
+FINETUNE_BASE_DIR = Path(os.environ.get("LATENTSYNC_FINETUNE_DIR", "/root/autodl-tmp/latentsync_finetune"))
+FINETUNE_BASE_DIR.mkdir(parents=True, exist_ok=True)
+TRAIN_OUTPUT_DIR = FINETUNE_BASE_DIR
+
 ASSETS_DIR = REPO_ROOT / "assets"
 
 
@@ -281,7 +288,31 @@ def list_run_dirs(base: Path) -> List[str]:
     if not base.exists():
         return []
     runs = sorted([p for p in base.iterdir() if p.is_dir() and p.name.startswith("train-")])
-    return [str(p.relative_to(REPO_ROOT)) for p in runs]
+    # If base is inside REPO_ROOT, keep paths relative for compact display.
+    # Otherwise (e.g. /root/autodl-tmp/...), return absolute paths.
+    try:
+        return [str(p.relative_to(REPO_ROOT)) for p in runs]
+    except ValueError:
+        return [str(p) for p in runs]
+
+
+def _resolve_run_dir(selected_run: Optional[str]) -> Optional[Path]:
+    """Resolve a selected run path to an absolute Path."""
+    if not selected_run:
+        return None
+    p = Path(selected_run)
+    if p.is_absolute():
+        return p
+    # First try relative to REPO_ROOT (legacy / default small-disk layout)
+    repo_candidate = REPO_ROOT / p
+    if repo_candidate.exists():
+        return repo_candidate
+    # Then try relative to FINETUNE_BASE_DIR
+    finetune_candidate = FINETUNE_BASE_DIR / p
+    if finetune_candidate.exists():
+        return finetune_candidate
+    # Fallback: assume FINETUNE_BASE_DIR
+    return finetune_candidate
 
 
 def list_datasets() -> List[str]:
@@ -343,8 +374,8 @@ def build_config_from_form(
             "train_fileslist": train_fileslist or "",
             "val_video_path": val_video_path or str(ASSETS_DIR / "demo1_video.mp4"),
             "val_audio_path": val_audio_path or str(ASSETS_DIR / "demo1_audio.wav"),
-            "audio_embeds_cache_dir": str(REPO_ROOT / "debug" / "audio_embeds_cache"),
-            "audio_mel_cache_dir": str(REPO_ROOT / "debug" / "audio_mel_cache"),
+            "audio_embeds_cache_dir": str(FINETUNE_BASE_DIR / "audio_embeds_cache"),
+            "audio_mel_cache_dir": str(FINETUNE_BASE_DIR / "audio_mel_cache"),
             "batch_size": int(batch_size),
             "num_workers": int(num_workers),
             "num_frames": int(num_frames),
@@ -353,7 +384,7 @@ def build_config_from_form(
             "audio_sample_rate": 16000,
             "video_fps": 25,
             "audio_feat_length": [2, 2],
-            "train_output_dir": train_output_dir or "debug/unet",
+            "train_output_dir": train_output_dir or str(FINETUNE_BASE_DIR / "unet"),
             "syncnet_config_path": preset["config_file"]
             if "syncnet" not in preset["config_file"]
             else preset["config_file"],
@@ -566,7 +597,7 @@ def launch_training(
         logger.info("[launch_training] config built, train_output_dir=%s", cfg["data"]["train_output_dir"])
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        cfg_dir = REPO_ROOT / "debug" / "generated_configs"
+        cfg_dir = FINETUNE_BASE_DIR / "generated_configs"
         cfg_dir.mkdir(parents=True, exist_ok=True)
         cfg_path = cfg_dir / f"{preset_name.split()[0].lower()}_{ts}.yaml"
         cfg["unet_config_path"] = str(cfg_path)
@@ -598,7 +629,7 @@ def launch_training(
         ]
         logger.info("[launch_training] command: %s", " ".join(shlex.quote(c) for c in cmd))
 
-        log_dir = REPO_ROOT / "debug" / "training_logs"
+        log_dir = FINETUNE_BASE_DIR / "training_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_kind = "syncnet" if is_syncnet else ("unet_lora" if is_lora else "unet")
         log_path = log_dir / f"{log_kind}_{ts}.log"
@@ -704,8 +735,18 @@ def debug_all_inputs(*args) -> str:
     return "\n".join(lines)
 
 
+def _resolve_output_dir(train_output_dir: str) -> Path:
+    """Resolve a possibly relative train_output_dir against FINETUNE_BASE_DIR."""
+    if not train_output_dir:
+        return FINETUNE_BASE_DIR / "unet"
+    p = Path(train_output_dir)
+    if p.is_absolute():
+        return p
+    return FINETUNE_BASE_DIR / p
+
+
 def refresh_runs(train_output_dir: str) -> gr.update:
-    base = REPO_ROOT / train_output_dir if train_output_dir else REPO_ROOT / "debug/unet"
+    base = _resolve_output_dir(train_output_dir)
     return gr.update(choices=list_run_dirs(base))
 
 
@@ -734,7 +775,9 @@ def parse_loss_chart(run_dir_path: Optional[str]) -> Optional[str]:
         return None
     rd = Path(run_dir_path)
     if not rd.is_absolute():
-        rd = REPO_ROOT / rd
+        rd = _resolve_run_dir(run_dir_path)
+        if rd is None:
+            return None
     for sub in ("loss_charts", "sync_conf_results"):
         d = rd / sub
         if d.exists():
@@ -749,11 +792,13 @@ def list_validation_videos(run_dir_path: Optional[str]) -> List[str]:
         return []
     rd = Path(run_dir_path)
     if not rd.is_absolute():
-        rd = REPO_ROOT / rd
+        rd = _resolve_run_dir(run_dir_path)
+        if rd is None:
+            return []
     vd = rd / "val_videos"
     if not vd.exists():
         return []
-    return sorted([str(p) for p in vd.glob("*.mp4")], key=lambda p: p.stat().st_mtime, reverse=True)
+    return sorted([str(p) for p in vd.glob("*.mp4")], key=lambda p: Path(p).stat().st_mtime, reverse=True)
 
 
 def list_checkpoints_in_run(run_dir_path: Optional[str]) -> List[str]:
@@ -761,11 +806,16 @@ def list_checkpoints_in_run(run_dir_path: Optional[str]) -> List[str]:
         return []
     rd = Path(run_dir_path)
     if not rd.is_absolute():
-        rd = REPO_ROOT / rd
+        rd = _resolve_run_dir(run_dir_path)
+        if rd is None:
+            return []
     ck = rd / "checkpoints"
     if not ck.exists():
         return []
-    return [str(p.relative_to(REPO_ROOT)) for p in sorted(ck.glob("*.pt"))]
+    try:
+        return [str(p.relative_to(REPO_ROOT)) for p in sorted(ck.glob("*.pt"))]
+    except ValueError:
+        return [str(p) for p in sorted(ck.glob("*.pt"))]
 
 
 def read_loss_from_checkpoint(ckpt_path: str) -> str:
@@ -803,15 +853,18 @@ def monitor_refresh(
 ) -> Tuple[str, str, Any, str, str, Any]:
     """Pull the latest snapshot. Returns: (run_dir_choices, selected_run_disp,
     loss_chart, val_video_choices, log_tail, ckpt_info)."""
-    base = REPO_ROOT / train_output_dir if train_output_dir else REPO_ROOT / "debug/unet"
+    base = _resolve_output_dir(train_output_dir)
     run_choices = list_run_dirs(base)
-    run_dir = (REPO_ROOT / selected_run) if selected_run else None
+    run_dir = _resolve_run_dir(selected_run)
     chart = parse_loss_chart(str(run_dir) if run_dir else None)
     val_videos = list_validation_videos(str(run_dir) if run_dir else None)
     log_text = tail_log(log_path, n_lines=80)
     ckpts = list_checkpoints_in_run(str(run_dir) if run_dir else None)
     if ckpts:
-        ckpt_info = read_loss_from_checkpoint(REPO_ROOT / ckpts[-1])
+        ckpt_path = Path(ckpts[-1])
+        if not ckpt_path.is_absolute():
+            ckpt_path = REPO_ROOT / ckpt_path
+        ckpt_info = read_loss_from_checkpoint(str(ckpt_path))
     else:
         ckpt_info = "(no checkpoint yet)"
     status = (
@@ -1358,8 +1411,12 @@ def build_ui() -> gr.Blocks:
                     max_train_steps = gr.Slider(1000, 10_000_000, value=10_000_000, step=1000, label="max_train_steps")
                     num_workers = gr.Slider(0, 32, value=12, step=1, label="num_workers")
                     train_output_dir = gr.Textbox(
-                        label="train_output_dir",
-                        value="debug/unet",
+                        label=f"train_output_dir (相对于 {FINETUNE_BASE_DIR.name})",
+                        value="unet",
+                    )
+                    gr.Markdown(
+                        f"> 📂 微调中间产物根目录：`{FINETUNE_BASE_DIR}`\n"
+                        f"> 可通过环境变量 `LATENTSYNC_FINETUNE_DIR` 修改"
                     )
                     nproc_per_node = gr.Slider(1, 8, value=1, step=1, label="torchrun nproc_per_node")
                     master_port = gr.Slider(20000, 30000, value=25679, step=1, label="torchrun master_port")
@@ -1446,8 +1503,8 @@ def build_ui() -> gr.Blocks:
         with gr.Tab("2️⃣ 训练监控"):
             with gr.Row():
                 monitor_output_dir = gr.Textbox(
-                    label="train_output_dir (同 Tab1)",
-                    value="debug/unet",
+                    label=f"train_output_dir (相对于 {FINETUNE_BASE_DIR.name})",
+                    value="unet",
                 )
                 refresh_runs_btn = gr.Button("🔄 刷新 run 列表")
 
@@ -1473,7 +1530,13 @@ def build_ui() -> gr.Blocks:
                 chart = parse_loss_chart(run_path)
                 vids = list_validation_videos(run_path)
                 ckpts = list_checkpoints_in_run(run_path)
-                ck_info = read_loss_from_checkpoint(REPO_ROOT / ckpts[-1]) if ckpts else "(no checkpoint yet)"
+                if ckpts:
+                    ckpt_path = Path(ckpts[-1])
+                    if not ckpt_path.is_absolute():
+                        ckpt_path = REPO_ROOT / ckpt_path
+                    ck_info = read_loss_from_checkpoint(str(ckpt_path))
+                else:
+                    ck_info = "(no checkpoint yet)"
                 return chart, gr.update(choices=vids, value=vids[0] if vids else None), ck_info
 
             run_dd.change(
