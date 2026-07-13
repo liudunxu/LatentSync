@@ -99,11 +99,15 @@ def _download_hf_subset(
     allow_patterns: List[str],
     target_dir: Path,
     max_files: int,
+    hf_token: Optional[str] = None,
 ) -> List[Path]:
     """Download up to max_files matching allow_patterns from an HF dataset repo.
 
     Idempotent: re-running skips files already present in target_dir.
     Returns the absolute paths of the downloaded files.
+
+    For gated datasets (VoxCeleb2 mirror, CelebV-HQ gated splits, etc.),
+    pass `hf_token` (or set the HF_TOKEN / HUGGINGFACE_TOKEN env var).
     """
     try:
         from huggingface_hub import HfApi, snapshot_download
@@ -113,11 +117,14 @@ def _download_hf_subset(
         )
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    api = HfApi()
+    api_kwargs = {"token": hf_token} if hf_token else {}
     try:
-        all_files = api.list_repo_files(hf_repo, repo_type=repo_type)
+        all_files = api.list_repo_files(hf_repo, repo_type=repo_type, **api_kwargs)
     except Exception as exc:
-        raise SystemExit(f"❌ cannot list files for {hf_repo}: {exc}")
+        raise SystemExit(
+            f"❌ cannot list files for {hf_repo}: {exc}\n"
+            "   If this is a gated repo, pass --hf-token or set HF_TOKEN."
+        )
 
     # Filter to allow_patterns matches (simple glob via fnmatch).
     import fnmatch
@@ -145,6 +152,7 @@ def _download_hf_subset(
             local_dir=str(target_dir),
             allow_patterns=to_download,
             max_workers=4,
+            token=hf_token,
         )
     except Exception as exc:
         raise SystemExit(f"❌ snapshot_download failed for {hf_repo}: {exc}")
@@ -207,6 +215,7 @@ def init_one(
     *,
     output_root: Path,
     n_clips_override: Optional[int] = None,
+    hf_token: Optional[str] = None,
 ) -> Path:
     """Initialize one prebuilt dataset. Returns the output dir."""
     output_dir = output_root / recipe_id
@@ -223,6 +232,7 @@ def init_one(
         allow_patterns=recipe.get("hf_allow", ["**/*.mp4"]),
         target_dir=raw_dir,
         max_files=n_clips,
+        hf_token=hf_token,
     )
     print(f"[{recipe_id}] downloaded {len(raw_paths)} files → {raw_dir}")
 
@@ -268,6 +278,9 @@ def main():
                         help="path to prebuilt_datasets.yaml")
     parser.add_argument("--n-clips", type=int, default=None,
                         help="override the per-dataset default clip count")
+    parser.add_argument("--hf-token", type=str, default=None,
+                        help="HuggingFace token for gated datasets. Falls back to "
+                             "HF_TOKEN / HUGGINGFACE_TOKEN env var.")
     parser.add_argument("--log", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -289,6 +302,8 @@ def main():
     if not args.dataset:
         sys.exit("❌ --dataset is required (or use --list to see options)")
 
+    hf_token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+
     output_root = Path(args.output_dir).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -296,7 +311,9 @@ def main():
         for recipe_id in recipes:
             try:
                 init_one(recipe_id, recipes[recipe_id],
-                         output_root=output_root, n_clips_override=args.n_clips)
+                         output_root=output_root,
+                         n_clips_override=args.n_clips,
+                         hf_token=hf_token)
             except SystemExit as exc:
                 print(f"⚠️  {exc}", file=sys.stderr)
                 continue
@@ -304,7 +321,9 @@ def main():
         if args.dataset not in recipes:
             sys.exit(f"❌ unknown dataset: {args.dataset}. Run --list.")
         init_one(args.dataset, recipes[args.dataset],
-                 output_root=output_root, n_clips_override=args.n_clips)
+                 output_root=output_root,
+                 n_clips_override=args.n_clips,
+                 hf_token=hf_token)
 
     return 0
 

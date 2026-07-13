@@ -1282,7 +1282,7 @@ def _prebuilt_choices() -> List[str]:
 
 
 def _run_init_prebuilt(
-    dataset_choice: str, output_dir: str,
+    dataset_choice: str, output_dir: str, hf_token: str,
 ) -> Tuple[str, str, str]:
     """Spawn `python -m tools.init_finetune_dataset` and stream output.
 
@@ -1304,6 +1304,9 @@ def _run_init_prebuilt(
         "--dataset", dataset_id,
         "--output-dir", output_dir,
     ]
+    hf_token = (hf_token or "").strip()
+    if hf_token:
+        cmd += ["--hf-token", hf_token]
     log_path = REPO_ROOT / "debug" / f"init_prebuilt_{datetime.now():%Y%m%d_%H%M%S}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -1316,8 +1319,6 @@ def _run_init_prebuilt(
                 f"📜 log: {log_path}\n\n最后 60 行:\n{log_text[-6000:]}",
                 gr.update(), gr.update(),
             )
-        # Auto-fill paths for the launch form. The init script puts the
-        # curated buckets under <output-dir>/<id>/curated/.
         curated_dir = (Path(output_dir).resolve() / dataset_id / "curated")
         fileslist = curated_dir / "fileslist.txt"
         summary = (
@@ -2213,11 +2214,16 @@ def build_ui() -> gr.Blocks:
                         value="data/init_finetune",
                         scale=2,
                     )
+                prebuilt_hf_token = gr.Textbox(
+                    label="HF Token (可选,用于 gated 数据集,留空走 HF_TOKEN 环境变量)",
+                    placeholder="hf_xxxxxxxxxxxxxxxxxxxx",
+                    type="password",
+                )
                 prebuilt_btn = gr.Button("⬇ 下载 + Curate", variant="primary")
                 prebuilt_log = gr.Textbox(label="输出", lines=18, interactive=False)
                 prebuilt_btn.click(
                     fn=_run_init_prebuilt,
-                    inputs=[prebuilt_dd, prebuilt_target],
+                    inputs=[prebuilt_dd, prebuilt_target, prebuilt_hf_token],
                     outputs=[prebuilt_log, train_data_dir, train_fileslist],
                 )
 
