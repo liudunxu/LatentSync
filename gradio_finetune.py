@@ -1092,6 +1092,47 @@ def read_loss_from_checkpoint(ckpt_path: str) -> str:
         return f"(could not read checkpoint: {e})"
 
 
+def _run_curate_finetune(
+    urls: str,
+    source_dir: str,
+    output_dir: str,
+    scale: str,
+) -> str:
+    """Spawn `python -m tools.download_curated_finetune_set` and stream output."""
+    urls = (urls or "").strip()
+    source_dir = (source_dir or "").strip()
+    if not urls and not source_dir:
+        return "❌ 必须填 URL 列表 或 本地源目录(选一)"
+    if not output_dir:
+        return "❌ curated 输出目录为空"
+
+    cmd = [
+        sys.executable, "-m", "tools.download_curated_finetune_set",
+        "--output-dir", output_dir,
+    ]
+    if urls:
+        cmd += ["--urls", urls]
+    if source_dir:
+        cmd += ["--source-dir", source_dir]
+    if scale:
+        cmd += ["--scale", scale]
+
+    log_path = REPO_ROOT / "debug" / f"curate_{datetime.now():%Y%m%d_%H%M%S}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(log_path, "w") as logf:
+            proc = subprocess.run(cmd, cwd=str(REPO_ROOT), stdout=logf, stderr=subprocess.STDOUT)
+        log_text = log_path.read_text()
+        if proc.returncode != 0:
+            return (
+                f"❌ curate 退出码 {proc.returncode}\n"
+                f"📜 log: {log_path}\n\n最后 60 行:\n{log_text[-6000:]}"
+            )
+        return f"✅ 已完成\n📜 log: {log_path}\n\n{log_text[-4000:]}"
+    except FileNotFoundError as exc:
+        return f"❌ 启动失败: {exc}"
+
+
 def _run_merge_lora(
     base_ckpt: str,
     adapter_dir: str,
@@ -1433,7 +1474,157 @@ def run_validation(
     resolution: int,
     enable_deepcache: bool,
     skip_quality_check: bool,
-) -> Tuple[str, str, str, str]:
+) -> Tuple[Any, Any, Any, Any]:
+    """Kick off Tab-3.5 single-ckpt inference in the background.
+
+    Returns immediately with a '⏳ running' status; the actual result
+    is delivered by the Timer poller `_poll_inference_state` which
+    updates the video / report components when the subprocess finishes.
+    """
+    if _INFERENCE.is_busy():
+        return (
+            gr.update(value=None),
+            gr.update(),
+            gr.update(value=f"❌ 已有推理在运行 (kind={_INFERENCE.kind})，请先 ⏹ 取消"),
+            gr.update(value=None),
+        )
+    if not ckpt_path or not Path(ckpt_path).exists():
+        return (gr.update(value=None), gr.update(), gr.update(value=f"❌ ckpt 不存在: {ckpt_path}"), gr.update())
+    if not unet_config or not Path(unet_config).exists():
+        return (gr.update(value=None), gr.update(), gr.update(value=f"❌ config 不存在: {unet_config}"), gr.update())
+
+    warnings = _check_ckpt_compatibility(ckpt_path, unet_config)
+    warnings_text = "\n".join(warnings) if warnings else "✅ ckpt 与 config 兼容"
+
+    _prune_debug_files(REPO_ROOT / "debug" / "validation_outputs", "validation_cfg_*.yaml")
+
+    base_cfg = OmegaConf.load(unet_config)
+    base_cfg.data.resolution = int(resolution)
+    base_cfg.run.inference_steps = int(inference_steps)
+    base_cfg.run.guidance_scale = float(guidance_scale)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = REPO_ROOT / "debug" / "validation_outputs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_mp4 = out_dir / f"validation_{ts}.mp4"
+    tmp_cfg = out_dir / f"validation_cfg_{ts}.yaml"
+    with open(tmp_cfg, "w") as f:
+        yaml.dump(OmegaConf.to_container(base_cfg), f)
+
+    cmd = [
+        sys.executable, "-m", "scripts.inference",
+        "--unet_config_path", str(tmp_cfg),
+        "--inference_ckpt_path", str(ckpt_path),
+        "--video_path", str(video_path),
+        "--audio_path", str(audio_path),
+        "--video_out_path", str(out_mp4),
+        "--inference_steps", str(int(inference_steps)),
+        "--guidance_scale", str(float(guidance_scale)),
+        "--seed", str(int(seed)),
+        "--temp_dir", "temp",
+    ]
+    if enable_deepcache:
+        cmd.append("--enable_deepcache")
+    log_path = out_dir / f"validation_{ts}.log"
+
+    if not _INFERENCE.start(
+        cmd, log_path,
+        kind="validate",
+        label=f"validate ckpt={Path(ckpt_path).name}",
+        result_video=out_mp4,
+    ):
+        return (gr.update(value=None), gr.update(), gr.update(value="❌ 启动失败"), gr.update())
+
+    skip_msg = " (skip quality check)" if skip_quality_check else ""
+    return (
+        gr.update(value=None),
+        gr.update(value=warnings_text),
+        gr.update(value=(
+            f"⏳ validate 推理启动中{skip_msg}\n"
+            f"📜 log: {log_path.relative_to(REPO_ROOT)}\n"
+            f"💡 点击 ⏹ 取消 或 等 timer 自动刷新"
+        )),
+        gr.update(value=None),
+    )
+
+
+def _poll_inference_state(skip_quality_check: bool):
+    """Timer poller — checks _INFERENCE status and delivers the result.
+
+    Called by Tab 3.5's gr.Timer every 3s while a validation is running.
+    On DONE: runs _quick_quality_check and pushes the final report +
+    video path into the UI (one-shot, then resets result_video).
+    """
+    state = _INFERENCE
+
+    if state.kind != "validate" or state.status not in (state.DONE, state.FAILED, state.CANCELLED):
+        if state.is_busy():
+            try:
+                pid = state.proc.pid if state.proc else "?"
+            except Exception:
+                pid = "?"
+            return (
+                gr.update(value=None),
+                gr.update(),
+                gr.update(value=(
+                    f"⏳ {state.label} running (pid={pid})"
+                )),
+                gr.update(),
+            )
+        return (gr.update(), gr.update(), gr.update(), gr.update())
+
+    # ---- one-shot consumption of a finished result ----
+    result_video = state.result_video
+    exit_code = state.exit_code
+    log_path = state.log_path
+    label = state.label
+
+    if state.status == state.DONE:
+        _INFERENCE.status = _INFERENCE.IDLE
+        _INFERENCE.result_video = None
+
+        report = f"✅ 推理完成\n📂 {result_video.relative_to(REPO_ROOT)}\n📜 log: {log_path.relative_to(REPO_ROOT)}"
+        if not skip_quality_check and result_video.exists():
+            metrics = _quick_quality_check(str(result_video))
+            report = _format_validation_report(metrics, label, duration=0.0)
+        return (
+            gr.update(value=str(result_video)),
+            gr.update(),
+            gr.update(value=report),
+            gr.update(value=str(result_video)),
+        )
+
+    if state.status == state.CANCELLED:
+        _INFERENCE.status = _INFERENCE.IDLE
+        _INFERENCE.result_video = None
+        return (
+            gr.update(value=None),
+            gr.update(),
+            gr.update(value=(
+                f"⏹ 已取消\n📜 log: {log_path.relative_to(REPO_ROOT)}\n"
+                f"最后 30 行:\n{tail_file(log_path, 30)}"
+            )),
+            gr.update(value=None),
+        )
+
+    # FAILED
+    _INFERENCE.status = _INFERENCE.IDLE
+    _INFERENCE.result_video = None
+    err_text = (
+        f"❌ 推理失败 (rc={exit_code})\n"
+        f"📜 log: {log_path.relative_to(REPO_ROOT)}\n\n"
+        f"最后 30 行:\n{tail_file(log_path, 30)}"
+    )
+    return (
+        gr.update(value=None),
+        gr.update(),
+        gr.update(value=err_text),
+        gr.update(value=None),
+    )
+
+
+def stop_inference() -> str:
+    """⏹ cancel button — sends SIGINT to the running inference subprocess group."""
+    return _INFERENCE.stop()
     """Run inference with the chosen fine-tuned checkpoint, then a quick
     quality self-check. Returns (output_mp4, warnings_text, report_text,
     saved_path).
@@ -1798,6 +1989,44 @@ def build_ui() -> gr.Blocks:
                 outputs=[launch_status, log_path_state],
             )
             stop_btn.click(fn=stop_training, outputs=launch_status)
+
+            # ---- 数据集一键准备 (download + curate) ----
+            with gr.Accordion("📥 数据集一键准备 (download_curated_finetune_set)", open=False):
+                gr.Markdown(
+                    "端到端跑 `tools/download_curated_finetune_set.py`:给一批 URL 或本地视频,"
+                    "自动按 yaw/motion 分桶,产出可直接填进上面表单的 fileslist。"
+                )
+                with gr.Row():
+                    curate_urls = gr.Textbox(
+                        label="URL 列表文件 (可空,用 --source-dir)",
+                        placeholder="tools/finetune_starter_urls.example.txt",
+                        scale=2,
+                    )
+                    curate_source_dir = gr.Textbox(
+                        label="本地源目录 (可空,用 --urls)",
+                        placeholder="/data/my_raw_videos",
+                        scale=2,
+                    )
+                with gr.Row():
+                    curate_output_dir = gr.Textbox(
+                        label="curated 输出目录",
+                        value=str(FINETUNE_BASE_DIR / "finetune_samples_v1"),
+                        scale=3,
+                    )
+                    curate_scale = gr.Dropdown(
+                        choices=["small", "medium", "large"],
+                        value="small",
+                        label="scale (small=200, medium=1000, large=5000)",
+                        scale=2,
+                    )
+                with gr.Row():
+                    curate_btn = gr.Button("📥 跑 download_curated_finetune_set", variant="primary")
+                curate_log = gr.Textbox(label="输出", lines=18, interactive=False)
+                curate_btn.click(
+                    fn=_run_curate_finetune,
+                    inputs=[curate_urls, curate_source_dir, curate_output_dir, curate_scale],
+                    outputs=curate_log,
+                )
 
             debug_status = gr.Textbox(label="诊断信息", lines=8, interactive=False)
             ping_btn.click(fn=ping_backend, outputs=debug_status)

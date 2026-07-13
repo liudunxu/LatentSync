@@ -178,6 +178,7 @@ def _score_one(
     video_path: Path,
     detector,
     sample_frames: int = SAMPLE_FRAMES,
+    min_frames: int = MIN_FRAMES,
 ) -> VideoScore:
     """Run face detection + motion scoring on a single video.
 
@@ -186,7 +187,7 @@ def _score_one(
     cap = cv2.VideoCapture(str(video_path))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    if total < MIN_FRAMES:
+    if total < min_frames:
         cap.release()
         return VideoScore(path=str(video_path), frame_count=total, rejected_reason="too_short")
 
@@ -246,11 +247,11 @@ def _score_one(
 # ---------------------------------------------------------------------------
 
 
-def _bucket(score: VideoScore) -> str:
+def _bucket(score: VideoScore, min_frames: int = MIN_FRAMES) -> str:
     """Assign a single bucket to a VideoScore. Sets `rejected_reason` if rejected."""
     if score.rejected_reason:
         return "reject"
-    if score.frame_count < MIN_FRAMES:
+    if score.frame_count < min_frames:
         score.rejected_reason = "too_short"
         return "reject"
     if score.face_detected_ratio < 0.4:
@@ -270,11 +271,11 @@ def _bucket(score: VideoScore) -> str:
     return "frontal"
 
 
-def _select(scored: List[VideoScore], target_count: int) -> Dict[str, List[VideoScore]]:
+def _select(scored: List[VideoScore], target_count: int, min_frames: int = MIN_FRAMES) -> Dict[str, List[VideoScore]]:
     """Pick the top-N per bucket per TARGET_RATIO."""
     buckets: Dict[str, List[VideoScore]] = defaultdict(list)
     for s in scored:
-        s.bucket = _bucket(s)
+        s.bucket = _bucket(s, min_frames=min_frames)
         if s.bucket != "reject":
             buckets[s.bucket].append(s)
 
@@ -380,9 +381,11 @@ def main():
     parser.add_argument("--output-dir", type=str, required=True,
                         help="where to put curated buckets, fileslist, and report")
     parser.add_argument("--target-count", type=int, default=60,
-                        help="target total number of kept videos")
-    parser.add_argument("--max-candidates", type=int, default=300,
-                        help="hard cap on videos to scan (after download)")
+                        help="target total number of kept videos (200 default for finetune; bump to 1000-5000 for industry-grade)")
+    parser.add_argument("--max-candidates", type=int, default=10000,
+                        help="hard cap on videos to scan after download (50000+ for industry-grade from VoxCeleb2)")
+    parser.add_argument("--min-frames", type=int, default=MIN_FRAMES,
+                        help=f"min frames per video to keep ({MIN_FRAMES}=~1.2s @ 25fps; bump to 60-120 for 1000+ videos to reduce short-clip noise)")
     parser.add_argument("--sample-frames", type=int, default=SAMPLE_FRAMES,
                         help="frames subsampled per video for face detection")
     parser.add_argument("--device", type=str, default="cuda",
@@ -426,7 +429,7 @@ def main():
     scored: List[VideoScore] = []
     for p in tqdm(candidates, desc="score"):
         try:
-            s = _score_one(p, detector, sample_frames=args.sample_frames)
+            s = _score_one(p, detector, sample_frames=args.sample_frames, min_frames=args.min_frames)
         except Exception as exc:
             logger.warning("Failed to score %s: %s", p, exc)
             s = VideoScore(path=str(p), rejected_reason="score_error")
