@@ -130,6 +130,8 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ```
 LatentSync/
 ├── api.py                          # FastAPI server, /api/lipsync + /api/faces + /health + /api/download
+├── gradio_app.py                   # Gradio inference UI (port 7861)
+├── gradio_finetune.py              # Gradio Fine-tune Studio (port 6006) - 7 tabs
 ├── predict.py                      # Replicate / Cog entry point
 ├── gradio_app.py                   # Gradio UI (alternative to ~/workspace/others/dubbing)
 ├── inference.sh                    # CLI inference (calls scripts/inference.py)
@@ -171,8 +173,27 @@ LatentSync/
 ├── tests/                          # pytest (test_codeformer_integration, test_temporal_continuity)
 ├── preprocess/                     # offline data prep: filter, segment, sync, etc.
 ├── scripts/                        # train_syncnet / train_unet / inference CLI
+│   ├── train_unet.py               # Full UNet training (Stage 1 / Stage 2)
+│   ├── train_unet_lora.py          # LoRA / QLoRA training (peft-based)
+│   ├── merge_lora.py               # Fold a trained LoRA adapter back into base UNet
+│   ├── train_syncnet.py            # SyncNet training
+│   ├── evaluate_checkpoint.py      # End-to-end eval (inference + metrics + JSON)
+│   └── inference.py                 # Single-video inference CLI
 ├── tools/                          # ad-hoc utilities
 ├── eval/                           # evaluation: hyper_iqa, syncnet_detect, inference_videos
+│   └── generate_report.py          # Self-contained HTML report from eval JSON
+├── latentsync/
+│   ├── utils/
+│   │   ├── training_state.py       # Crash-recovery state save/load (optimizer/scaler/RNG)
+│   │   ├── tracker.py              # WandB / TensorBoard unified logger
+│   │   └── quality_sampler.py      # WeightedRandomSampler from HyperIQA scores
+│   └── data/
+│       └── unet_dataset.py         # Now supports recursive rglob (nested dirs)
+├── preprocess/
+│   └── manifest.py                 # Preprocess manifest (resume + incremental + observability)
+├── docs/                            # 9 markdown docs (see CHANGELOG.md index)
+├── start.sh                         # One-liner launcher for gradio_finetune.py
+├── CHANGELOG.md                    # Centralised changelog
 │
 ├── checkpoints/                    # ⛔ NOT in repo. Loaded at server startup from disk.
 └── data/                           # outputs/inputs/job dirs (created at runtime)
