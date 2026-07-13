@@ -87,6 +87,9 @@ pip install lpips scikit-image matplotlib
 huggingface-cli download ByteDance/LatentSync-1.6 whisper/tiny.pt --local-dir checkpoints
 huggingface-cli download ByteDance/LatentSync-1.6 latentsync_unet.pt --local-dir checkpoints
 
+# 如果 huggingface-cli 下到一半就提示完成（文件损坏），用带断点续传的脚本
+python tools/download_checkpoints.py --verify-size
+
 # SyncNet 相关（训练 Stage 2 / 评估需要）
 huggingface-cli download ByteDance/LatentSync-1.6 stable_syncnet.pt --local-dir checkpoints
 

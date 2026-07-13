@@ -110,6 +110,12 @@ huggingface-cli download ByteDance/LatentSync-1.6 whisper/tiny.pt --local-dir ch
 huggingface-cli download ByteDance/LatentSync-1.6 latentsync_unet.pt --local-dir checkpoints
 ```
 
+If `huggingface-cli` reports success but the file is incomplete/corrupted, use the resume-aware downloader:
+
+```bash
+python tools/download_checkpoints.py --verify-size
+```
+
 ### Fine-tuning output location
 
 When using `gradio_finetune.py`, generated configs, training logs, run outputs and audio caches are written to `/root/autodl-tmp/latentsync_finetune/` by default (a common large-disk mount on AutoDL). Override with:
