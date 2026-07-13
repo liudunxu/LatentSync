@@ -6,17 +6,141 @@
 > 3. 本仓库源码与 `AGENTS.md` / `docs/` 内置文档
 >
 > **目标读者**：希望训练/微调 LatentSync 的工程师与研究者
+>
+> **文档风格**：尽量通俗，必要时配类比。看完前 4 节你应该能跟别人讲清楚 LatentSync 在干什么。
 
 ---
 
 ## 0. 一句话总览
 
-> **LatentSync = SD1.5 UNet（+音频 cross-attention + 时序 motion module） + SyncNet 监督 + TREPA 时序对齐损失** 的两阶段端到端训练框架。
-> **训练 = 数据清洗 → SyncNet 训练 → UNet Stage1 → UNet Stage2 → 评估**。
+> **LatentSync = SD1.5 UNet（+ 音频 cross-attention + 时序 motion module） + SyncNet 监督 + TREPA 时序对齐损失** 的两阶段端到端训练框架。
+>
+> **训练链路 = 数据清洗 → SyncNet 训练 → UNet Stage1 → UNet Stage2 → 评估**。
 
 ---
 
-## 1. 全局训练链路（论文视角 + 代码映射）
+## 1. 通俗版：SyncNet 是什么、UNet 是什么
+
+> 这一节先用人话讲清楚两个核心模型是什么，后面再讲训练细节。
+
+### 1.1 用一个类比开场
+
+想象你在教一个"配音演员"（UNet）表演一段新台词：
+
+- **配音演员（UNet）**：拿到一张嘴被遮住的脸 + 音频，要"画"出对应的嘴型。
+- **嘴型审核员（SyncNet）**：每画完一段，就审核"这段嘴型配这段声音真的对吗？"，告诉演员哪里要改。
+
+光让演员"画得像嘴"（pixel loss）还不够，因为演员会偷懒——他从眼睛、脸颊的肌肉运动就能猜到嘴型，根本不听声音。审核员 SyncNet 就是来防止这种"偷懒"的。
+
+```mermaid
+flowchart LR
+    AUDIO[一段音频<br/>'你好'] --> ACTOR[UNet<br/>配音演员]
+    FACE[一张脸<br/>嘴部被遮] --> ACTOR
+    ACTOR --> DRAW[画出新嘴型]
+    DRAW --> JUDGE[SyncNet<br/>审核员]
+    AUDIO --> JUDGE
+    JUDGE -.评分/梯度.-> ACTOR
+    JUDGE -.指导.-> ACTOR
+```
+
+### 1.2 SyncNet 是什么？
+
+#### 一句话定义
+**SyncNet 是一个二分类网络：给定 16 帧人脸 + 16 帧对应音频，判断这俩是否"对得上嘴型"。**
+
+#### 输入输出
+
+| | 形状 | 含义 |
+|---|---|---|
+| **输入（视觉）** | `(16, 3, 256, 256)` 像素值 | 16 帧人脸下半张图（只看嘴） |
+| **输入（音频）** | `(1, 80, 52)` mel 频谱 | 16 帧对应的 0.64 秒音频 |
+| **输出 A** | `vision_embeds`: 2048 维向量 | 视频的"嘴型指纹" |
+| **输出 B** | `audio_embeds`: 2048 维向量 | 音频的"声音指纹" |
+| **最终判断** | 两个向量的余弦相似度 | 越接近 1 越同步 |
+
+#### 它解决什么问题？
+在训练 UNet 时充当"判官"——如果 UNet 画的嘴型和音频不匹配，SyncNet 会通过梯度"骂"UNet，让它必须听音频而不是偷懒看视觉。
+
+#### 能不能独立训练？
+**能。** SyncNet 完全独立于 UNet，本质就是一个二分类器，论文甚至把它当通用工具贡献了出来。
+- 数据：任意带人脸的视频 + 内嵌音频（必须先做音视频对齐，详见 §3）。
+- 训练：`./train_syncnet.sh`，5-30 分钟看完一轮。
+- 产物：`stable_syncnet.pt`，HDTF 准确率 91% → 94%。
+
+#### 训练集格式
+一行一个 mp4 绝对路径：
+
+```
+/data/voxceleb2/abc/001.mp4
+/data/voxceleb2/abc/002.mp4
+...
+```
+
+数据集会自动从视频里抽音频做 mel。
+
+### 1.3 UNet 是什么？
+
+#### 一句话定义
+**UNet 是一个图像生成网络：拿到被遮住的脸 + 音频 + 参考脸，画出没被遮的完整脸。** 它就是 LatentSync 真正对外服务的"演员"。
+
+#### 为什么叫 UNet？
+因为它长得像个 U：左边一层层缩小（编码器），右边一层层放大（解码器），中间用 skip connection 连起来。这是 Stable Diffusion 的核心架构。
+
+#### LatentSync 的 UNet 在 SD 基础上加了三个东西
+
+```mermaid
+flowchart TB
+    subgraph BASE[SD1.5 的 UNet]
+        ENC[编码器<br/>一步步缩小图]
+        DEC[解码器<br/>一步步放大图]
+        ENC -.skip.-> DEC
+    end
+
+    subgraph LS[LatentSync 加的三件套]
+        A[音频 cross-attention<br/>attn2.to_q/k/v/out<br/>让 UNet 听声音]
+        B[Motion Module<br/>Temporal Self-Attention<br/>让帧之间连贯]
+        C[13 通道 conv_in<br/>SD 是 4 通道<br/>这里拼了 mask + masked + ref]
+    end
+
+    BASE -.改造.-> LS
+```
+
+#### 输入输出
+
+| | 形状 | 含义 |
+|---|---|---|
+| **输入（图像侧）** | `(B, 13, 16, 64, 64)`（256 分辨率） | 4 通道 noise + 1 通道 mask + 4 通道 masked 帧 + 4 通道 ref 帧 |
+| **输入（音频侧）** | `(B, 16, 50, 384)` | 16 帧各 50 个 whisper-tiny token 的 384 维特征 |
+| **输入（时间步）** | `(B,)` 整数 | 0-999 的扩散步数 |
+| **输出** | `(B, 4, 16, 64, 64)` | 预测的噪声 ε |
+
+#### 它解决什么问题？
+- 训练时：学会"看到 masked 脸 + 听到声音 → 还原嘴型"。
+- 推理时：把遮住的嘴部补出来。
+
+#### 能不能独立训练？
+**Stage 1 可以独立训练**（只用视频 + 音频，不依赖 SyncNet）。
+**Stage 2 必须依赖 SyncNet**（需要 SyncNet 算 sync_loss）。
+
+#### 训练集格式
+和 SyncNet 一样，一行一个 mp4。但 Stage 2 必须先有 Stage 1 的 checkpoint（fine-tune 模式）。
+
+### 1.4 对比总结
+
+| | SyncNet | UNet (LatentSync) |
+|---|---|---|
+| **类比** | 嘴型审核员 | 配音演员 |
+| **任务** | 二分类：嘴和音对不对 | 图像生成：补全被遮的脸 |
+| **输入** | 16 帧脸 + 16 帧音频 mel | 13 通道 noise+mask+masked+ref + 16 帧音频特征 |
+| **输出** | 2048 维两个 embedding | 4 通道噪声预测 |
+| **判别 vs 生成** | 判别式 | 生成式 |
+| **能否独立训练** | ✅ 完全独立 | Stage 1 独立；Stage 2 需 SyncNet |
+| **训练数据格式** | 一行一个 mp4 路径 | 一行一个 mp4 路径 |
+| **产物** | `stable_syncnet.pt` | `latentsync_unet.pt` |
+
+---
+
+## 2. 全局训练链路（论文视角 + 代码映射）
 
 ```mermaid
 flowchart LR
@@ -45,121 +169,105 @@ flowchart LR
 
 ---
 
-## 2. 论文核心洞察：**Shortcut Learning 问题**
+## 3. 数据预处理（`preprocess/`）
 
-论文最大的理论贡献：**直接用 audio-conditioned LDM 做 lip-sync 会失败**，原因是「shortcut learning」。
+> **目标**：把"乱七八糟的原始视频"压成"干净的、256×256 人脸对齐、同步、高质量"的训练样本。
+> **入口**：`./data_processing_pipeline.sh`
+
+### 3.1 七步流水线
 
 ```mermaid
-flowchart LR
-    subgraph 问题
-        M[音频条件 LDM] -.无视音频.-> V[从脸颊/眼睛/肌肉<br/>等视觉上下文推断嘴型]
-        V -.掩码越大.-> V2[视觉信息越少<br/>反而迫使模型听音频]
-        V2 -.-> BAD[唇音同步差]
-    end
+flowchart TB
+    R[原始视频<br/>input_dir] --> R1[remove_broken_videos<br/>AVReader 检测可读]
+    R1 --> R2[resample_fps_hz<br/>→ 25fps · 16kHz]
+    R2 --> R3[detect_shot<br/>PySceneDetect 切镜头]
+    R3 --> R4[segment_videos<br/>ffmpeg 切 5s 片段]
+    R4 --> R5{可选<br/>filter_high_resolution<br/>mediapipe 人脸 >= resolution}
+    R5 --> R6[affine_transform<br/>InsightFace 检测 + 仿射 → 256×256]
+    R6 --> R7[sync_av<br/>SyncNet 算 AV offset + conf]
+    R7 --> R8{conf ≥ 3<br/>且 |offset| ≤ 6}
+    R8 -->|yes| R9[filter_visual_quality<br/>HyperIQA ≥ 40]
+    R8 -->|no| DROP[丢弃]
+    R9 --> OUT[high_visual_quality/<br/>训练样本]
 
-    subgraph 解法
-        SN[SyncNet 监督] --> FIX[强制模型学视听关联]
-        FIX -.掩码大小不再影响.-> GOOD[唇音同步稳定]
-    end
+    style OUT fill:#9f9
+    style DROP fill:#f99
 ```
 
-> **关键实验**（论文 Fig. 2）：没 SyncNet 监督时，mask 越大 sync_conf 越好（因为模型被迫听音频）；有 SyncNet 监督时，无论 mask 大小，sync_conf 都稳定在高水平。
+### 3.2 每步干什么
 
-**代码体现**：
-- **整脸 mask**（不只遮嘴）：`latentsync/utils/mask.png`，专门把整张脸都遮掉，迫使模型必须看 mask 外的极少信息 → 不得不靠音频。
-- **如果用 landmark 动态画 mask**：嘴部周围 landmark 移动本身就是"嘴型变化线索"，等于让模型走视觉 shortcut。所以论文明确说"不用 landmark 画 mask"。
+| 步骤 | 干什么 | 为什么要 |
+|---|---|---|
+| **1. 去损坏** | 用 AVReader 读，读不出就删 | 数据集里有损坏文件会卡死训练 |
+| **2. 重采样** | 全部统一到 25 fps + 16 kHz | 网络设计死了 25 fps，音频窗口对齐才能算 |
+| **3. 切镜头** | 用 PySceneDetect 找切点 | 一个长视频里可能换了人，要切 |
+| **4. 5s 切片** | 每段切成 5 秒 | 训练时一次取 16 帧（0.64s），太长的视频浪费 |
+| **5. 高分辨率筛选**（可选） | mediapipe 检测人脸，要求 ≥ 256 | 人脸太小训练出来没用 |
+| **6. 仿射对齐** | InsightFace 检测 106 个关键点 → 把人脸"摆正"到 256×256 | 侧脸、歪脸统一变正脸，简化学习 |
+| **7. 音视频对齐** | SyncNet 算 offset，把音频移动到嘴型同步的位置，丢弃 conf<3 | 没同步的样本会把 SyncNet 教傻 |
+| **8. 视觉质量** | HyperIQA 评分，≥ 40 才留 | 太糊、太暗、太花的样本没用 |
 
----
+### 3.3 关键：为什么"先仿射再调 AV offset"？
 
-## 3. 数据预处理链路（`preprocess/` + `data_processing_pipeline.sh`）
-
-### 3.1 七步流水线（论文 §5.1 + 代码）
-
-| 步骤 | 脚本 | 论文依据 | 关键过滤阈值 | 代码行 |
-|---|---|---|---|---|
-| 1. 去损坏 | `remove_broken_videos.py` | AVReader 读不出就丢 | 损坏 | `preprocess/remove_broken_videos.py` |
-| 2. 重采样 | `resample_fps_hz.py` | 论文实验：25 FPS / 16 kHz | fps=25, sr=16000 | `preprocess/resample_fps_hz.py` |
-| 3. 镜头切分 | `detect_shot.py` | PySceneDetect adaptive detect | — | `preprocess/detect_shot.py` |
-| 4. 5s 切片 | `segment_videos.py` | 每段 ≥ num_frames*3=48 帧 | segment_time=5 | `preprocess/segment_videos.py` |
-| 5. 可选：高分辨率 | `filter_high_resolution.py` | mediapipe 人脸尺寸 ≥ res | face≥256 | `preprocess/filter_high_resolution.py` |
-| 6. **仿射对齐** | `affine_transform.py` | **论文关键**：用 InsightFace landmark 把人脸正面化（侧脸也能用），降 side profile | 256×256 | `preprocess/affine_transform.py` |
-| 7. **音视频同步** | `sync_av.py` | **论文关键**：用官方 SyncNet 调 AV offset 到 0，丢弃 conf<3 的视频 | conf≥3, \|offset\|≤6 | `preprocess/sync_av.py` |
-| 8. 视觉质量 | `filter_visual_quality.py` | HyperIQA 分数过滤 | score≥40 | `preprocess/filter_visual_quality.py` |
-
-### 3.2 为什么"先仿射再调 AV offset"？
-
-论文 §4「Data preprocessing」专门做了 ablation（Fig. 10）：
-- **不做 offset 调整**：SyncNet loss 卡在 0.69（= log 2，意味着没在学）。
-- **先仿射再调 offset**：最佳收敛曲线。
+论文 §4 Fig.10 的实验结果：
+- **不做 offset 调整**：SyncNet loss 卡在 0.69（= ln 2），永远学不会。
+- **先 affine 再调 offset**：唯一能正常收敛的顺序。
 
 原因：仿射变换去掉了大量侧脸 / 怪角度样本，让官方 SyncNet 估 AV offset 更准。
 
-### 3.3 数据预处理 → 训练字段映射
+### 3.4 数据集目录结构
 
-| 预处理产物 | 训练集字段 | 用途 |
-|---|---|---|
-| `high_visual_quality/*.mp4` | `video_paths` | 视频源 |
-| 视频内嵌音频（16 kHz） | `original_mel` (缓存 `_mel.pt`) | UNet `mel` / SyncNet `audio_samples` |
-| 仿射对齐后的人脸 | `gt_pixel_values` / `masked_pixel_values` / `ref_pixel_values` | UNet 三元组 |
+```
+VoxCeleb2/
+├── raw/                          # 原始 mp4
+├── resampled/                    # 25fps 16kHz
+├── shot/                         # 切镜头后
+├── segmented/                    # 5s 一段
+├── affine_transformed/           # 256×256 人脸对齐
+├── av_synced_3/                  # AV 对齐后
+└── high_visual_quality/          # ← 最终训练用
+    └── abc/001.mp4
+    └── abc/002.mp4
+    └── ...
+```
+
+每一步生成一个新目录，万一某步挂掉可以从那一步重跑，不用从头来。
+
+### 3.5 训练集格式
+
+最终训练输入就是一个文本文件，每行一个 mp4 绝对路径：
+
+```
+/data/VoxCeleb2/high_visual_quality/abc/001.mp4
+/data/VoxCeleb2/high_visual_quality/abc/002.mp4
+/data/HDTF/high_visual_quality/xyz/001.mp4
+...
+```
+
+训练时 `UNetDataset` / `SyncNetDataset` 会自动：
+- 用 decord 解码视频帧
+- 用 ffmpeg 抽音频
+- 用 melspectrogram 转 mel
+- cache 到 `audio_mel_cache_dir`（避免每次都重算）
 
 ---
 
-## 4. SyncNet 训练（论文 §4 + `scripts/train_syncnet.py`）
+## 4. SyncNet 训练详解
 
-> **论文贡献**：StableSyncNet —— 把 SyncNet 视觉/音频编码器重做成 SD U-Net encoder 结构，HDTF 准确率 91% → **94%**。
+### 4.1 一句话目标
+让 SyncNet 学会"看一眼嘴，听一声音，判断它们对不对得上"。
 
-### 4.1 为什么"loss 卡在 0.69"
-
-论文给出了数学证明：
-
-```
-q(x=1) ≈ q(x=0) ≈ 0.5  (模型在学之前等概率猜)
-L_syncnet = -1/N ∑ p(xᵢ) log q(xᵢ) ≈ 0.693 = ln 2
-```
-
-**含义**：SyncNet 没学到任何判别能力时，loss 的下界就是 ln 2 ≈ 0.69。这是判断"模型是否在训练"的强信号。
-
-### 4.2 论文五因素消融（Fig. 6-10）
-
-| 因素 | 论文结论 | 代码对应配置字段 |
-|---|---|---|
-| **Batch size** | 1024 最优，128 卡在 0.69，256 振荡 | `data.batch_size=256`（可调到 1024） |
-| **架构** | SD U-Net encoder 改造的 StableSyncNet > Wav2Lip 原始架构 | `configs/syncnet/syncnet_16_pixel_attn.yaml`（含 attention） |
-| **Embedding dim** | 2048 最优；512 太小，4096/6144 太稀疏 | `block_out_channels` 末层 2048 |
-| **帧数** | 16 最优；25 在训练初期卡住 | `data.num_frames=16` |
-| **数据预处理** | 先 affine 再调 AV offset | pipeline 顺序固定 |
-
-### 4.3 StableSyncNet 架构
-
-```mermaid
-flowchart LR
-    subgraph VE[Visual Encoder<br/>输入 (48, H, W)]
-        VRES[ResBlock×N<br/>下采样 [1,2],2,2,2,2,2,2,2] --> VATTN[Self-Attn block 4,5]
-        VATTN --> VOUT[2048×1×1]
-    end
-
-    subgraph AE[Audio Encoder<br/>输入 (1, 80, 52)]
-        ARES[ResBlock×N<br/>下采样 [[2,1],2,2,1,2,2,[2,3]]] --> AATTN[Self-Attn block 3,4]
-        AATTN --> AOUT[2048×1×1]
-    end
-
-    VOUT --> COS[cosine_loss<br/>同源 y=1 / 错配 y=0]
-    AOUT --> COS
-```
-
-> **只取下半脸**：`configs/syncnet/syncnet_16_pixel_attn.yaml` 的 `data.lower_half: true` —— SyncNet 只看嘴部区域，因为上半脸对"嘴-音"同步是噪声。
-
-### 4.4 训练循环
+### 4.2 训练循环
 
 ```mermaid
 flowchart TB
     S[init_dist DDP] --> L[SyncNetDataset<br/>同一视频随机抽两段]
     L --> P{50% 概率}
-    P -->|正| Y1[y=1: 同源窗口]
-    P -->|负| Y0[y=0: 错配窗口]
-    Y1 --> PROC[ImageProcessor resize 256]
+    P -->|正| Y1[y=1: 同源窗口<br/>嘴音匹配]
+    P -->|负| Y0[y=0: 错配窗口<br/>嘴音不匹配]
+    Y1 --> PROC[ImageProcessor<br/>resize 256×256<br/>只保留下半脸]
     Y0 --> PROC
-    PROC --> FWD[StableSyncNet.forward<br/>→ vision_embeds, audio_embeds]
+    PROC --> FWD[StableSyncNet.forward]
     MEL[melspectrogram] --> FWD
     FWD --> LOSS[cosine_loss]
     LOSS --> ACC[gradient_accumulation_steps]
@@ -172,17 +280,49 @@ flowchart TB
     CKPT -->|否| L
 ```
 
-### 4.5 SyncNet 损失函数（论文附录 A + `latentsync/utils/util.py:314`）
+### 4.3 正负样本怎么造
 
 ```python
-# cosine_loss(vision_embeds, audio_embeds, y)
+# 伪代码
+start_idx   = 随机选一段 16 帧
+wrong_idx   = 再随机选一段 16 帧（≠ start_idx）
+audio       = 视频原始音频的 mel
+
+if random.random() < 0.5:
+    sample = (start_idx 帧, audio, y=1)    # 正样本：嘴音同源
+else:
+    sample = (wrong_idx 帧, audio, y=0)    # 负样本：嘴音错配
+```
+
+这就是自监督——**不需要任何标签**，视频本身的对齐音频就是正样本，错位的就是负样本。
+
+### 4.4 损失函数
+
+```python
+# latentsync/utils/util.py:314 cosine_loss
 # y=1: 1 - cos(v, a)        # 同源 → 鼓励对齐
 # y=0: max(0, cos(v, a))    # 错配 → hinge 鼓励远离
 ```
 
+### 4.5 论文五因素消融（必须记牢）
+
+| 因素 | 论文结论 | 你的配置 |
+|---|---|---|
+| **Batch size** | 1024 最优，128 卡 0.69 | `data.batch_size=256`，可加大 |
+| **架构** | SD U-Net encoder > Wav2Lip 原架构 | `syncnet_16_pixel_attn.yaml` |
+| **Embedding dim** | 2048 最优 | `block_out_channels` 末层 2048 |
+| **帧数** | 16 最优，25 卡住 | `data.num_frames=16` |
+| **数据预处理** | 先 affine 再调 AV offset | pipeline 顺序固定 |
+
+### 4.6 loss 卡 0.69 = 完蛋了吗？
+
+论文给了数学证明：`0.693 = ln 2`，是 SyncNet 完全没学到任何东西时 loss 的下界。
+
+**诊断方法**：训练几个 step 看 loss，如果不往下走，就卡这 5 个因素里。
+
 ---
 
-## 5. UNet 训练（论文 §3.2 + `scripts/train_unet.py`）
+## 5. UNet 训练详解
 
 ### 5.1 模型架构
 
@@ -212,90 +352,58 @@ flowchart TB
     UNET --> PRED[pred_noise]
 ```
 
-> **输入通道数 = 13**：4（noise latent）+ 1（mask）+ 4（masked latent）+ 4（reference latent）。
-> **初始化**：SD1.5 权重初始化，但 `conv_in`（13 通道）和 cross-attn 层（dim 384 而非 1280）随机初始化。
-
 ### 5.2 音频特征怎么喂
 
-论文公式（§3.1）：
+公式（论文 §3.1）：
 ```
 A^(f) = {a^(f-m), ..., a^(f), ..., a^(f+m)}
 ```
 
-**代码**：`configs/unet/stage1.yaml` → `audio_feat_length: [2, 2]`，即 `m=2`，每帧用"前 2 帧 + 自己 + 后 2 帧"共 5 帧音频特征（每帧 50 个 token），shape `(B, 16, 50, 384)`。
+**代码**：`configs/unet/stage1.yaml` → `audio_feat_length: [2, 2]`，即 `m=2`，每帧用"前 2 帧 + 自己 + 后 2 帧"共 5 帧音频特征。
 
-> **音频特征 384 dim** 来自 whisper-tiny。如果换成 whisper-small 则是 768（`cross_attention_dim=768`），对应 `whisper_model_path="checkpoints/whisper/small.pt"`。
+> 为什么要前后各看几帧？因为嘴型有滞后性，看周围的音频能让模型更好对齐。
 
-### 5.3 **两阶段训练策略**（论文核心 §3.2）
-
-> 论文动机：**decoded pixel space supervision 需要保留 VAE decoder 的 activations 给反传**，显存爆炸。
-> 解决：先不 decode（不耗显存），学视觉特征；再加 sync/lpips/trepa 学视听关联。
+### 5.3 两阶段训练（论文核心）
 
 ```mermaid
 flowchart LR
     subgraph S1[Stage 1: 学视觉特征]
-        S1A[不 decode<br/>不 sync<br/>不 trepa/lpips] --> S1B[L = L_simple<br/>只算 latent MSE]
+        S1A[不 decode<br/>不 sync<br/>不 trepa/lpips] --> S1B[L = L_simple]
         S1B --> S1C[训全部 UNet 参数<br/>use_motion_module=false]
         S1C --> S1D[大 batch size<br/>23GB VRAM]
     end
 
     subgraph S2[Stage 2: 学视听关联]
         S2A[decode 到 pixel<br/>sync/lpips/trepa] --> S2B[L = λ1·L_simple + λ2·L_sync + λ3·L_lpips + λ4·L_trepa]
-        S2B --> S2C[冻结 UNet 主体<br/>只训 motion_modules. + attentions.]
+        S2B --> S2C[冻结 UNet 主体<br/>只训 motion + attn]
         S2C --> S2D[use_motion_module=true<br/>30GB VRAM]
     end
 
     S1 --> S2
 ```
 
-### 5.4 训练目标（论文 Eq. 2-6 + 代码 `scripts/train_unet.py:415-420`）
+> **动机**：decoded pixel space supervision 需要保留 VAE decoder 的 activations 给反传，显存爆炸。Stage 1 先不 decode，省显存；Stage 2 再加 sync/lpips/trepa。
+
+### 5.4 训练目标
 
 **Stage 1**：
 ```
 L_simple = E[||ε - ε_θ(z_t, t, τ_θ(A))||²]
 ```
-代码：`recon_loss = MSE(pred_noise, noise)`，`recon_loss_weight=1`。
 
 **Stage 2**：
 ```
 L_total = λ1·L_simple + λ2·L_sync + λ3·L_lpips + λ4·L_trepa
 ```
-| 损失 | 公式（论文） | 代码位置 | 权重 |
-|---|---|---|---|
-| `L_simple` | `MSE(ε_pred, ε_target)` | `train_unet.py:360` | 1 |
-| `L_sync` | `cosine_loss(SyncNet(D(ẑ⁰), a))` | `train_unet.py:411` | 0.05 |
-| `L_lpips` | `||V_l(D(ẑ⁰_f)) - V_l(x_f)||²`（仅下半脸） | `train_unet.py:375` | 0.1 |
-| `L_trepa` | `||T(D(ẑ⁰)) - T(x)||²`（VideoMAE-v2 特征） | `train_unet.py:388` | 10 |
 
-> **L_sync 输入**：UNet 推理 → one-step 估计 ẑ⁰ → VAE decode 到 pixel → 只取下半脸 → 喂给冻结的 StableSyncNet → 算 cosine loss。
-> **`lower_half`**：`SyncNetDataset` 训练时也用 `lower_half=true`（见 `syncnet_16_pixel_attn.yaml`），推理时一致。
+| 损失 | 作用 | 权重 |
+|---|---|---|
+| `L_simple` | 噪声预测主目标 | 1 |
+| `L_sync` | 嘴音同步（用 SyncNet 监督） | 0.05 |
+| `L_lpips` | 感知相似（只看下半脸） | 0.1 |
+| `L_trepa` | 时序一致性（VideoMAE-v2 特征） | 10 |
 
-### 5.5 one-step estimation（论文 Eq. 1 + `latentsync/utils/util.py:267`）
-
-```python
-# z^0 = (z_t - sqrt(1 - α_t) * ε_θ(z_t)) / sqrt(α_t)
-def one_step_sampling(ddim_scheduler, pred_noise, timesteps, x_t):
-    alpha_prod_t = ddim_scheduler.alphas_cumprod[timesteps]
-    beta_prod_t = 1 - alpha_prod_t
-    return (x_t - beta_prod_t ** 0.5 * pred_noise) / alpha_prod_t ** 0.5
-```
-
-> **意义**：单步从 `z_t` 直接估计干净的 `z^0`，避免跑完整个 DDIM 反向过程，**且保留梯度**让 sync/lpips/trepa 反传。
-
-### 5.6 **Mixed Noise**（论文 §3.1 + 代码 `train_unet.py:319-332`）
-
-```python
-# noise = noise_ind + noise_shared
-# noise_shared = randn_like(...)[:, :, 0:1].repeat(全帧) * α / sqrt(1+α²)
-# noise_ind    = randn_like(...) * 1 / sqrt(1+α²)
-# mixed_noise_alpha=1
-```
-
-- **`noise_shared`**：所有帧共用同一噪声 → 强制 UNet 学**时序一致性**（相邻帧差异由去噪过程产生而非噪声产生）。
-- **`noise_ind`**：每帧独立噪声 → 提供帧间变化。
-- 论文引用 [AnimateDiff](https://arxiv.org/abs/2308.09716) 的做法。
-
-### 5.7 数据采样（`UNetDataset`）
+### 5.5 数据采样（`UNetDataset`）
 
 ```mermaid
 flowchart LR
@@ -304,66 +412,41 @@ flowchart LR
     GT --> GT_P[gt_pixel_values]
     REF --> RF_P[ref_pixel_values]
 
-    AR[AudioReader 16kHz] --> MEL[原始 mel<br/>缓存 _mel.pt]
-    MEL --> CW[crop_audio_window<br/>按 80.0 × start_idx / fps]
+    AR[AudioReader 16kHz] --> MEL[原始 mel]
+    MEL --> CW[crop_audio_window]
     CW --> MEL_W[mel 16 × window_len]
 
-    VR --> GT2[gt_pixel_values]
-    GT2 --> MASK[ImageProcessor<br/>+ load_fixed_mask<br/>应用 mask]
+    GT --> MASK[ImageProcessor<br/>+ load_fixed_mask]
     MASK --> MK_P[masked_pixel_values]
-    MASK --> MS_P[masks<br/>下采样到 latent 分辨率]
-
-    GT_P -.13 通道拼接.-> UN
-    RF_P -.13 通道拼接.-> UN
-    MS_P -.13 通道拼接.-> UN
-    MK_P -.13 通道拼接.-> UN
-    MEL_W -.encoder_hidden_states.-> UN
+    MASK --> MS_P[masks]
 ```
 
-> 训练时 `affine_transform=False`（在数据集里已经做过），但 `ImageProcessor.prepare_masks_and_masked_images` 仍会调一次（mask 应用 + resize）。
+> 训练时 `affine_transform=False`（预处理已经做过），但 ImageProcessor 仍会再调一次（mask 应用 + resize）。
 
-### 5.8 **Stage 2 训练对象（论文 §3.2）**
+### 5.6 Stage 2 训练对象
 
-论文原话：
-> *"In the second stage of training, we only train the temporal layer and audio layer while freezing the other parameters of the U-Net."*
+**冻结**：UNet 主体（SD1.5 原有参数）
+**训练**：
+- `motion_modules.`（时序层）
+- `attentions.`（cross-attn 之外的 self-attn）
 
-代码对应：
-```yaml
-# configs/unet/stage2.yaml
-trainable_modules:
-  - motion_modules.    # Motion Module（时序层）
-  - attentions.        # cross-attn 之外的 self-attn（Stage 2 标准）
-```
+**stage2_efficient.yaml** 进一步缩范围：
+- `decoder_only: true`（Motion Module 只挂 decoder）
+- 只训 `attn2.`（cross-attn）
+- `trepa_loss_weight: 0`（省显存）
 
-**stage2_efficient.yaml 进一步缩范围**：
-```yaml
-trainable_modules:
-  - motion_modules.
-  - attn2.             # 只训 cross-attn（attn2.to_q/k/v/out）
-decoder_only: true     # Motion Module 只挂在 decoder，encoder 不挂
-trepa_loss_weight: 0   # 省显存
-```
-
-### 5.9 **TREPA（论文 §3.3 + `latentsync/trepa/loss.py`）**
-
-> **问题**：单帧 pixel-level 损失（LPIPS）只管每帧好不好看，不管帧间是否一致 → 牙齿/胡须闪烁。
-> **解法**：用大规模自监督视频模型 **VideoMAE-v2** 提取**时序表示**（embeddings before head projection），让生成的 16 帧的时序特征 ≈ GT 16 帧的时序特征。
+### 5.7 Mixed Noise 干嘛的
 
 ```python
-# latentsync/trepa/loss.py:33
-def __call__(self, videos_fake, videos_real):
-    # resize to 224x224
-    # 输入范围 [0, 1]
-    feats_fake = self.model.forward_features(videos_fake)  # VideoMAE-v2
-    feats_real = self.model.forward_features(videos_real)
-    feats_fake = F.normalize(feats_fake, p=2, dim=1)        # ℓ2 归一化
-    feats_real = F.normalize(feats_real, p=2, dim=1)
-    return F.mse_loss(feats_fake, feats_real)
+# noise = noise_shared + noise_ind
+# noise_shared = randn()[:, :, 0:1].repeat(全帧)  # 所有帧共用
+# noise_ind    = randn()                            # 每帧独立
 ```
 
-> **权重 10**：远大于 sync=0.05、lpips=0.1；因为 MSE on normalized features 数值小，需要放大。
+- **noise_shared**：所有帧共用同一噪声 → 强制 UNet 学时序一致性（相邻帧差异由去噪过程产生）。
+- **noise_ind**：每帧独立噪声 → 提供帧间变化。
 
-### 5.10 配置全表
+### 5.8 配置全表
 
 | config | 分辨率 | motion | decoder_only | trainable | trepa | sync | mask | VRAM |
 |---|---|---|---|---|---|---|---|---|
@@ -375,47 +458,178 @@ def __call__(self, videos_fake, videos_real):
 
 ---
 
-## 6. 评估（`eval/` + 论文 §5.2）
+## 6. 评估
 
-### 6.1 评估指标（论文 Table 1）
+### 6.1 指标
 
 | 指标 | 含义 | 越大/越小 | 代码 |
 |---|---|---|---|
-| **FID** | Fréchet Inception Distance，视觉质量 | ↓ 越好 | `eval/eval_fvd.py` (I3D) |
-| **SSIM** | Structural Similarity，重建质量 | ↑ 越好 | 同上 |
-| **Sync_conf** | SyncNet confidence，唇音同步 | ↑ 越好 | `eval/eval_sync_conf.py` |
-| **LMD** | Landmark Distance，嘴部 landmark 距离 | ↓ 越好 | 同上 |
-| **FVD** | Fréchet Video Distance，时序质量 | ↓ 越好 | `eval/eval_fvd.py` |
+| **FID** | 视觉质量 | ↓ 越好 | `eval/eval_fvd.py` |
+| **SSIM** | 重建质量 | ↑ 越好 | 同上 |
+| **Sync_conf** | 唇音同步 | ↑ 越好 | `eval/eval_sync_conf.py` |
+| **LMD** | 嘴部 landmark 距离 | ↓ 越好 | 同上 |
+| **FVD** | 时序质量 | ↓ 越好 | `eval/eval_fvd.py` |
 
 ### 6.2 论文 Table 1（HDTF 测试集）
 
 | 方法 | FID↓ | SSIM↑ | Sync_conf↑ | LMD↓ | FVD↓ |
 |---|---|---|---|---|---|
 | Wav2Lip | 12.5 | 0.70 | 8.2 | 0.34 | 304.35 |
-| VideoReTalking | 9.5 | 0.75 | 7.5 | 0.49 | 270.56 |
-| Diff2Lip | 10.3 | 0.72 | 7.9 | 0.36 | 260.45 |
 | MuseTalk | 9.35 | 0.74 | 6.8 | 0.56 | 246.75 |
 | **LatentSync** | **7.22** | **0.79** | **8.9** | **0.30** | **162.74** |
 
-### 6.3 论文 Table 2 消融（HDTF）
+---
 
-| 变体 | Sync_conf↑ | FVD↓ |
-|---|---|---|
-| w/o SyncNet | 4.6 | 220.37 |
-| + latent space SyncNet | 7.9 | 180.45 |
-| **+ pixel space SyncNet** | **8.9** | **162.74** |
+## 7. Badcase 与对应训练策略（重点）
 
-> **结论**：pixel space supervision 全面胜出 → 论文选 decoded pixel space。
+> 这一节是实际项目中**最常遇到的问题**和**怎么通过训练/微调解决**。
 
-### 6.4 SyncNet 训练数据集 vs HDTF 测试
+### 7.1 Badcase 一览
 
-论文说 StableSyncNet **在 VoxCeleb2 上训练，在 HDTF 上测试**（跨数据集 OOD 测试），验证泛化。
+```mermaid
+flowchart TB
+    BC[常见 Badcase] --> BC1[嘴部模糊/牙齿糊]
+    BC --> BC2[侧脸/大角度]
+    BC --> BC3[嘴型对不上音]
+    BC --> BC4[帧间闪烁/抖动]
+    BC --> BC5[身份丢失/人脸不像]
+    BC --> BC6[Mask 边界明显]
+    BC --> BC7[大段静音/无嘴型]
+```
+
+### 7.2 Badcase 1：嘴部模糊、牙齿糊
+
+#### 现象
+生成的嘴部细节丢失，看起来像糊了一层，牙齿看不清。
+
+#### 根因
+- Stage 2 没训够，LPIPS / pixel 监督不够强。
+- 分辨率太低（256），细节本身就没学清楚。
+
+#### 训练策略
+1. **升分辨率训练**：256 → 512，改用 `stage1_512.yaml` + `stage2_512.yaml`，mask 换 `mask2.png`（更紧的嘴部 mask）。
+2. **加大 LPIPS 权重**：把 `perceptual_loss_weight` 从 0.1 调到 0.3+。
+3. **加训练步数**：Stage 2 多训几个 epoch。
+4. **数据侧**：检查 `audio_mel_cache_dir` 里的 mel 是否正常（糊的可能从源头就糊）。
+5. **推理后处理**：开 `codeformer_enabled=true`（见 `docs/codeformer_integration.md`）。
+
+### 7.3 Badcase 2：侧脸 / 大角度
+
+#### 现象
+人脸偏转超过 30°，生成的嘴部要么扭曲、要么粘贴到脸上其他地方。
+
+#### 根因
+- 侧脸时人脸 landmark 检测不准，mask 区域错位。
+- 模型没怎么见过大角度样本。
+
+#### 训练策略
+1. **数据侧**：让预处理阶段**保留更多侧脸样本**（不强制要求正面）。
+2. **检测侧**：`_estimate_yaw_degrees` 阈值放宽（参考 `AGENTS.md` 的 multi-signal fusion 说明）。
+3. **训练侧**：
+   - 用更大的 mask 覆盖范围（不要只遮嘴）。
+   - 加更多侧脸样本到训练集。
+4. **推理侧**：调小 `yaw_skip_threshold`，让大角度也能生成（但可能质量下降）。
+
+> ⚠️ **AGENTS.md 警告**：不要轻易改 `yaw_skip_threshold`，调阈值只是治标。要从提高检测信号质量入手。
+
+### 7.4 Badcase 3：嘴型对不上音（sync 差）
+
+#### 现象
+生成的嘴型在动，但和音频节奏对不上。
+
+#### 根因
+- SyncNet 没训好（最常见）。
+- Stage 2 的 `sync_loss_weight=0.05` 太低。
+
+#### 训练策略
+1. **重训 SyncNet**：
+   - 用**更大的 batch size**（论文建议 1024+）。
+   - 检查数据是否经过 `sync_av.py`（AV offset 调整过）。
+   - 如果 loss 卡 0.69，按 §4.5 五因素排查。
+2. **加大 sync 权重**：把 `sync_loss_weight` 从 0.05 调到 0.1+（注意不要破坏视觉质量）。
+3. **数据侧**：检查训练视频的音频是否清晰、有无背景音乐干扰。
+
+### 7.5 Badcase 4：帧间闪烁、牙齿/胡须抖
+
+#### 现象
+单帧看着还行，但连续播放帧间有"闪烁感"，特别是牙齿、胡须区域。
+
+#### 根因
+- TREPA 权重太低或没训。
+- Motion Module 没训够。
+
+#### 训练策略
+1. **恢复 TREPA**：`trepa_loss_weight=10`（如果用了 efficient 改成 0，调回来）。
+2. **Motion Module 训练**：
+   - Stage 2 训够步数。
+   - 用标准 `stage2.yaml` 而不是 efficient。
+3. **数据侧**：检查训练视频是否有频繁的镜头切换（预处理阶段已切，但 5s 内的快速运动也会影响）。
+4. **推理后处理**：增大 `mouth_temporal_stabilization_strength`（默认 0.15，可调到 0.25）。
+
+### 7.6 Badcase 5：身份丢失（生成的脸不像原人物）
+
+#### 现象
+生成的视频里人脸变了，五官不像原视频。
+
+#### 根因
+- `ref_pixel_values` 没起到作用。
+- 训练时 ref 窗口选得太近（论文要求 `ref_start_idx` 必须离 gt 区间足够远）。
+
+#### 训练策略
+1. **检查 ref 窗口选择**（`latentsync/data/unet_dataset.py:75-80`）：ref 必须和 gt 不重叠。
+2. **数据侧**：单视频时长足够（>3×num_frames=48 帧）。
+3. **推理侧**：调高 `identity_similarity` 阈值（强制更相似）。
+
+### 7.7 Badcase 6：Mask 边界明显
+
+#### 现象
+生成的人脸上能看到 mask 边缘的"接缝"。
+
+#### 根因
+- mask 太硬（边界 0/1 跳变）。
+- 训练时 mask 和推理时不一致。
+
+#### 训练策略
+1. **检查 mask 是否归一化**：`latentsync/utils/mask.png` 是否被正确读取。
+2. **mask 边缘羽化**：参考 `AGENTS.md` 的 mask baseline 警告（baseline 是 `mask.png`，不要轻易换）。
+3. **推理后处理**：开 `_match_color_to_reference` 做颜色平滑。
+
+### 7.8 Badcase 7：大段静音 / 无嘴型
+
+#### 现象
+音频有大段静音，但生成的嘴型还在动，或者反过来。
+
+#### 根因
+- Stage 2 的 sync loss 让模型过度响应音频。
+
+#### 训练策略
+1. **数据侧**：训练数据里保留一些"说话停顿"的样本（自然语料都有）。
+2. **推理侧**：调小 `mouth_audio_motion_min_scale`（默认 0.85，可调到 0.7）。
+
+### 7.9 Badcase 排查流程
+
+```mermaid
+flowchart TB
+    START[遇到 badcase] --> Q1{是嘴糊?<br/>单帧质量差}
+    Q1 -->|是| FIX1[升分辨率训练<br/>加大 LPIPS<br/>开 CodeFormer]
+    Q1 -->|否| Q2{是 sync 差?<br/>嘴和音对不上}
+    Q2 -->|是| FIX2[重训 SyncNet<br/>batch≥1024<br/>加大 sync_loss_weight]
+    Q2 -->|否| Q3{是闪烁?<br/>帧间不一致}
+    Q3 -->|是| FIX3[恢复 TREPA=10<br/>Motion Module 训够<br/>开时序稳定]
+    Q3 -->|否| Q4{是身份丢失?}
+    Q4 -->|是| FIX4[检查 ref 窗口<br/>调 identity_similarity]
+    Q4 -->|否| Q5{是边界接缝?}
+    Q5 -->|是| FIX5[检查 mask<br/>开颜色匹配]
+    Q5 -->|否| Q6[检查 [FaceMatch] 日志<br/>看是哪个 filter 在 skip]
+```
+
+> **诊断第一步永远是看 `[FaceMatch]` 日志**：它会告诉你每种 filter 跳过了多少帧（yaw_skip、face_jump_skip 等）。如果某类 skip 异常多，说明那类样本在过滤阶段就被丢了，根本没进生成。
 
 ---
 
-## 7. 微调实战指南
+## 8. 微调实战指南
 
-### 7.1 微调场景矩阵
+### 8.1 微调场景矩阵
 
 | 微调目标 | 推荐入口 | 关键改动 | 风险 |
 |---|---|---|---|
@@ -423,47 +637,47 @@ def __call__(self, videos_fake, videos_real):
 | **256 → 512 升分辨率** | `stage1_512.yaml` → `stage2_512.yaml` | `resolution: 512`，`mask2.png` | 中（VRAM 翻倍） |
 | **省显存** | `stage2_efficient.yaml` | `decoder_only: true`, `trepa=0`, 只训 motion+attn2 | 质量略降 |
 | **重训 SyncNet** | `train_syncnet.sh` | 改 `train_fileslist` / `val_data_dir`；batch_size 越大越好（论文建议 1024） | 低 |
-| **LoRA 风格微调** | 不原生支持，需改 `scripts/train_unet.py` 加 PEFT | — | 高 |
-| **唇音同步精度 ↑** | 用更大 batch 重训 SyncNet（1024+），再 Stage 2 | SyncNet 训不动 → 全链路崩 | 中 |
+| **提升嘴部细节** | §7.2 策略组合 | 升分辨率 + 加 LPIPS | 中 |
+| **提升 sync** | §7.4 策略组合 | 重训 SyncNet（batch 1024） | 中 |
+| **提升时序一致性** | §7.5 策略组合 | 恢复 TREPA + Motion Module | 低 |
 
-### 7.2 通用 checklist（结合论文 §4 的 5 因素）
+### 8.2 通用 checklist
 
 #### 数据准备
 - [ ] 数据走过 `data_processing_pipeline.sh` 到 `high_visual_quality/`。
 - [ ] `python -m tools.write_fileslist` 生成 `train_fileslist.txt`。
-- [ ] `audio_mel_cache_dir` / `audio_embeds_cache_dir` 可写（每视频几十 MB）。
-- [ ] **新数据必须重新跑 SyncNet offset 调整**（论文 §4 结论：不做 loss 卡 0.69）。
+- [ ] `audio_mel_cache_dir` / `audio_embeds_cache_dir` 可写。
+- [ ] **新数据必须重新跑 SyncNet offset 调整**（不做 loss 卡 0.69）。
 
 #### 配置继承
 - [ ] **复制**最近的 config，不要改原文件。
 - [ ] 必改：`train_fileslist`, `val_video_path`, `val_audio_path`, `train_output_dir`, `audio_embeds_cache_dir`, `audio_mel_cache_dir`。
-- [ ] 如果改分辨率：`cross_attention_dim` 仍为 384（whisper-tiny），或 768（whisper-small）。
+- [ ] `cross_attention_dim=384`（whisper-tiny）或 768（whisper-small）。
 - [ ] `mask_image_path`：256 用 `mask.png`，512 用 `mask2.png`。
 
 #### 断点续训
-- [ ] `ckpt.resume_ckpt_path` 指向上阶段产物（如 `latentsync_unet.pt`）。
-- [ ] 从 `resume_global_step` 继续；scaler/optimizer 状态**不会**恢复，混合精度需要 warm-up。
-- [ ] Stage 2 训练时 `trainable_modules` 必须正确列出，否则全 UNet 一起动 = 显存爆炸 + 灾难遗忘。
+- [ ] `ckpt.resume_ckpt_path` 指向上阶段产物。
+- [ ] 从 `resume_global_step` 继续；scaler/optimizer 状态不会恢复。
+- [ ] Stage 2 训练时 `trainable_modules` 必须正确列出。
 
-#### SyncNet 监督（论文 §4 五因素）
+#### SyncNet 监督
 - [ ] Stage 2 必须有 SyncNet（`inference_ckpt_path` 必填）。
-- [ ] **Batch size ≥ 256**（论文 128 卡 0.69，1024 最优）。
-- [ ] **Embedding dim 末层 = 2048**（太小信息不够，太大稀疏）。
+- [ ] **Batch size ≥ 256**（128 卡 0.69，1024 最优）。
+- [ ] **Embedding dim 末层 = 2048**。
 - [ ] **`num_frames=16`**（25 帧卡住）。
-- [ ] **先 affine 再调 AV offset**（这是论文 Fig. 10 唯一收敛的预处理顺序）。
+- [ ] **先 affine 再调 AV offset**。
 
 #### 监控
 - [ ] `progress_bar.step_loss`：recon 单调下降，sync 收敛到 ~0.1-0.2。
 - [ ] `val_videos/*.mp4`：每 `save_ckpt_steps` 抽检。
 - [ ] `sync_conf_results/*.png`：曲线应稳定上升（>7 为合格）。
-- [ ] **如果 sync_conf 卡在某个低值不升**：八成是 SyncNet 没训好，回去检查 batch size / 数据预处理。
 
-#### 推理回归（论文 §5.1 设置）
-- [ ] 把新 ckpt 放 `checkpoints/latentsync_unet.pt`，重启 server 让 singleton 重新加载（env 仅启动时生效）。
+#### 推理回归
+- [ ] 把新 ckpt 放 `checkpoints/latentsync_unet.pt`，重启 server。
 - [ ] **DDIM 20 步 + guidance=1.5** 是论文标准设置。
-- [ ] 用 `eval_sync_conf.py` 在 HDTF/VoxCeleb2 30 个测试视频上跑一遍，对比论文 Table 1 基线。
+- [ ] 用 `eval_sync_conf.py` 跑一遍，对比论文 Table 1 基线。
 
-### 7.3 常见坑
+### 8.3 常见坑
 
 | 现象 | 根因 | 解决 |
 |---|---|---|
@@ -474,36 +688,25 @@ def __call__(self, videos_fake, videos_real):
 | 时序闪烁严重 | TREPA=0 或 weight 太小 | 恢复 `trepa_loss_weight=10` |
 | 前端改了参数没生效 | 没加 `_override` 后缀 | 字段名必须 `guidance_scale_override` 等 |
 | 训练完效果没变化 | `train_fileslist` 还是老的 | 重新生成 |
-
-### 7.4 论文实验设置速查（§5.1）
-
-- **数据集**：VoxCeleb2 + HDTF 混合训练。
-- **训练分辨率**：256×256（论文）/ 512×512（v1.6 changelog）。
-- **音频**：16 kHz，melspectrogram 80 mel，hop 200。
-- **DDIM 推理步数**：20。
-- **评估视频数**：HDTF/VoxCeleb2 各 30 个。
-- **评估设置**：
-  - *Reconstruction setting*：原视频原音频 → 看 SSIM。
-  - *Cross generation setting*：换音频 → 看 FID, Sync_conf, LMD, FVD。
+| 嘴部很糊 | 256 分辨率不够 | 升 512 + 加 LPIPS 权重 |
 
 ---
 
-## 8. 文件 ↔ 角色 ↔ 论文章节 三向速查
+## 9. 文件 ↔ 角色 ↔ 论文章节 三向速查
 
 | 文件 | 角色 | 论文对应章节 |
 |---|---|---|
 | `scripts/train_unet.py` | UNet 训练主循环 | §3.2 |
 | `scripts/train_syncnet.py` | SyncNet 训练主循环 | §4 |
 | `latentsync/data/unet_dataset.py` | UNet 三元组采样 | §3.1 |
-| `latentsync/data/syncnet_dataset.py` | SyncNet 正/负样本 | §3.1 SyncNet 部分 |
+| `latentsync/data/syncnet_dataset.py` | SyncNet 正/负样本 | §3.1 |
 | `latentsync/models/unet.py` | UNet3DConditionModel 定义 | §3.1 |
 | `latentsync/models/motion_module.py` | Temporal Self-Attention | §3.1 (引用 AnimateDiff) |
 | `latentsync/models/stable_syncnet.py` | StableSyncNet 编码器 | §4 |
-| `latentsync/whisper/audio2feature.py` | Whisper → 帧级特征 | §3.1 Audio layers |
-| `latentsync/trepa/loss.py` | TREPA 感知损失 | §3.3 Eq. 6 |
-| `latentsync/utils/util.py:267 one_step_sampling` | ẑ⁰ 一步估计 | §3.1 Eq. 1 |
-| `latentsync/utils/util.py:314 cosine_loss` | SyncNet 对比损失 | 附录 A |
-| `latentsync/utils/util.py:237 init_dist` | DDP 初始化 | 训练基础设施 |
+| `latentsync/whisper/audio2feature.py` | Whisper → 帧级特征 | §3.1 |
+| `latentsync/trepa/loss.py` | TREPA 感知损失 | §3.3 |
+| `latentsync/utils/util.py:267` | one_step_sampling | §3.1 Eq. 1 |
+| `latentsync/utils/util.py:314` | cosine_loss | 附录 A |
 | `preprocess/*.py` | 7 步数据清洗 | §5.1 + §4 |
 | `eval/*.py` | 离线评估指标 | §5.2 |
 | `configs/scheduler_config.json` | DDIMScheduler 配置 | 推理 |
@@ -513,21 +716,16 @@ def __call__(self, videos_fake, videos_real):
 
 ---
 
-## 9. 关键 takeaway
+## 10. 关键 takeaway
 
-1. **论文核心贡献**：
-   - 识别并解决 shortcut learning（用 SyncNet + 整脸 mask）。
-   - StableSyncNet 架构改进（HDTF 94%）。
-   - TREPA 时序对齐损失。
-   - 两阶段训练策略（解决 VAE decode 显存爆炸）。
+1. **两个核心模型**：
+   - **SyncNet** = 嘴型审核员 = 二分类网络 = 判别式
+   - **UNet** = 配音演员 = 图像生成网络 = 生成式
 
-2. **训练核心链路**：
-   ```
-   VoxCeleb2+HDTF → 7步清洗 → StableSyncNet → Stage1 (L_simple) → Stage2 (L_simple+sync+lpips+trepa) → 评估
-   ```
+2. **训练链路**：数据清洗 → SyncNet → UNet Stage1 → UNet Stage2 → 评估
 
 3. **微调黄金法则**（论文实证）：
-   - SyncNet batch ≥ 256，**最好 1024**；低于 128 一定卡 0.69。
+   - SyncNet batch ≥ 256，最好 1024；低于 128 一定卡 0.69。
    - 数据必须先 affine 再调 AV offset。
    - Stage 2 冻结 UNet 主体，只训 motion + attn。
    - 256 → 512 仅改 `resolution` 和 `mask_image_path`。
@@ -537,9 +735,11 @@ def __call__(self, videos_fake, videos_real):
    - `mixed_noise_alpha=1` —— 必须用 mixed noise 才能学时序。
    - `lower_half=true` for SyncNet —— 只看嘴部。
 
+5. **Badcase 第一步永远是查 `[FaceMatch]` 日志**，看哪个 filter 在 skip。
+
 ---
 
-## 10. 端到端时间线（示意图）
+## 11. 端到端时间线（示意图）
 
 ```mermaid
 gantt
@@ -561,8 +761,6 @@ gantt
     FID/SSIM/Sync_conf/LMD/FVD 评估 :e1, after d2, 2d
     推理回归 + 部署                  :e2, after e1, 2d
 ```
-
-> 时间数字为示意量级。实际取决于 GPU 数量与数据规模。论文未给出确切训练时长。
 
 ---
 
