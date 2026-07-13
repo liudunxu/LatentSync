@@ -178,6 +178,115 @@ unet, resume_global_step = UNet3DConditionModel.from_pretrained(
 
 其他 resnet、self-attn、time embedding 等模块 shape 兼容，可以从 SD1.5 权重 warm start 加速收敛。
 
+### 1.4 嘴部 mask 怎么算？推理需要吗？
+
+#### 一句话回答
+
+**mask 是一张预先画好的 PNG（`latentsync/utils/mask.png`），不是实时算的。训练和推理都要用它把原图的嘴部抹黑后再喂给 UNet。**
+
+#### mask.png 长什么样？
+
+一张预先生成的、人脸形状的二值图（256×256）。约定：
+
+| mask 像素值 | 含义 | masked_face 中表现 |
+|---|---|---|
+| **0**（黑） | 要 inpaint 的区域 | 嘴部被抹成黑色 |
+| **1**（白） | 保留原图 | 眼睛/额头/背景不动 |
+
+#### 怎么从原图得到"嘴被遮住的脸"？
+
+**逐像素相乘**，一行代码：
+
+```python
+# latentsync/utils/image_processor.py:244
+mask_to_use = self.mask_image[0:1]              # 加载好的固定 mask
+masked_pixel_values = pixel_values * mask_to_use  # 逐像素相乘
+```
+
+数学上：`masked = face × mask`，mask=0 的位置 → 全 0（黑），mask=1 的位置 → 原值。
+
+#### 训练侧（`UNetDataset`）
+
+```mermaid
+flowchart LR
+    GT[gt_pixel_values<br/>原图 256×256] --> MUL[× mask.png]
+    MASK[mask.png<br/>256×256] --> MUL
+    MUL --> MASKED[masked_pixel_values<br/>嘴部=0]
+
+    GT --> UN[cat → UNet 输入 13 通道]
+    MASKED --> UN
+    MASK --> UN
+    REF[ref_pixel_values] --> UN
+```
+
+#### 推理侧（`LipsyncPipeline`）
+
+**推理也要做相同的 mask 操作**，因为 UNet 只接受这种 13 通道格式的输入。
+
+```python
+# lipsync_pipeline.py:4194
+ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
+    inference_faces, affine_transform=False
+)
+```
+
+#### 为什么用"整脸 mask"而不是只遮嘴？
+
+论文 §3.1 原话：
+> *"We applied a mask that covers the entire face to minimize the model's tendency to learn visual-visual shortcuts."*
+
+**核心动机**：如果只遮嘴，眼睛/脸颊/肌肉的运动会"剧透"嘴型——UNet 会偷懒不学音频。**把整张脸都遮掉**，UNet 在 mask 内看不到任何视觉线索，就被迫只能听音频。
+
+这正是论文 §2 Fig.2 的实验结论：**mask 越大 → sync 越好**（因为偷不了懒）。
+
+#### 推理侧多了一个东西：动态嘴部 mask
+
+```python
+# lipsync_pipeline.py:3197 / 4141
+fixed_keep_mask = self.image_processor.mask_image[0:1]  # 固定 mask（mask.png）
+dynamic_region_mask = generate_dynamic_mouth_mask(
+    mouth_info,
+    fixed_keep_mask=fixed_keep_mask,  # ← 用固定 mask 当边界约束
+)
+```
+
+- **固定 mask** = mask.png → 决定"哪些像素**可以**改"
+- **动态 mask** = 每帧根据 landmark 实时算 → 决定"哪些像素**实际需要**改"
+- 动态 mask 不能超出固定 mask 的边界（AGENTS.md 里强调的 clamp）
+
+> 训练时只用固定 mask；推理时多一层动态 mask 保护，避免极端表情时生成内容扩散到脸外。
+
+#### 训练 vs 推理 mask 流程对比
+
+| 步骤 | 训练 (`UNetDataset`) | 推理 (`LipsyncPipeline`) |
+|---|---|---|
+| **加载 mask** | `__init__` 时 `load_fixed_mask` | `__init__` 时 `load_fixed_mask` |
+| **应用 mask** | `prepare_masks_and_masked_images` | `prepare_masks_and_masked_images` |
+| **mask 类型** | 固定 mask | 固定 mask + 动态 mask |
+| **是否对齐** | ❌（preprocess 已做过） | ✅（推理时实时仿射对齐） |
+
+#### 完整推理时的 mask 链路
+
+```mermaid
+flowchart TB
+    VID[原始视频帧] --> AFF[仿射对齐<br/>InsightFace 检测 106 关键点<br/>统一到 256×256]
+    AFF --> FACE[对齐后人脸]
+    FACE --> SELF[prepare_masks_and_masked_images<br/>用同一个 mask.png]
+    SELF --> REF[ref_pixel_values]
+    SELF --> MK[masked_pixel_values<br/>× mask → 抹嘴]
+    SELF --> MS[masks<br/>下采样到 64×64]
+
+    NOISE[噪声 latent] --> INP
+    REF --> INP[concat 13 通道]
+    MK --> INP
+    MS --> INP
+
+    INP --> UNET[UNet 推理<br/>20 步 DDIM]
+    UNET --> OUT[生成的嘴部]
+    OUT --> PASTE[贴回原图<br/>alignrestore.restore_img]
+    PASTE --> FINAL[最终视频]
+```
+
 #### 输入输出
 
 | | 形状 | 含义 |
