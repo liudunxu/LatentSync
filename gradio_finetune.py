@@ -20,12 +20,14 @@ an SSH host via the 'remote launch' option (writes a launch script).
 
 import argparse
 import json
+import logging
 import os
 import shlex
 import shutil
 import signal
 import subprocess
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,6 +35,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import gradio as gr
 import yaml
 from omegaconf import OmegaConf
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("gradio_finetune")
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -512,114 +521,136 @@ def launch_training(
     extra_env: str,
 ) -> Tuple[str, str]:
     """Build a config yaml, spawn the training subprocess, return status."""
+    try:
+        logger.info(
+            "[launch_training] called with preset=%s data_dir=%s fileslist=%s",
+            preset_name, train_data_dir, train_fileslist,
+        )
 
-    if _TRAINER.is_running():
+        if _TRAINER.is_running():
+            logger.warning(
+                "[launch_training] rejected: another training is already running (pid=%s)",
+                _TRAINER.proc.pid,
+            )
+            return (
+                f"❌ 训练已在运行中 (pid={_TRAINER.proc.pid}, run={_TRAINER.run_dir.name})",
+                "",
+            )
+
+        cfg = build_config_from_form(
+            preset_name=preset_name,
+            train_data_dir=train_data_dir,
+            train_fileslist=train_fileslist,
+            val_video_path=val_video_path,
+            val_audio_path=val_audio_path,
+            resume_ckpt=resume_ckpt,
+            batch_size=batch_size,
+            num_frames=num_frames,
+            resolution=resolution,
+            learning_rate=learning_rate,
+            use_motion_module=use_motion_module,
+            pixel_space_supervise=pixel_space_supervise,
+            use_syncnet=use_syncnet,
+            sync_loss_weight=sync_loss_weight,
+            perceptual_loss_weight=perceptual_loss_weight,
+            recon_loss_weight=recon_loss_weight,
+            trepa_loss_weight=trepa_loss_weight,
+            mixed_precision_training=mixed_precision_training,
+            enable_gradient_checkpointing=enable_gradient_checkpointing,
+            mask_image_path=mask_image_path,
+            save_ckpt_steps=save_ckpt_steps,
+            max_train_steps=max_train_steps,
+            num_workers=num_workers,
+            train_output_dir=train_output_dir,
+        )
+        logger.info("[launch_training] config built, train_output_dir=%s", cfg["data"]["train_output_dir"])
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        cfg_dir = REPO_ROOT / "debug" / "generated_configs"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cfg_dir / f"{preset_name.split()[0].lower()}_{ts}.yaml"
+        cfg["unet_config_path"] = str(cfg_path)
+        with open(cfg_path, "w") as f:
+            yaml.dump(OmegaConf.to_container(OmegaConf.create(cfg)), f, sort_keys=False)
+        logger.info("[launch_training] config written to %s", cfg_path)
+
+        is_syncnet = "syncnet" in PRESETS[preset_name]["config_file"]
+        is_lora = bool(PRESETS[preset_name].get("lora", {}).get("enabled", False))
+
+        if is_syncnet:
+            script = "scripts.train_syncnet"
+            config_arg = "--config_path"
+        elif is_lora:
+            script = "scripts.train_unet_lora"
+            config_arg = "--unet_config_path"
+        else:
+            script = "scripts.train_unet"
+            config_arg = "--unet_config_path"
+
+        cmd = [
+            "torchrun",
+            f"--nproc_per_node={int(nproc_per_node)}",
+            f"--master_port={int(master_port)}",
+            "-m",
+            script,
+            config_arg,
+            str(cfg_path),
+        ]
+        logger.info("[launch_training] command: %s", " ".join(shlex.quote(c) for c in cmd))
+
+        log_dir = REPO_ROOT / "debug" / "training_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_kind = "syncnet" if is_syncnet else ("unet_lora" if is_lora else "unet")
+        log_path = log_dir / f"{log_kind}_{ts}.log"
+
+        env = os.environ.copy()
+        if extra_env.strip():
+            for kv in extra_env.strip().splitlines():
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    env[k.strip()] = v.strip()
+
+        logger.info("[launch_training] spawning subprocess ...")
+        try:
+            log_f = open(log_path, "w")
+            proc = subprocess.Popen(
+                cmd,
+                cwd=REPO_ROOT,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                preexec_fn=os.setsid,
+            )
+        except FileNotFoundError as e:
+            logger.error("[launch_training] torchrun not found: %s", e)
+            return (
+                f"❌ 启动失败：{e}\n请确保 torchrun 在 PATH 中",
+                str(log_path),
+            )
+
+        _TRAINER.proc = proc
+        _TRAINER.log_path = log_path
+        _TRAINER.run_dir = REPO_ROOT / cfg["data"]["train_output_dir"]  # will be created with timestamp
+        _TRAINER.started_at = datetime.now().isoformat(timespec="seconds")
+        _TRAINER.cmd = cmd
+
+        status = (
+            f"✅ 已启动 (pid={proc.pid})\n"
+            f"📄 config: {cfg_path.relative_to(REPO_ROOT)}\n"
+            f"📜 log:    {log_path.relative_to(REPO_ROOT)}\n"
+            f"📦 产物目录: {cfg['data']['train_output_dir']}/train-<timestamp>\n"
+            f"🕐 启动时间: {_TRAINER.started_at}\n\n"
+            f"💡 命令行：\n  {' '.join(shlex.quote(c) for c in cmd)}"
+        )
+        logger.info("[launch_training] started: pid=%s log=%s", proc.pid, log_path)
+        return status, str(log_path)
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.exception("[launch_training] unhandled exception: %s", e)
         return (
-            f"❌ 训练已在运行中 (pid={_TRAINER.proc.pid}, run={_TRAINER.run_dir.name})",
+            f"❌ 启动时发生异常：{e}\n\n详细堆栈：\n{tb}",
             "",
         )
-
-    cfg = build_config_from_form(
-        preset_name=preset_name,
-        train_data_dir=train_data_dir,
-        train_fileslist=train_fileslist,
-        val_video_path=val_video_path,
-        val_audio_path=val_audio_path,
-        resume_ckpt=resume_ckpt,
-        batch_size=batch_size,
-        num_frames=num_frames,
-        resolution=resolution,
-        learning_rate=learning_rate,
-        use_motion_module=use_motion_module,
-        pixel_space_supervise=pixel_space_supervise,
-        use_syncnet=use_syncnet,
-        sync_loss_weight=sync_loss_weight,
-        perceptual_loss_weight=perceptual_loss_weight,
-        recon_loss_weight=recon_loss_weight,
-        trepa_loss_weight=trepa_loss_weight,
-        mixed_precision_training=mixed_precision_training,
-        enable_gradient_checkpointing=enable_gradient_checkpointing,
-        mask_image_path=mask_image_path,
-        save_ckpt_steps=save_ckpt_steps,
-        max_train_steps=max_train_steps,
-        num_workers=num_workers,
-        train_output_dir=train_output_dir,
-    )
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    cfg_dir = REPO_ROOT / "debug" / "generated_configs"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    cfg_path = cfg_dir / f"{preset_name.split()[0].lower()}_{ts}.yaml"
-    cfg["unet_config_path"] = str(cfg_path)
-    with open(cfg_path, "w") as f:
-        yaml.dump(OmegaConf.to_container(OmegaConf.create(cfg)), f, sort_keys=False)
-
-    is_syncnet = "syncnet" in PRESETS[preset_name]["config_file"]
-    is_lora = bool(PRESETS[preset_name].get("lora", {}).get("enabled", False))
-
-    if is_syncnet:
-        script = "scripts.train_syncnet"
-        config_arg = "--config_path"
-    elif is_lora:
-        script = "scripts.train_unet_lora"
-        config_arg = "--unet_config_path"
-    else:
-        script = "scripts.train_unet"
-        config_arg = "--unet_config_path"
-
-    cmd = [
-        "torchrun",
-        f"--nproc_per_node={int(nproc_per_node)}",
-        f"--master_port={int(master_port)}",
-        "-m",
-        script,
-        config_arg,
-        str(cfg_path),
-    ]
-
-    log_dir = REPO_ROOT / "debug" / "training_logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_kind = "syncnet" if is_syncnet else ("unet_lora" if is_lora else "unet")
-    log_path = log_dir / f"{log_kind}_{ts}.log"
-
-    env = os.environ.copy()
-    if extra_env.strip():
-        for kv in extra_env.strip().splitlines():
-            if "=" in kv:
-                k, v = kv.split("=", 1)
-                env[k.strip()] = v.strip()
-
-    try:
-        log_f = open(log_path, "w")
-        proc = subprocess.Popen(
-            cmd,
-            cwd=REPO_ROOT,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            preexec_fn=os.setsid,
-        )
-    except FileNotFoundError as e:
-        return (
-            f"❌ 启动失败：{e}\n请确保 torchrun 在 PATH 中",
-            str(log_path),
-        )
-
-    _TRAINER.proc = proc
-    _TRAINER.log_path = log_path
-    _TRAINER.run_dir = REPO_ROOT / cfg["data"]["train_output_dir"]  # will be created with timestamp
-    _TRAINER.started_at = datetime.now().isoformat(timespec="seconds")
-    _TRAINER.cmd = cmd
-
-    status = (
-        f"✅ 已启动 (pid={proc.pid})\n"
-        f"📄 config: {cfg_path.relative_to(REPO_ROOT)}\n"
-        f"📜 log:    {log_path.relative_to(REPO_ROOT)}\n"
-        f"📦 产物目录: {cfg['data']['train_output_dir']}/train-<timestamp>\n"
-        f"🕐 启动时间: {_TRAINER.started_at}\n\n"
-        f"💡 命令行：\n  {' '.join(shlex.quote(c) for c in cmd)}"
-    )
-    return status, str(log_path)
 
 
 def stop_training() -> str:
@@ -628,6 +659,26 @@ def stop_training() -> str:
     pid = _TRAINER.proc.pid
     _TRAINER.stop()
     return f"⏹ 已停止 (pid={pid})"
+
+
+def ping_backend() -> str:
+    """Simple connectivity check."""
+    logger.info("[ping_backend] received ping")
+    return f"✅ 后端连通 (pid={os.getpid()}, time={datetime.now().isoformat()})"
+
+
+def debug_all_inputs(*args) -> str:
+    """Accept any number of inputs and echo them back for diagnostics."""
+    logger.info("[debug_all_inputs] received %d args", len(args))
+    for i, arg in enumerate(args):
+        logger.info("[debug_all_inputs] arg[%d] type=%s value=%r", i, type(arg).__name__, arg)
+    lines = [f"收到 {len(args)} 个参数："]
+    for i, arg in enumerate(args):
+        preview = repr(arg)
+        if len(preview) > 200:
+            preview = preview[:200] + "..."
+        lines.append(f"  arg[{i}] ({type(arg).__name__}): {preview}")
+    return "\n".join(lines)
 
 
 def refresh_runs(train_output_dir: str) -> gr.update:
@@ -1298,6 +1349,8 @@ def build_ui() -> gr.Blocks:
             with gr.Row():
                 launch_btn = gr.Button("🚀 启动训练", variant="primary", scale=2)
                 stop_btn = gr.Button("⏹ 停止训练", variant="stop", scale=1)
+                ping_btn = gr.Button("🔍 Ping 后端", scale=1)
+                debug_btn = gr.Button("🐛 Debug 输入", scale=1)
 
             launch_status = gr.Textbox(label="启动状态", lines=10)
             log_path_state = gr.State(value="")
@@ -1315,6 +1368,22 @@ def build_ui() -> gr.Blocks:
                 outputs=[launch_status, log_path_state],
             )
             stop_btn.click(fn=stop_training, outputs=launch_status)
+
+            debug_status = gr.Textbox(label="诊断信息", lines=8, interactive=False)
+            ping_btn.click(fn=ping_backend, outputs=debug_status)
+            debug_btn.click(
+                fn=debug_all_inputs,
+                inputs=[
+                    preset_dd, train_data_dir, train_fileslist, val_video_path, val_audio_path,
+                    resume_ckpt, batch_size, num_frames, resolution, learning_rate,
+                    use_motion_module, pixel_space_supervise, use_syncnet,
+                    sync_loss_weight, perceptual_loss_weight, recon_loss_weight, trepa_loss_weight,
+                    mixed_precision_training, enable_gradient_checkpointing, mask_image_path,
+                    save_ckpt_steps, max_train_steps, num_workers, train_output_dir,
+                    nproc_per_node, master_port, extra_env,
+                ],
+                outputs=debug_status,
+            )
 
             # preset → fill defaults
             preset_dd.change(
