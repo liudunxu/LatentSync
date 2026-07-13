@@ -4576,6 +4576,604 @@ flowchart TD
 
 ---
 
+## 21. 数据集格式支持
+
+> 这一节讲 UNetDataset 当前支持哪些数据格式，gradio UI 怎么识别数据集，以及如何扩展。
+
+### 21.1 当前支持的格式
+
+| 格式 | 是否支持 | 优先级 | 代码 |
+|---|---|---|---|
+| **`train_fileslist`**（每行一个 mp4 路径） | ✅ **强烈推荐** | 1（最高） | `UNetDataset:31-33` |
+| **`train_data_dir`**（本地目录，**递归**扫 .mp4） | ✅ 支持 | 2 | `UNetDataset:35-39`（已升级为递归） |
+| 子目录嵌套（`<dir>/<speaker>/<video>.mp4`） | ✅ 支持 | — | 同上（`Path.rglob`） |
+| HuggingFace Dataset（`load_dataset`） | ❌ 不支持 | — | — |
+| URL / HTTP 下载 | ❌ 不支持 | — | — |
+| WebDataset（`.tar`） | ❌ 不支持 | — | — |
+| S3 / GCS / OSS | ❌ 不支持（但可挂载后用本地路径） | — | — |
+
+**优先级规则**（`UNetDataset.__init__`）：
+
+```python
+if train_fileslist != "":       # 优先级 1：fileslist
+    load from fileslist
+elif train_data_dir != "":      # 优先级 2：目录（递归）
+    load from dir.rglob("*.mp4")
+else:
+    raise ValueError
+```
+
+### 21.2 推荐用法
+
+#### 21.2.1 方式 A：fileslist（最灵活）
+
+```bash
+# 1. 用 tools/write_fileslist.py 生成
+python -m tools.write_fileslist
+# 编辑文件里的路径
+
+# 2. 在 gradio UI 选 preset 时填
+train_fileslist: /data/my_dataset/fileslist.txt
+```
+
+**fileslist 格式**（每行一个绝对路径）：
+```
+/data/voxceleb2/abc/001.mp4
+/data/voxceleb2/abc/002.mp4
+/data/HDTF/xyz/001.mp4
+```
+
+**优点**：
+- 跨多个目录混用
+- 手动控制哪些视频入选
+- 可以接 manifest 增量处理
+
+#### 21.2.2 方式 B：本地目录（最简单）
+
+```bash
+# 1. 把所有 mp4 放到一个目录
+mkdir /data/my_dataset
+cp *.mp4 /data/my_dataset/
+
+# 2. 在 gradio UI 选 preset 时填
+train_data_dir: /data/my_dataset
+```
+
+**现在支持递归**（已升级）：`/data/my_dataset/<speaker>/001.mp4` 也能被扫到。
+
+#### 21.2.3 方式 C：preprocess 产物（推荐生产用）
+
+`data_processing_pipeline.sh` 跑完后会得到：
+
+```
+data/
+├── resampled/          # 25fps 16kHz
+├── shot/              # 按镜头切分
+├── segmented/         # 5s 切片
+├── affine_transformed/  # 256×256 对齐
+├── av_synced_3/       # AV offset 调过
+└── high_visual_quality/  # ← 用这个！
+```
+
+填 `train_data_dir: data/high_visual_quality` 即可。
+
+### 21.3 gradio UI 的数据集下拉框
+
+`gradio_finetune.py:list_datasets()`（约 246-260 行）：
+
+```python
+candidates = []
+for root in (REPO_ROOT, REPO_ROOT / "preprocess", REPO_ROOT / "data"):
+    for path in root.rglob("*.mp4"):
+        parent = path.parent
+        if parent.name in {"high_visual_quality", "segmented", "affine_transformed"}:
+            rel = str(parent.relative_to(REPO_ROOT))
+            if rel not in candidates:
+                candidates.append(rel)
+return sorted(candidates)
+```
+
+**只识别这三种命名的目录**：
+- `high_visual_quality`（首选，最干净）
+- `segmented`（中间产物）
+- `affine_transformed`（中间产物）
+
+**自定目录怎么办**：选 `train_data_dir` 直接填绝对路径，或在 `list_datasets` 里加自己的目录名。
+
+### 21.4 HuggingFace Dataset 支持（未来扩展）
+
+**目前完全不支持**。如需支持，可以加一个 `HuggingFaceUNetDataset`：
+
+```python
+# latentsync/data/hf_dataset.py（未来）
+from datasets import load_dataset
+
+class HuggingFaceUNetDataset(Dataset):
+    def __init__(self, hf_repo: str, config):
+        # 例：hf_repo = "username/my-lipsync-videos"
+        self.ds = load_dataset(hf_repo, split="train")
+        # 假设每行有 'video' 字段（bytes 或 path）
+    
+    def __len__(self):
+        return len(self.ds)
+    
+    def __getitem__(self, idx):
+        item = self.ds[idx]
+        # 解码 video bytes / 加载路径
+        # 复用 UNetDataset 的视频处理逻辑
+        ...
+```
+
+**需要解决**：
+1. HF dataset 的视频字段格式（bytes？path？）
+2. 本地缓存策略（每次都从 HF 拉慢）
+3. audio 是否也在 HF dataset 里
+4. 训练时的网络中断恢复
+
+**实现成本**：中等（1-2 天），需要明确数据 schema。
+
+### 21.5 自定义格式：扩展点
+
+如果你的数据不是 mp4（比如 webm、mov、avi），可以：
+
+1. **方式 1：转换格式**（最简单）
+   ```bash
+   for f in *.webm; do
+       ffmpeg -i "$f" -c:v libx264 -c:a aac "${f%.webm}.mp4"
+   done
+   ```
+
+2. **方式 2：扩展 UNetDataset**
+   ```python
+   class UNetDataset(Dataset):
+       SUPPORTED_EXT = {".mp4", ".webm", ".mov"}
+       
+       def __init__(self, ...):
+           self.video_paths = sorted(
+               str(p) for p in Path(train_data_dir).rglob("*")
+               if p.suffix.lower() in self.SUPPORTED_EXT
+           )
+   ```
+   `decord` 本来就支持多种格式，不用改 video loading。
+
+3. **方式 3：加 `__init__` 参数控制**
+   ```python
+   class UNetDataset:
+       def __init__(self, train_data_dir, config, allowed_extensions=None):
+           exts = allowed_extensions or {".mp4"}
+           self.video_paths = sorted(
+               str(p) for p in Path(train_data_dir).rglob("*")
+               if p.suffix.lower() in exts
+           )
+   ```
+
+### 21.6 故障排查
+
+| 症状 | 原因 | 怎么修 |
+|---|---|---|
+| 训练 dataset size = 0 | 路径错 / 文件名后缀不是 .mp4 | 检查 `train_data_dir` 是否对；用 `find $dir -name "*.mp4"` 看 |
+| 训练只加载部分视频 | 老版本不递归 / 目录嵌套 | **已修复**（升级为 rglob） |
+| 内存爆 | dataset 太大 / 视频太长 | 跑 preprocess 切到 5s 段；调小 batch_size |
+| 卡在读视频 | 视频文件损坏 | 用 `ffprobe $f` 检查；跑 `preprocess/remove_broken_videos.py` |
+| HF dataset 加载不到 | 还没实现 | 见 §21.4 |
+
+### 21.7 一句话总结
+
+> **当前 UNetDataset 只支持本地 mp4 文件**，通过两种方式：
+> 1. **fileslist**（推荐，灵活）
+> 2. **目录递归**（已升级，2026-07 之后支持嵌套）
+>
+> **HuggingFace Dataset / WebDataset / URL 都不支持**。如需要，加一个 `HuggingFaceUNetDataset` 类（§21.4 给了模板）。
+> **扩展最简单**：改 `UNetDataset` 的 `rglob` 后缀白名单（§21.5 给了代码）。
+
+---
+
+## 22. 为什么所有微调都是 Stage 2？Stage 2 如何解决 badcase？
+
+> **直答**：Stage 1 只学"什么是脸"，Stage 2 学"什么是会说话的、一致的、清楚的脸"。**所有 badcase 都需要 Stage 2 的能力**。
+
+### 22.1 两阶段定位
+
+```mermaid
+flowchart TB
+    subgraph S1[Stage 1: 学视觉特征]
+        S1A[输入: masked 帧 + ref 帧] --> S1B[目标: 重建 GT 帧]
+        S1B --> S1C[损失: 仅 L_simple latent MSE]
+        S1C --> S1D[学到: 什么是脸, 什么是 inpaint]
+    end
+
+    subgraph S2[Stage 2: 学视听关联]
+        S2A[输入: masked 帧 + ref + 音频特征] --> S2B[目标: 重建 GT + 听音]
+        S2B --> S2C[损失: L_simple + L_sync + L_lpips + L_trepa]
+        S2C --> S2D[学到: 什么是对的嘴型, 什么是清楚, 什么是时序一致]
+    end
+```
+
+| 维度 | Stage 1 | Stage 2 |
+|---|---|---|
+| 音频 | ❌ 不用 | ✅ 用作 cross-attention |
+| Sync loss | ❌ | ✅ StableSyncNet |
+| LPIPS | ❌ | ✅ VGG perceptual |
+| TREPA | ❌ | ✅ VideoMAE-v2 时序 |
+| 训练时长 | 5-10 天 | 5-10 天 |
+| 主要学什么 | "什么是一张脸" | "什么是会说话的脸" |
+| 单独有用？ | ❌（嘴型对不上音）| ✅（完整功能） |
+
+### 22.2 Badcase 根因 → Stage 2 解法 完整对照
+
+```mermaid
+flowchart LR
+    B1[嘴糊] -.Stage 1 缺.-> S2A[L_lpips 监督嘴部细节]
+    B2[sync 差] -.Stage 1 缺.-> S2B[L_sync 强制音视对齐]
+    B3[闪烁] -.Stage 1 缺.-> S2C[L_trepa 强制时序平滑]
+    B4[侧脸] -.Stage 1 缺.-> S2D[用真实侧脸样本训]
+    B5[身份丢失] -.Stage 1 缺.-> S2E[用多身份样本训]
+```
+
+#### 详细对照表
+
+| Badcase | Stage 1 表现 | Stage 2 改进机制 | 训练侧设置 |
+|---|---|---|---|
+| **嘴部模糊** | 嘴糊，因为只有 latent MSE 监督 | `L_lpips`（VGG 感知）监督下半张脸 | `perceptual_loss_weight=0.1`，升 512 → `mask2.png` |
+| **嘴音不同步** | 嘴完全对不上音（没听） | `L_sync`（StableSyncNet 监督）| `sync_loss_weight=0.05`，`use_syncnet=true` |
+| **帧间闪烁** | 每帧独立生成（无时序约束） | `L_trepa`（VideoMAE-v2 时序特征对齐）| `trepa_loss_weight=10`，`use_motion_module=true` |
+| **侧脸 / 大嘴** | 训练集里没大量侧脸，学不到 | 用真实 VoxCeleb2+HDTF 混合数据训 | 加 30%+ 侧脸/极端表情样本 |
+| **身份丢失** | ref 窗口随机，identity 信息没强监督 | LPIPS+sync 间接保留 + ref 仍是输入 | 多身份数据集 |
+| **嘴部细节不自然** | LPIPS 关，嘴部纹理学不到 | LPIPS 开了，VGG 特征对齐 | `perceptual_loss_weight=0.2+` |
+
+### 22.3 为什么 Stage 1 不行？详细原因
+
+#### 嘴糊：Stage 1 缺 LPIPS
+
+```python
+# Stage 1 (scripts/train_unet.py:415)
+loss = recon_loss * recon_loss_weight      # 只有 latent MSE
+# 训练完的 UNet 知道"图是张脸"，但不知道"嘴部应该清楚"
+```
+
+**问题**：
+- `recon_loss = MSE(pred_noise, noise)` 在 **latent 空间** 算
+- latent 空间的 MSE 距离 ≠ 像素空间的视觉距离
+- UNet 在 latent 上 MSE 很小，但 decode 到 pixel 后嘴部可能糊
+
+**Stage 2 解法**：
+- `lpips_loss` 在 **pixel 空间** 算
+- VGG 特征对"嘴部纹理"敏感
+- UNet 学到"嘴部要清楚"
+
+#### sync 差：Stage 1 不用音频
+
+```python
+# Stage 1 audio_embeds = None (scripts/train_unet.py:286)
+```
+
+**问题**：
+- UNet 在 Stage 1 完全没听过音频
+- 推理时即使给音频 cross-attn，UNet 不知道怎么响应
+- 嘴型完全是模型"自由发挥"
+
+**Stage 2 解法**：
+- `L_sync = cosine_loss(SyncNet(generated), audio)` 强制音视对齐
+- UNet 学到"音频说'a'，嘴部要张开"
+
+#### 闪烁：Stage 1 无时序约束
+
+```python
+# Stage 1 用 noise[:, :, 0:1].repeat(1, 1, num_frames, 1, 1)
+# 所有帧用同一 noise → 但只算 latent MSE 仍然不够
+```
+
+**问题**：
+- 单帧 latent MSE 最小化 → 每帧单独最优
+- UNet 不知道"前后帧应该连贯"
+- 牙齿/胡须/皮肤纹理每帧微变 → 闪烁
+
+**Stage 2 解法**：
+- `L_trepa` 用 VideoMAE-v2 提取 16 帧的**时序特征**，要求生成和 GT 的时序特征一致
+- 加上 Motion Module（`use_motion_module=true`）让 UNet 内部有跨帧 attention
+- 两层一起保证时序一致
+
+### 22.4 Stage 2 的 4 项损失全解
+
+```mermaid
+flowchart TB
+    L_simple[L_simple<br/>latent MSE<br/>Stage 1 就有] --> SUM
+    L_sync[L_sync<br/>cosine 距离<br/>Stage 2 新增] --> SUM
+    L_lpips[L_lpips<br/>VGG 感知<br/>Stage 2 新增] --> SUM
+    L_trepa[L_trepa<br/>VideoMAE 时序<br/>Stage 2 新增] --> SUM
+
+    SUM[L_total = 0.1·L_sync + 0.1·L_lpips + 10·L_trepa + 1·L_simple]
+
+    L_simple -.管.-> S[生成图是 GT 的 latent 重建]
+    L_sync -.管.-> SY[sync 能力]
+    L_lpips -.管.-> D[嘴部细节]
+    L_trepa -.管.-> T[时序一致]
+```
+
+**Stage 2 的 4 项损失**（论文 Eq. 5）：
+
+| 损失 | 解决 badcase | Stage 1 有吗 |
+|---|---|---|
+| `L_simple` | 通用重建 | ✅ 有 |
+| `L_sync` | 嘴音同步 | ❌ Stage 2 新增 |
+| `L_lpips` | 嘴部细节 | ❌ Stage 2 新增 |
+| `L_trepa` | 帧间闪烁 | ❌ Stage 2 新增 |
+
+**结论**：**任何 badcase 都需要 Stage 2 独有的损失**。这就是为什么微调都基于 Stage 2。
+
+### 22.5 那 Stage 1 还有什么用？
+
+| 场景 | 用 Stage 1 吗 |
+|---|---|
+| **微调（Fine-tune）** | ❌ 直接用 Stage 2 (推荐 Stage 2 256 或 Efficient) |
+| **从零训练（罕见）** | ✅ 必须先 Stage 1 → Stage 2 |
+| **训练新语言** | ❌ Stage 1 训完也不会说新语言（没用音频）→ 直接 Stage 2 训 |
+| **训练新风格**（动漫/影视）| ❌ 直接 Stage 2 训 |
+| **研究 / 实验** | ✅ 想理解"先学视觉再学视听"的分阶段设计 |
+
+**Stage 1 的真正用途**：
+- 学术研究（论文核心贡献之一：证明"先视觉再视听"的分阶段策略有效）
+- 从零训练流程的第一步（但很少有人从零训）
+- 不应该作为微调方案
+
+### 22.6 为什么没有 Stage 3？
+
+**Stage 2 已经是论文 Eq.5 的最完整形式**：
+```
+L_total = λ1·L_simple + λ2·L_sync + λ3·L_lpips + λ4·L_trepa
+```
+
+4 项损失覆盖了**所有可监督的维度**：
+- `L_simple`：重建
+- `L_sync`：视听同步
+- `L_lpips`：感知细节
+- `L_trepa`：时序一致
+
+**没有第 5 项损失可以加**了。剩下的 badcase 都是数据 / 推理侧问题，不能靠加 loss 解决：
+
+| 剩余 badcase | 原因 | 怎么解 |
+|---|---|---|
+| 侧脸 / 大嘴 | mask 形状问题 | 数据 + 推理 mask |
+| Mask 接缝 | paste back blur | 推理参数 |
+| 身份丢失 | ref 窗口 + 数据少身份 | 数据 + 推理 |
+| 静音 | 音频 RMS 低 | 推理参数 |
+| 牙齿闪烁 | 仍是 1k 数据不足 | 加大数据 |
+
+### 22.7 一句话总结
+
+> **Stage 1 学"什么是一张脸"（没听音频）；Stage 2 学"什么是对嘴型、清楚、一致的脸"（听音频 + 4 项损失）**。
+> **所有 badcase 都需要 Stage 2 独有的能力**：
+> - 嘴糊 → `L_lpips`（Stage 2）
+> - sync 差 → `L_sync`（Stage 2）
+> - 闪烁 → `L_trepa` + Motion Module（Stage 2）
+>
+> **所以"基于 Stage 2 的微调"能解决相关 badcase**。Stage 1 只能从零训练时用，微调不需要。
+> **没有 Stage 3**——Stage 2 的 4 项损失已经覆盖所有可监督的维度。
+
+### 22.8 推荐回答用户问题
+
+> **Q：为什么 gradio_finetune.py 里的 preset 都是 Stage 2？**
+> A：因为所有 badcase 都需要 Stage 2 独有的损失（`L_sync` / `L_lpips` / `L_trepa`）。Stage 1 没有这些损失，训出来只能补全脸，**不会说话、嘴糊、闪烁**。所以微调只能从 Stage 2 开始（resumeckpt 用官方 latentsync_unet.pt，加 LoRA / QLoRA 是参数高效化）。
+
+---
+
+## 23. 深度专题：侧脸 / 大角度为什么失败
+
+> **直答**：侧脸失败的根因不在 UNet，在 **仿射对齐 + mask 形状 + landmark 噪声** 的级联失败。本节从代码层面讲清楚为什么 Stage 2 训练也救不了，**真正能做什么**。
+
+### 23.1 侧脸失败的 5 个级联步骤
+
+```mermaid
+flowchart TD
+    A[原始视频<br/>侧脸/转头] --> B[1. InsightFace 检测 106 关键点<br/>+ 3D pose yaw]
+    B --> C[2. AffineTransform 仿射对齐<br/>到 256×256]
+    C --> D[3. fixed mask.png 抹脸]
+    D --> E[4. UNet 生成嘴部]
+    E --> F[5. paste_surrounding_pixels_back<br/>用 ref_pixel_values 还原]
+
+    B -.yaw 大.-> G1[landmark 抖<br/>affine 误差大]
+    C -.误差传递.-> G2[对齐后人脸偏离中心]
+    D -.mask 是对称.-> G3[mask 不能完全覆盖侧脸]
+    E -.UNet 没见过.-> G4[生成内容不贴真实轮廓]
+    F -.paste back.-> G5[边缘接缝明显]
+
+    G1 --> X[❌ 侧脸坏]
+    G2 --> X
+    G3 --> X
+    G4 --> X
+    G5 --> X
+```
+
+### 23.2 5 步详细分析
+
+#### 步骤 1：InsightFace 检测
+
+```python
+# latentsync/utils/face_detector.py
+face, box, affine_matrix, embedding, landmark_2d_106 = det.detect(frame)
+```
+
+**问题**：
+- 侧脸时，InsightFace 的 106 个关键点精度下降
+- 3D pose yaw 估计在 60°+ 时不准
+- 90° 完全侧脸时只能看到半张脸，landmark 数量减少
+
+**当前防护**（`lipsync_pipeline.py:282 _estimate_yaw_degrees`）：
+
+```python
+# 多信号融合估算 yaw
+signals = [
+    nose_yaw,    # 鼻尖偏移 * 60
+    eye_yaw,      # 眼睛不对称 * 30 (gated at ratio > 1.5)
+    mouth_yaw,    # 嘴角不对称 * 100 (gated at diff > 0.2)
+    area_yaw,     # 人脸面积变化 * 1200
+    aspect_yaw,   # 宽高比变化 * 60
+]
+# 取最大值（最保守估计）
+return sign * max(abs(*signals))
+```
+
+**为什么训练救不了**：检测精度是 InsightFace 模型的固有能力，**和你训不训 LatentSync 无关**。
+
+#### 步骤 2：仿射对齐
+
+```python
+# latentsync/utils/affine_transform.py
+face, _, _ = image_processor.affine_transform(frame)
+# 把人脸 crop + warp 到 256×256 标准正面
+```
+
+**问题**：
+- 侧脸时，warp 矩阵会"压扁"人脸
+- warp 后的 256×256 图像里，脸部不是标准正面 → 训练分布外
+- mask 形状假设人脸在中心对称位置
+
+**当前防护**：`yaw_skip_threshold=40.0`，超过就 passthrough
+
+**为什么训练救不了**：
+- 仿射对齐算法是固定的
+- UNet 训过"侧脸对齐图"，但 inference 时的对齐误差和训练集不完全一致
+- 训练只能**平均**降低对齐误差的影响，不能根治
+
+#### 步骤 3：固定 mask
+
+```python
+# latentsync/utils/image_processor.py:load_fixed_mask
+mask_image = cv2.imread("latentsync/utils/mask.png")  # 预先生成
+```
+
+**问题**：
+- mask.png 是**对称的**人脸形状
+- 侧脸时实际脸型是**不对称的**（一面更窄）
+- mask 边缘会"溢出"到背景，或"漏掉"侧脸外侧
+
+**当前防护**：
+- 训练用 `fixed_keep_mask` clamp `dynamic mask`，**侧脸外扩被截断**
+- 推理侧用 `dynamic_region_mask` 椭圆（pad_width=1.5, pad_height=1.3/2.2）
+
+**为什么训练救不了**：
+- `AGENTS.md` 明确说 **"Mask & feather baseline is locked at `ef3903f` with `latentsync/utils/mask.png`. Do not toggle masks"**
+- 改 mask 必须全链路重训
+
+#### 步骤 4：UNet 生成
+
+**理论上**：UNet 训过"侧脸对齐图"，应该能生成。
+
+**实际上**：
+- VoxCeleb2 + HDTF 里**侧脸样本占比 < 30%**（多数是采访，正面或微侧）
+- UNet 在侧脸对齐图上学到的分布**稀疏**
+- 极端侧脸（>45°）时 UNet 仍然在"猜" → 嘴部可能错位
+
+**当前防护**：
+- 数据侧：`preprocess/filter_visual_quality.py` 没筛侧脸
+- 训练侧：Stage 2 用真实数据训，**间接学到侧脸能力**
+
+**能做什么**：
+- **加侧脸数据**：从 YouTube 拍侧脸采访 → 进 VoxCeleb2 风格数据集
+- **数据增强**：随机 yaw 旋转训练样本
+
+#### 步骤 5：paste_surrounding_pixels_back
+
+```python
+# lipsync_pipeline.py:4298
+decoded_latents = paste_surrounding_pixels_back(
+    decoded_latents, ref_pixel_values, generated_region_mask, device, weight_dtype
+)
+```
+
+**问题**：
+- 侧脸时，`generated_region_mask` 椭圆和实际嘴部位置可能不对齐
+- paste back 后，**嘴部** 在 mask 外 → 留下原图（不动）
+- **嘴部** 在 mask 内（但位置错） → UNet 生成的"假嘴部"贴回去 → 错位明显
+
+**当前防护**：
+- mask 边缘羽化（`feather_sigma_px=7`）软化边界
+- `_match_color_to_reference` 颜色匹配
+- `_restore_reference_detail` 高频细节贴回
+
+### 23.3 真能解决侧脸的 4 件事
+
+#### 1. 加侧脸数据（最有效）
+
+```python
+# 收集侧脸数据源
+# 1. YouTube 采访（侧脸居多）
+# 2. TED 演讲（演讲者常转头看观众）
+# 3. 电视剧（演员对话，侧脸交流）
+
+# 数据准备
+./data_processing_pipeline.sh  # 跑标准 7 步
+# 然后再叠：
+# - 过滤 yaw > 20° 的视频
+# - 平衡数据集：侧脸 ≥ 30%
+```
+
+**预期效果**：1k 步后侧脸 sync_conf 提升 5-10%。
+
+#### 2. 改训练设置（次有效）
+
+```yaml
+# configs/unet/stage2.yaml
+trainable_modules:
+  - motion_modules.
+  - attentions.      # 全 attn 都训
+run:
+  sync_loss_weight: 0.1   # 默认 0.05，加倍
+  # ⚠️ 不要碰 mask / paste back
+```
+
+#### 3. 调推理参数（不训练）
+
+```python
+# lipsync_pipeline.py kwargs
+yaw_skip_threshold=45.0           # 默认 40，提到 45 让更多侧脸进 UNet
+side_face_passthrough_yaw_threshold=22.5  # 默认 0，22.5 让中度侧脸 passthrough
+dynamic_mask_pad_width_ratio=2.0   # 默认 1.5，让 mask 覆盖更大
+```
+
+**注意**：这些只是"补救"，不解决根本问题。
+
+#### 4. 多角度数据增强（研究级）
+
+```python
+# 在 latentsync/data/unet_dataset.py 加增强
+def random_yaw_augment(self, frames):
+    """随机水平翻转 + 旋转模拟侧脸"""
+    if random.random() < 0.5:
+        frames = frames[:, :, ::-1, :]  # 水平翻转
+    return frames
+```
+
+**效果**：可能，但需要重训。
+
+### 23.4 哪些做法没用
+
+| 做法 | 为什么没用 |
+|---|---|
+| 改 `mask.png` 形状 | AGENTS.md 锁了 baseline，且改 mask 必须全链路重训 |
+| 改 `yaw_skip_threshold` | AGENTS.md 警告"调阈值是 band-aid，要从信号质量入手" |
+| 加 `LoRA` 想解决侧脸 | LoRA 训的是 attention 投影，不是检测器 |
+| 调 `L_sync` 想让侧脸同步 | L_sync 只在 mask 内算；侧脸 mask 漏嘴 → sync 也算不到 |
+
+### 23.5 检查清单
+
+训练侧脸后，对照检查：
+
+- [ ] 训练数据侧脸占比 ≥ 30%
+- [ ] 推理时 [FaceMatch] 日志 `yaw_skip` 不异常多
+- [ ] Tab 6 Badcase 检查的"身份保持" > 0.7（侧脸时 identity 易丢）
+- [ ] 试 `dynamic_mask_mode=aggressive` 看会不会好
+- [ ] 仍不行 → 看 `_estimate_yaw_degrees` 的多信号融合（可能本地化优化）
+
+### 23.6 一句话总结
+
+> **侧脸失败的根因不在 UNet，而在级联流水线**（检测 → 对齐 → mask → 生成 → paste back）。
+> **训练能做的有限**：加数据、调 trainable_modules、调 sync_loss_weight。
+> **真正解决需要数据侧努力**：补 30%+ 侧脸样本，而不是改 mask / 阈值。
+> 调 mask 会被 AGENTS.md 锁住；改阈值是 band-aid。
+
+---
+
 ## 附录 A：论文数学公式对照
 
 | 公式 | 含义 | 代码位置 |

@@ -590,6 +590,86 @@ flowchart LR
 
 请看 [training_pipeline.md §20](../training_pipeline.md#20-badcase-驱动的微调策略选择)（技术深度版）。
 
+### 6.7 为什么所有微调 preset 都是 Stage 2？
+
+> 完整版见 [training_pipeline.md §22](../training_pipeline.md#22-为什么所有微调都是-stage-2stage-2-如何解决-badcase)（技术深度版）。本节是**用户视角的简短版**。
+
+**直答**：Stage 1 训出来"能补全脸但不会说话"，Stage 2 训出来"会说话 + 清楚 + 一致"。**所有 badcase 都需要 Stage 2 独有的能力**。
+
+| Badcase | Stage 1 表现 | Stage 2 改进机制 |
+|---|---|---|
+| 嘴糊 | 嘴糊，只有 latent MSE 监督 | `L_lpips`（VGG 感知）监督下半张脸 |
+| sync 差 | 嘴完全对不上音（没听）| `L_sync`（StableSyncNet 监督）|
+| 闪烁 | 每帧独立生成 | `L_trepa`（VideoMAE-v2 时序）|
+| 身份丢失 | ref 随机，无强监督 | LPIPS + sync 间接保留 + ref 输入 |
+| 侧脸 / 大嘴 | 训练集侧脸少 | 用真实数据训，加 30%+ 侧脸样本 |
+
+**没有 Stage 3**——Stage 2 的 4 项损失（`L_simple + L_sync + L_lpips + L_trepa`）已经覆盖所有可监督维度。剩下的 badcase 都是数据 / 推理侧问题。
+
+### 6.8 深度专题：侧脸 / 大角度为什么失败
+
+> 完整版见 [training_pipeline.md §23](../training_pipeline.md#23-深度专题侧脸--大角度为什么失败)（技术深度版）。本节是**用户视角的简短版**。
+
+**直答**：侧脸失败的根因**不在 UNet**，而在**级联流水线**（检测 → 对齐 → mask → 生成 → paste back）。
+
+#### 5 个失败步骤
+
+```mermaid
+flowchart TD
+    A[侧脸视频] --> B[1. InsightFace 检测<br/>yaw 估计不准]
+    B --> C[2. 仿射对齐<br/>误差大]
+    C --> D[3. 固定 mask<br/>对称形状漏嘴]
+    D --> E[4. UNet 生成<br/>没见过]
+    E --> F[5. paste back<br/>位置错位]
+    F --> X[❌ 失败]
+```
+
+#### 训练侧能做的（有限）
+
+| 做法 | 效果 | 推荐度 |
+|---|---|---|
+| **加 30%+ 侧脸样本** | 直接补训练分布 | ✅ 强推 |
+| 调 `sync_loss_weight=0.1` | 略提升 sync | ⭐ |
+| 调 `trainable_modules` 加全 attn | 间接帮助 | ⭐ |
+
+#### 推理侧能做的
+
+```python
+# 推理时调大这些阈值（Tab 4 也能调）
+yaw_skip_threshold=45.0              # 默认 40
+side_face_passthrough_yaw_threshold=22.5  # 默认 0
+dynamic_mask_mode="aggressive"        # 默认 standard
+```
+
+#### 千万别做的事
+
+| ❌ 做法 | 原因 |
+|---|---|
+| 改 `mask.png` 形状 | AGENTS.md 锁了 baseline |
+| 改 `yaw_skip_threshold` | band-aid，不解决根因 |
+| LoRA 训侧脸 | LoRA 只训 attention，不是检测器 |
+
+#### 完整决策树
+
+```mermaid
+flowchart TD
+    A[遇到侧脸 badcase] --> B{训练数据有 30%+ 侧脸?}
+    B -->|否| C[优先加数据<br/>而不是改训练配置]
+    B -->|是| D[训好了还是侧脸失败?]
+    D -->|是| E[看 FaceMatch 日志<br/>yaw_skip 次数]
+    E -->|很多| F[检检测器问题<br/>不是训练问题]
+    E -->|不多| G[调推理 yaw_skip / mask]
+    G -->|还不行| H[研究级:<br/>仿射对齐优化<br/>多角度数据增强]
+```
+
+#### 实操建议
+
+1. **加数据**优先于调配置
+2. 用 Tab 6 量化"侧脸时 sync_conf 多少"
+3. 用 Tab 4 调 `dynamic_mask_mode=aggressive` 试一下
+4. 看 `_estimate_yaw_degrees` 是否需要本地化调
+5. **别动 mask**（AGENTS.md 警告）
+
 ---
 
 ## 7. 常见问题 FAQ
@@ -630,6 +710,15 @@ A：本 UI 已集成 `TrainingState`，会自动从 `training_state.pt` 恢复 o
 
 ### Q：怎么对比多个 ckpt？
 A：Tab 3 支持两两对比。如果要批量对比，循环用 `scripts/evaluate_checkpoint.py`。
+
+### Q：我的数据在子目录嵌套里（比如 `data/train/abc/001.mp4`），能加载吗？
+A：✅ 能。2026-07 之后 `UNetDataset` 已升级为 `Path.rglob("*.mp4")`，**自动递归扫所有子目录**。直接填 `train_data_dir: data/train` 即可。
+
+### Q：支持 HuggingFace Dataset 吗？
+A：❌ 不支持。详见 [training_pipeline.md §21](../training_pipeline.md#21-数据集格式支持)。如需要，可以加一个 `HuggingFaceUNetDataset` 类（文档给了模板）。
+
+### Q：可以加载 webm / mov / avi 吗？
+A：decord 本身支持多种格式，但 `UNetDataset` 默认只过滤 `.mp4` 后缀。改一行（见 [training_pipeline.md §21.5](../training_pipeline.md#215-自定义格式扩展点)）就能支持。
 
 ---
 
