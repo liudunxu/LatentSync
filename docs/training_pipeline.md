@@ -739,6 +739,138 @@ else:
 
 **诊断方法**：训练几个 step 看 loss，如果不往下走，就卡这 5 个因素里。
 
+### 4.7 StableSyncNet vs SyncNetEval：为什么需要两个 SyncNet？
+
+> **直答**：**StableSyncNet = 论文提出的新架构（训练时给 UNet 当老师）**；**SyncNetEval = Joon Son Chung 2016 原版（预处理 + 离线评估用）**。两者**不替代**。
+
+#### 4.7.1 一表对比
+
+| 维度 | **StableSyncNet** | **SyncNetEval** |
+|---|---|---|
+| 位置 | `latentsync/models/stable_syncnet.py` | `eval/syncnet/syncnet.py` |
+| 来源 | **论文创新**（基于 SD U-Net encoder） | **Joon Son Chung 2016 原版**（从 `joonson/syncnet_python` 复制） |
+| 架构 | SD U-Net encoder + ResBlock + 可选 Self-Attention | 传统 Conv2D + BatchNorm + ReLU + MaxPool |
+| 准确率（HDTF） | **94%**（论文 SOTA） | **91%**（老 baseline） |
+| 用途 | UNet Stage 2 训练的 `L_sync` 监督者 | 数据预处理 AV offset 调整 + 离线评估 |
+| 训练时 | ✅ 加载并冻结 | ❌ 完全不参与 |
+| 推理时 | ❌ 完全不参与 | ❌ 也不参与（preprocess/eval 流程会跑） |
+| Checkpoint | `stable_syncnet.pt` | `syncnet_v2.model` |
+| 配置文件 | `configs/syncnet/syncnet_16_pixel_attn.yaml` | 无 yaml，hard-code 路径 |
+
+#### 4.7.2 流程图
+
+```mermaid
+flowchart LR
+    subgraph TRAIN[训练 UNet Stage 2]
+        SSN[StableSyncNet<br/>latentsync/models<br/>SD U-Net 架构<br/>94% HDTF]
+        UN[UNet]
+        UN -.L_sync.-> SSN
+        SSN -.grad 反馈.-> UN
+    end
+
+    subgraph OFFLINE[离线 / Preprocess]
+        SNE[SyncNetEval<br/>eval/syncnet<br/>原始 Conv2D 架构<br/>91% HDTF]
+    end
+
+    subgraph PIPELINE[流程]
+        P1[preprocess/sync_av.py<br/>调 AV offset 到 0]
+        P2[eval/eval_sync_conf.py<br/>给生成视频打分]
+        SNE --> P1
+        SNE --> P2
+    end
+```
+
+#### 4.7.3 为什么 StableSyncNet（论文创新）
+
+论文 §4 做了详尽的 SyncNet 收敛性研究（详见 §4.5 五因素消融），发现 5 个关键因素让旧架构不够用：
+
+| 因素 | 旧 SyncNet 表现 | StableSyncNet 表现 |
+|---|---|---|
+| 架构 | 卡 0.69 | 正常收敛 |
+| Batch size | 128 卡 0.69 | 1024 收敛 |
+| Embedding dim | 2048 时勉强 | 2048 稳定 |
+| 帧数 | 25 卡住 | 16 收敛 |
+| 数据预处理 | 难收敛 | 正常 |
+
+**结论**：原始 SyncNet 架构在 latent-diffusion 时代不够强，**重做架构**是论文核心贡献之一。
+
+#### 4.7.4 架构差异
+
+```mermaid
+flowchart TB
+    subgraph OLD[原始 SyncNet - 2016]
+        O1[Conv2D 1→64] --> O2[BN + ReLU]
+        O2 --> O3[Conv2D 64→192] --> O4[BN + ReLU]
+        O4 --> O5[MaxPool 1×2]
+        O5 --> O6[更多 Conv layers]
+        O6 --> OFC[FC 1024]
+        OFC --> OOUT[vision_embeds 1024 dim]
+    end
+
+    subgraph NEW[StableSyncNet - 2024]
+        N1[ResNet SD U-Net encoder<br/>block_out_channels 64-2048] --> N2[ResBlock × N]
+        N2 --> N3[可选 Self-Attention]
+        N3 --> N4[AdaptiveAvgPool]
+        N4 --> NOUT[vision_embeds 2048 dim]
+    end
+```
+
+| 组件 | 原始 SyncNet | StableSyncNet |
+|---|---|---|
+| Backbone | 7 层 Conv2D | SD U-Net encoder（5-7 层 ResBlock） |
+| 归一化 | BatchNorm2d | GroupNorm（和 UNet 一致） |
+| 注意力 | ❌ 无 | ✅ 可选 Self-Attention |
+| 激活 | ReLU | SiLU（和 UNet 一致） |
+| Embedding dim | 1024 | 2048 |
+| 论文 | Chung 2016 | LatentSync 2024 |
+
+#### 4.7.5 为什么 SyncNetEval 还要保留
+
+**StableSyncNet 不是万能替代品**，原始 SyncNet 仍有两个独特价值：
+
+**1. 数据预处理（`preprocess/sync_av.py`）**
+
+```python
+# preprocess/sync_av.py:51
+syncnet = SyncNetEval(device=device)
+syncnet.loadParameters("checkpoints/auxiliary/syncnet_v2.model")
+# ↑ 用原始 SyncNet 给原始视频算 AV offset
+```
+
+为什么不用 StableSyncNet：
+- StableSyncNet 是在 `affine_transformed` 数据上训的（论文 Table 2）
+- 原始视频（unprocessed）格式不匹配
+- 需要用通用 SyncNet 来对齐
+
+**2. 离线评估（`eval/eval_sync_conf.py`）**
+
+```python
+# eval/eval_sync_conf.py:55
+syncnet = SyncNetEval(device=device)
+syncnet.loadParameters(args.initial_model)
+# ↑ 用原始 SyncNet 给生成的 mp4 算 confidence
+```
+
+为什么不用 StableSyncNet：
+- **公平比较**：和论文 Table 1 里的 Sync_conf 分数对齐
+- **标准化**：所有 SOTA 方法都用 Joon Son Chung 原版 SyncNet
+- **独立第三方**：自己的 SyncNet 评自己 → 容易过拟合
+
+#### 4.7.6 如果只用 StableSyncNet 不用 SyncNetEval
+
+| 场景 | 后果 |
+|---|---|
+| 训练 | ✅ 可以，效果更好（94% > 91%） |
+| 预处理 AV offset | ⚠️ 原始视频对齐不准（StableSyncNet 在 affine 后才有效） |
+| 离线评估 | ❌ 分数偏高（自评），不能和论文 Table 1 直接比较 |
+| 用户报告 sync_conf | ❌ 数字含义和论文不同 |
+
+#### 4.7.7 一句话总结
+
+> **StableSyncNet = 论文提出的新 SyncNet（94% HDTF，SD U-Net 架构），训练时给 UNet 监督。**
+> **SyncNetEval = Joon Son Chung 2016 原版（91% HDTF，传统 Conv 架构），预处理和离线评估用。**
+> **两者不替代：StableSyncNet 强但只在特定分布有效；SyncNetEval 弱但通用且和论文基准对齐。**
+
 ---
 
 ## 5. UNet 训练详解
