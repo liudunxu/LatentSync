@@ -287,6 +287,243 @@ flowchart TB
     PASTE --> FINAL[最终视频]
 ```
 
+### 1.5 Mask 策略的优化空间（侧脸 & 快速变动）
+
+> 这一节专门讨论用户提出的两个核心痛点：**侧脸 / 大角度** + **脸快速变动**。
+
+#### 当前 mask 策略的问题诊断
+
+**1. 固定 mask 在数学上就是个"对称刚性区域"**
+
+`mask.png` 是一张对称的、人脸形状的二值图，问题：
+
+| 场景 | 问题 |
+|---|---|
+| **正脸** | 完美对齐 mask 边界 = 人脸边界 |
+| **侧脸 30°** | mask 一侧盖到背景；另一侧没盖到脸颊 |
+| **仰头/低头** | mask 下半部盖到脖子；上半部漏掉额头 |
+| **快速转头** | landmark 检测抖，mask 跟不上 |
+
+**2. 侧脸的具体痛点**
+
+`lipsync_pipeline.py:3197`：
+
+```python
+dynamic_region_mask = generate_dynamic_mouth_mask(
+    mouth_info,
+    fixed_keep_mask=fixed_keep_mask  # ← 动态 mask 被固定 mask 边界限制
+)
+```
+
+`fixed_keep_mask` 是固定 mask 的"保留区"，**动态 mask 不能超过它**。所以侧脸时如果嘴部 landmark 跑到了固定 mask 外面，会被硬截回去。
+
+**3. 快速变动的痛点**
+
+```mermaid
+flowchart LR
+    F1[Frame 1: 正面] --> F2[Frame 2: 快速转头]
+    LM1[landmark 1<br/>稳定] --> M1[mask 1<br/>正常]
+    LM2[landmark 2<br/>模糊/丢失] --> M2[mask 2<br/>噪声/缺数据]
+    M1 --> S1[正常 inpaint]
+    M2 --> S2[接缝/闪烁]
+```
+
+**4. 论文 Fig.2 揭示的三难 trade-off**
+
+- mask 越大 → sync 越好（被迫听音频）
+- mask 越大 → 视觉质量越差（重建压力大）
+- mask 越小 → sync 越差（能偷懒）
+
+整脸 mask 是 sync 的极端选择，但牺牲了**身份信息**、**时序一致性**、**侧脸鲁棒性**、**计算效率**（9 个无关通道）。
+
+#### 6 个潜在优化方向
+
+| 方向 | 改动 | sync | 视觉 | 侧脸 | 时序 | 难度 |
+|---|---|---|---|---|---|---|
+| **A. Pose-aware 自适应 mask** | mask 随 yaw/pitch warp | ↑ | ↑ | ✅ | 中 | 中 |
+| **B. Landmark-based 全脸 mask** | 用 106 landmark 实时画 mask | ↑ | ↑ | ✅ | ⚠️ | 低 |
+| **C. Learned mask** | UNet 加 mask 预测头 | ↑↑ | ↑ | ✅ | ✅ | 高 |
+| **D. 分区域 mask** | 只 inpaint 嘴部 + 鼻子下方 | ↓（破坏反 shortcut） | ↑↑ | ✅ | ✅ | 低 |
+| **E. 多 mask 集成** | 推理时取并集 | ↑ | ↓ | ✅ | ⚠️ | 低 |
+| **F. 时序平滑** | mask 帧间 EMA | — | ↑ | — | ✅✅ | 低 |
+
+**各方向核心代码示意**：
+
+```python
+# A. Pose-aware
+def get_adaptive_mask(yaw, pitch, base_mask):
+    if abs(yaw) > 15:
+        mask = warp_mask(base_mask, yaw_rotation=-yaw)
+        mask = dilate_along_axis(mask, axis=sign(yaw), ratio=1.2)
+    return mask
+
+# B. Landmark-based
+def landmark_mask(landmarks_106, image_shape):
+    face_outline = landmarks_106[0:17]
+    eyebrows = landmarks_106[17:27]
+    return fill_polygon(face_outline + eyebrows)
+
+# C. Learned (需重训)
+mask_logits = unet(input_4ch, t).mask_pred
+predicted_mask = torch.sigmoid(mask_logits)
+
+# F. 时序平滑
+mask_ema = ema(mask_ema, dynamic_mask_t, alpha=0.3)
+```
+
+#### ⚠️ AGENTS.md 的硬约束
+
+```markdown
+> Mask & feather baseline is locked
+> Baseline: ef3903f with latentsync/utils/mask.png.
+> Do not toggle masks, mask width, or feather without an explicit ask.
+> Previous revert cycles were explicitly rejected.
+```
+
+**意思**：
+- mask 已经被反复 revert 过几次
+- 维护者明确说"别动"
+- 任何 mask 改动都要**用户明确要求**
+
+**原因推测**：
+- mask 改小 → sync 变差（用户最在意的指标）
+- mask 改大 → 视觉质量变差（用户也关心）
+- mask 改形状 → 训练数据分布变了，全链路要重训
+- 加羽化 → 边界软了但 mask 覆盖率变了，相当于改 mask
+
+#### 不破 baseline 的实际可优化点
+
+**1. 侧脸：优化检测而不是 mask**
+
+`AGENTS.md` 已经说：
+> *"Threshold tuning alone (`yaw_skip_threshold`) is a band-aid. Real fixes require improving the underlying signals."*
+
+即：**检测侧做得更准**（让侧脸能进得来），而不是改 mask 范围。
+
+具体能做：
+- 改进 `_estimate_yaw_degrees` 的多信号融合
+- 降低 landmark 噪声（EMA 平滑已经在做，alpha=0.7）
+- 用 `generate_dynamic_mouth_mask(..., fixed_keep_mask=fixed_keep_mask)` 的 clamp（已经在做）
+
+**2. 快速变动：优化 landmark 跟踪**
+
+- 用 InsightFace tracker 而不是每帧检测
+- landmark 帧间 EMA（已做）
+- motion_blur skip（已做）
+
+**3. 边界接缝：优化合成而非 mask**
+
+- `paste_surrounding_pixels_back`（已做）
+- 颜色匹配 `_match_color_to_reference`（已做）
+
+#### 研究项目路线（如果要真做）
+
+如果要**研究**新 mask 策略（不是生产改）：
+
+1. **第一阶段**：mask ablation 实验
+   - Baseline: mask.png
+   - 实验 1: pose-aware warp
+   - 实验 2: landmark-based mask
+   - 实验 3: learned mask
+   - 测 sync_conf + FID，找最佳 trade-off
+
+2. **第二阶段**：在最佳 mask 上重训 Stage 1 + Stage 2
+
+3. **第三阶段**：跑侧脸 / 快速变动 case，看是否真的解决 badcase
+
+**但这是研究项目，不是生产改动。先和用户对齐要不要做。**
+
+#### 极端嘴型的额外硬伤（大嘴 / 大笑 / 唱歌 / 打哈欠）
+
+> 用户追问：嘴特别大时不能完全遮住，是不是也不行？
+
+**答：是的，这是当前 mask 策略的另一个硬伤。**
+
+##### 代码层面的双重 clamp
+
+`lipsync_pipeline.py:1663-1752` 的 `generate_dynamic_mouth_mask` 有两层限制：
+
+```python
+# 第一层：动态 mask 自身的 max 上限
+max_rx_norm: float = 0.40,   # 嘴宽最大 40% 图宽
+max_ry_norm: float = 0.30,   # 嘴高最大 30% 图高
+
+rx = max(min_rx_norm, min(max_rx_norm, rx))   # 硬卡
+ry = max(min_ry_norm, min(max_ry_norm, ry))   # 硬卡
+
+# 第二层：固定 mask 的 keep 区域强制保留（line 1750）
+keep_mask = torch.maximum(keep_mask, m)  # 动态不能扩展 inpaint 到 fixed keep 区
+```
+
+也就是说：256×256 图上，**动态 mask 最大只能覆盖 ~102×77 像素的椭圆区域**；超出这个范围的嘴部，**mask 覆盖不到**。
+
+##### 大嘴 / 大笑时实际发生什么
+
+```mermaid
+flowchart LR
+    A[输入: 大笑/唱歌视频<br/>嘴张开度 ~50% 高] --> B[landmark 检测<br/>嘴部很大]
+    B --> C[动态 mask 计算<br/>被 max 卡到 40%x30%]
+    C --> D[UNet 推理<br/>只 inpaint 中间]
+    D --> E[嘴角/外翻嘴唇<br/>留在原图]
+    E --> F[输出 badcase:<br/>嘴中央中性 + 嘴角咧着]
+```
+
+**具体表现**：
+- **嘴中央**：UNet 生成（但训练数据里几乎没见过大笑样本 → 画成"正常说话"嘴型）
+- **嘴角/外翻嘴唇**：原图保留（在 mask 外）
+- **牙齿**：原位没动（没跟音频对齐）
+- **整体效果**：**嘴角在笑但嘴中央是中性 → 诡异的"嘴型分裂"**
+
+##### 更深层的问题：训练数据分布缺陷
+
+```python
+# UNetDataset 训练时
+gt_pixel_values = gt_frames               # 包含大笑嘴
+masked_pixel_values = gt_pixel_values * mask_image  # 用固定 mask 抹掉
+```
+
+**训练时**：
+- gt 里有大笑/唱歌嘴
+- 但 mask 永远只覆盖固定区域 → UNet 看不到这些极端 ground truth
+- UNet 学到的是"在这个固定区域内画嘴型" → 永远只生成"正常说话"的嘴
+
+**推理时**：
+- 实际嘴是大笑
+- mask 也不覆盖大笑的边缘
+- UNet 在 mask 内画"正常说话"的嘴 → 和原图嘴角打架
+
+> **核心矛盾**：UNet 是"盲人画师"——只看到 mask 内的"涂黑的脸"，不知道外面嘴角是咧着的，自然画不出匹配的整体表情。
+
+##### 修复路径对比
+
+| 限制 | 原因 |
+|---|---|
+| **mask 改大** | AGENTS.md 锁定 baseline；改大后训练分布全变 |
+| **max_rx/max_ry 改大** | UNet 没在更大 inpaint 区训过 → 推理画不好 |
+| **landmark-based 大 mask** | 推理能扩展但 UNet 还是画不出大笑 |
+| **重训 UNet 用更大 mask** | 等于全链路重训（Stage 1+2） |
+| **加极端嘴型数据集** | 训练分布需要补足 |
+| **mask 大小随机化** | 研究级改动 |
+| **条件化 mask** | 让 UNet 知道"这次画多大" |
+
+**根本解决方案**（研究级）：
+
+1. **数据集增强**：训练集里加大量"大笑/唱歌/打哈欠"极端嘴型视频
+2. **mask 大小随机化**：训练时 mask 在 [30%, 60%] 区间随机，让 UNet 适应不同 inpaint 范围
+3. **条件化 mask**：把 mask 本身作为输入，让 UNet 知道"这次要画多大"
+4. **表情感知**：先识别"这是大笑/正常说话"，再决定 mask 大小
+
+但这些都是**研究方向**，不破 baseline 做不到。
+
+##### 当前最佳 fallback
+
+在 prefilters 中（`yaw_skip`、`motion_blur_skip`、`mouth_occlusion` 等）检测大嘴型：
+- 触发 skip → **fallback 到原视频帧**
+- 坏处：sync 失败
+- 好处：避免"嘴型分裂" badcase
+
+这是当前默认行为。生产环境**宁可不生成也不要分裂**。
+
 #### 输入输出
 
 | | 形状 | 含义 |
@@ -364,11 +601,11 @@ flowchart TB
     R1 --> R2[resample_fps_hz<br/>→ 25fps · 16kHz]
     R2 --> R3[detect_shot<br/>PySceneDetect 切镜头]
     R3 --> R4[segment_videos<br/>ffmpeg 切 5s 片段]
-    R4 --> R5{可选<br/>filter_high_resolution<br/>mediapipe 人脸 >= resolution}
-    R5 --> R6[affine_transform<br/>InsightFace 检测 + 仿射 → 256×256]
+    R4 --> R5{可选 filter_high_resolution<br/>mediapipe 人脸 大于等于 resolution}
+    R5 --> R6[affine_transform<br/>InsightFace 检测 + 仿射转 256×256]
     R6 --> R7[sync_av<br/>SyncNet 算 AV offset + conf]
-    R7 --> R8{conf ≥ 3<br/>且 |offset| ≤ 6}
-    R8 -->|yes| R9[filter_visual_quality<br/>HyperIQA ≥ 40]
+    R7 --> R8{conf 大于等于 3<br/>且 offset 绝对值 小于等于 6}
+    R8 -->|yes| R9[filter_visual_quality<br/>HyperIQA 大于等于 40]
     R8 -->|no| DROP[丢弃]
     R9 --> OUT[high_visual_quality/<br/>训练样本]
 
@@ -627,6 +864,246 @@ flowchart LR
 
 - **noise_shared**：所有帧共用同一噪声 → 强制 UNet 学时序一致性（相邻帧差异由去噪过程产生）。
 - **noise_ind**：每帧独立噪声 → 提供帧间变化。
+
+### 5.8 TREPA：时序对齐损失（论文核心创新）
+
+> **一句话**：TREPA 让 UNet 学会"生成的 16 帧视频在'时间维度上的特征'要和真实的 16 帧尽量一致"。
+
+#### 5.8.1 它解决什么问题？
+
+假设你已经把 UNet 训得不错，单帧看着挺好。但播放出来发现：
+
+```mermaid
+flowchart LR
+    A[生成的第 1 帧<br/>牙齿清晰] --> B[生成的第 2 帧<br/>牙齿位置/形状突然变]
+    B --> C[生成的第 3 帧<br/>牙齿又变回来]
+    C --> D[... 帧间闪烁]
+
+    E[Ground Truth 第 1 帧<br/>牙齿清晰] --> F[GT 第 2 帧<br/>牙齿自然过渡]
+    F --> G[GT 第 3 帧<br/>牙齿继续变化]
+    G --> H[GT ... 平滑流畅]
+```
+
+**具体表现**：
+- **牙齿闪烁**：每帧牙齿的形状/位置/亮度有微抖动
+- **嘴唇闪烁**：上下唇边缘在抖
+- **胡须闪烁**：男士胡须区域每帧不一样
+- **整体感觉**：诡异、不真实、像 PPT 翻页
+
+#### 5.8.2 为什么 LPIPS 解决不了这个问题？
+
+LPIPS 是个**单帧损失**——它只看"这一帧和 GT 这一帧像不像"，**完全不看帧间关系**。
+
+```python
+# LPIPS 的"视角"
+for frame_i in generated_frames:
+    lpips_loss += LPIPS_vgg(frame_i, gt_frame_i)  # 逐帧独立算
+```
+
+所以理论上：
+- 第 1 帧 UNet 可以画"张大嘴"
+- 第 2 帧 UNet 可以画"闭嘴"（即使音频是要连续说话）
+- 每帧单独看都不错 → LPIPS 很低
+- 但连起来看 → 闪烁
+
+**论文原话**：
+> *"Merely employing distance loss between individual images improves the content quality of single generated images but does not enhance the temporal consistency of the generated image sequence."*
+
+#### 5.8.3 TREPA 的核心思路
+
+既然单帧损失不行，那就让 UNet 学习**"16 帧一起"的特征**。
+
+```mermaid
+flowchart TB
+    subgraph INPUT[输入]
+        G1[生成 16 帧视频] --> F1
+        G2[GT 16 帧视频] --> F2
+    end
+
+    subgraph ENC[VideoMAE-v2 编码器<br/>冻结, 不训练]
+        F1[生成 16 帧] --> M1[模型 forward_features<br/>提取时序表示]
+        F2[GT 16 帧] --> M2[模型 forward_features<br/>提取时序表示]
+    end
+
+    M1 --> N1[ℓ2 归一化]
+    M2 --> N2[ℓ2 归一化]
+
+    N1 --> MSE[MSE loss]
+    N2 --> MSE
+
+    MSE --> BACK[梯度反传 → UNet]
+```
+
+**直觉类比**：
+
+| 单帧损失（LPIPS） | TREPA |
+|---|---|
+| 让 100 个学生**单独**考试都及格 | 让 100 个学生**合唱**听起来和谐 |
+| 每个学生自己写自己的 | 一个指挥协调所有人 |
+| 不管学生之间怎么配合 | 强制学生之间的"节奏、音调、配合"对齐 |
+| 类比：每帧好看 | 类比：帧间平滑 |
+
+#### 5.8.4 用什么模型提取"时序表示"？
+
+论文选了 **VideoMAE-v2**（`vit_g_hybrid_pt_1200e_ssv2_ft.pth`）。
+
+**为什么选它**：
+1. **大规模自监督**：在海量无标注视频上预训练 → 不需要标签
+2. **时空建模**：不是只看单帧，而是用 Transformer attention 跨帧融合信息
+3. **特征丰富**：embedding 维度足够大，能捕捉细微的时空差异
+4. **强泛化**：在 lip-sync 数据上没训过，但能提取通用的"视频时序特征"
+
+**自动下载**：
+
+```python
+# latentsync/trepa/loss.py:29
+def __init__(self, device="cuda",
+             ckpt_path="checkpoints/auxiliary/vit_g_hybrid_pt_1200e_ssv2_ft.pth",
+             with_cp=False):
+    check_model_and_download(ckpt_path)  # 没就自动从 HF 下
+    self.model = load_videomae_model(device, ckpt_path, with_cp).eval().to(dtype=torch.float16)
+    self.model.requires_grad_(False)  # 冻结，不训练
+```
+
+#### 5.8.5 代码逐行解读
+
+```python
+# latentsync/trepa/loss.py:33
+class TREPALoss:
+    def __call__(self, videos_fake, videos_real):
+        # 输入：UNet 生成的 16 帧 vs GT 16 帧
+        # shape 都是 (B, 3, 16, 256, 256)
+
+        # 1. 把 (B, 3, 16, H, W) 拆成 (B*16, 3, H, W) —— 把 16 帧当成独立 batch
+        videos_fake = rearrange(videos_fake, "b c f h w -> (b f) c h w")
+        videos_real = rearrange(videos_real, "b c f h w -> (b f) c h w")
+
+        # 2. resize 到 224×224（VideoMAE-v2 的输入要求）
+        videos_fake = F.interpolate(videos_fake, size=(224, 224), mode="bicubic")
+        videos_real = F.interpolate(videos_real, size=(224, 224), mode="bicubic")
+
+        # 3. 还原成 (B, 3, 16, 224, 224) —— 让模型看完整 16 帧序列
+        videos_fake = rearrange(videos_fake, "(b f) c h w -> b c f h w", f=16)
+        videos_real = rearrange(videos_real, "(b f) c h w -> b c f h w", f=16)
+
+        # 4. 像素范围 [-1,1] → [0,1]（VideoMAE 预训练时的范围）
+        videos_fake = (videos_fake / 2 + 0.5).clamp(0, 1)
+        videos_real = (videos_real / 2 + 0.5).clamp(0, 1)
+
+        # 5. 提取"时序表示"（embeddings before head projection）
+        feats_fake = self.model.forward_features(videos_fake)
+        feats_real = self.model.forward_features(videos_real)
+
+        # 6. L2 归一化 —— 让特征在单位球面上，MSE 等价于余弦距离
+        feats_fake = F.normalize(feats_fake, p=2, dim=1)
+        feats_real = F.normalize(feats_real, p=2, dim=1)
+
+        # 7. MSE 损失
+        return F.mse_loss(feats_fake, feats_real)
+```
+
+#### 5.8.6 为什么用 `forward_features` 而不是 `forward`？
+
+`forward()` = 提取特征 + 分类头（head projection）
+`forward_features()` = **只提取特征，不分类**
+
+我们要的就是"通用时序表示"，不需要分类。所以用 `forward_features()`，避免 head projection 把特征压成"用于分类"的特定形状。
+
+#### 5.8.7 为什么 L2 归一化后再算 MSE？
+
+```python
+feats_fake = F.normalize(feats_fake, p=2, dim=1)
+return F.mse_loss(feats_fake, feats_real)
+```
+
+**数学等价**：
+- `||a_normalized - b_normalized||² = 2 - 2·cos(a, b)`
+- 即 `MSE(L2_norm(a), L2_norm(b))` 与 `余弦距离` 成正比
+
+**实际意义**：
+- 不关心特征的"绝对大小"，只关心"方向"（即"语义相似度"）
+- 训练更稳定（数值范围固定在 [0, 4]）
+- 和 SyncNet 的 cosine_loss 哲学一致
+
+#### 5.8.8 完整训练时的 TREPA 流程
+
+```mermaid
+flowchart TB
+    A[UNet 输出 pred_latents] --> B[VAE decode → pred_pixel_values]
+    B --> C[16 帧 × 256×256 × 3]
+    C --> D[TREPALoss.__call__]
+    D --> E[resize 224×224]
+    E --> F[VideoMAE-v2 forward_features<br/>冻结, 不训]
+    F --> G[时序表示 feats_fake]
+    GT[GT pixel_values] --> H[resize 224×224]
+    H --> F2[VideoMAE-v2 forward_features]
+    F2 --> I[时序表示 feats_real]
+    G --> J[ℓ2 norm + MSE]
+    I --> J
+    J --> K[L_trepa]
+    K --> L[× trepa_loss_weight=10]
+    L --> M[加到 L_total]
+```
+
+**关键代码**（`scripts/train_unet.py:381-388`）：
+
+```python
+if config.run.trepa_loss_weight != 0 and config.run.pixel_space_supervise:
+    trepa_pred_pixel_values = rearrange(pred_pixel_values, "(b f) c h w -> b c f h w", f=16)
+    trepa_gt_pixel_values   = rearrange(gt_pixel_values,   "(b f) c h w -> b c f h w", f=16)
+    trepa_loss = trepa_loss_func(trepa_pred_pixel_values, trepa_gt_pixel_values)
+else:
+    trepa_loss = 0
+```
+
+**只在 Stage 2 生效**（因为 `pixel_space_supervise=True`）。
+
+#### 5.8.9 权重为什么是 10？
+
+看配置：
+```yaml
+# configs/unet/stage2.yaml
+trepa_loss_weight: 10
+```
+
+**数学分析**：
+- LPIPS loss ≈ 0.1-0.3 数量级
+- TREPA loss（L2 normalized features 的 MSE）≈ 0.01-0.05 数量级
+- 权重 10 让 TREPA 和 LPIPS 在数值上平衡
+- 如果改成 1，TREPA 几乎不起作用
+- 如果改成 100，TREPA 会盖过其他损失，破坏视觉质量
+
+**经验值**，调权重时要先看 loss 曲线，不能盲调。
+
+#### 5.8.10 TREPA 的局限性
+
+| 场景 | TREPA 表现 |
+|---|---|
+| 正常说话 | ✅ 显著改善帧间一致性 |
+| 大笑/唱歌/极端嘴型 | ⚠️ 改善有限（mask 本身盖不到这些区域） |
+| 侧脸快速转头 | ⚠️ 改善有限（landmark 抖动传到特征） |
+| 单帧质量本身很差 | ❌ TREPA 不管单帧，只管帧间 |
+| 训练数据本身有闪烁 | ❌ TREPA 学不到不闪烁的表示 |
+
+#### 5.8.11 配置与开关
+
+| config | trepa_loss_weight | 效果 |
+|---|---|---|
+| `stage1.yaml` | 10 | 但因 `pixel_space_supervise=false` 实际不生效 |
+| `stage2.yaml` | 10 | ✅ 标准配置 |
+| `stage2_512.yaml` | 10 | ✅ 512 标准 |
+| `stage2_efficient.yaml` | **0** | ❌ 关闭（省显存优先） |
+
+**省显存策略**：
+- 关闭 TREPA 可以省 ~2GB VRAM（VideoMAE-v2 模型占显存）
+- 代价：帧间一致性略降
+- 适合：消费级 GPU（如 RTX 3090）跑 Stage 2
+
+#### 5.8.12 一句话总结
+
+> **TREPA = 让 UNet 生成的 16 帧视频在 VideoMAE-v2 提取的"时序特征空间"上和 GT 尽量对齐。**
+> **本质：从"让单帧好看"升级到"让 16 帧作为一个整体好看"。**
+> **配合 Mixed Noise + Motion Module，是 LatentSync 解决"帧间闪烁"问题的三件套。**
 
 ### 5.8 配置全表
 
