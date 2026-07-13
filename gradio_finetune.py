@@ -25,6 +25,7 @@ import os
 import shlex
 import shutil
 import signal
+import threading
 import subprocess
 import time
 import traceback
@@ -302,6 +303,44 @@ class TrainingProcess:
 
 
 _TRAINER = TrainingProcess()
+
+
+def _on_page_load():
+    """Repopulate training-status UI on page (re)load.
+
+    The Python process keeps the trainer subprocess alive across browser
+    refreshes, but the browser-side gr.State values (log_path, run_dd,
+    …) reset to empty. This handler re-pulls from the in-process
+    _TRAINER singleton.
+    """
+    if _TRAINER.is_running():
+        pid = _TRAINER.proc.pid
+        rc_hint = _TRAINER.proc.poll()
+        rc_text = f" (rc={rc_hint})" if rc_hint is not None else ""
+        trainer_text = (
+            f"⏳ 训练进行中 (pid={pid}{rc_text})\n"
+            f"📂 run_dir: {_TRAINER.run_dir or '(unknown)'}\n"
+            "💡 点击 Tab 2 的 '🔄 刷新 run 列表' + '🔄 手动刷新' 来查看进度"
+        )
+        launch_text = f"⏳ training running since {_TRAINER.started_at or '?'}"
+        # Reload runs into dropdown so the user can pick the running one
+        out_dir_text = "unet"
+        runs = list_run_dirs(FINETUNE_BASE_DIR / out_dir_text)
+        return (
+            trainer_text,
+            launch_text,
+            gr.update(choices=runs, value=_TRAINER.run_dir.name if _TRAINER.run_dir else None),
+            gr.update(interactive=True),
+        )
+    trainer_text = "🟢 idle — 点 '🚀 启动训练' 开始"
+    launch_text = ""
+    runs = list_run_dirs(FINETUNE_BASE_DIR / "unet")
+    return (
+        trainer_text,
+        launch_text,
+        gr.update(choices=runs, value=None),
+        gr.update(interactive=True),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2072,6 +2111,17 @@ pipe(
                 fn=run_badcase_checklist,
                 inputs=[bc_video, bc_reference],
                 outputs=[bc_blurry, bc_flicker, bc_sync, bc_identity, bc_report],
+            )
+
+            # On page (re)load: repopulate trainer status + run dropdown
+            # from the in-process _TRAINER singleton. This survives browser
+            # refreshes — the Python process keeps the training subprocess
+            # alive even if the user's tab disconnects, so we re-detect here.
+            demo.load(
+                fn=_on_page_load,
+                outputs=[
+                    trainer_status, launch_status, run_dd, monitor_btn,
+                ],
             )
 
     return demo
