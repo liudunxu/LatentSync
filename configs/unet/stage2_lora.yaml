@@ -48,7 +48,7 @@ lora:
     - to_q
     - to_k
     - to_v
-    - to_out.0
+    - "to_out.0"
   qlora: false       # set true for 4-bit base (needs bitsandbytes)
   freeze_attn2: false  # set true to protect audio cross-attn (avoid sync regression)
 

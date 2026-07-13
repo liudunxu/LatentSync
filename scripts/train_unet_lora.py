@@ -127,6 +127,7 @@ def inject_lora(
         unet = prepare_model_for_kbit_training(unet, use_gradient_checkpointing=False)
         logger.info("QLoRA: base UNet quantized to 4-bit (nf4).")
 
+    logger.info(f"[LoRA debug] lora_cfg.target_modules (raw): {list(lora_cfg.target_modules)!r}")
     logger.info(f"[LoRA debug] target_modules passed to LoraConfig: {target_modules!r}")
     lora_config = LoraConfig(
         r=rank,
