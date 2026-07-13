@@ -829,6 +829,109 @@ cat data/drama/ep01_curated/curation_report.json | python -m json.tool | head -4
 
 完整 multi-speaker routing(model 内置 audio→face 路由)是 Step 4,目前**未实现**(model 改动风险高,需要专门的 2-speaker 合成测试集验证)。
 
+### 6.5 预制数据集（HF Hub 一键下 + 自动 curate）📚
+
+> **本节针对**: 想 finetune 但不想自己找数据 / 不想维护 URL 列表的用户。
+> 4 个已写好的 HF Hub recipe,点一下就下载 + face 检测 + 按 yaw/motion 分桶 + 写 fileslist.txt,直接喂给 Tab 1。
+
+#### 6.5.1 可用 recipe(写在 `tools/prebuilt_datasets.yaml`)
+
+| id | 来源 (HF Hub) | 适合 |
+|---|---|---|
+| `voxceleb2_sample` | `Reverb/voxceleb2` | 通用 baseline / 单人 / 侧脸都有 |
+| `celebv_hq_side` | `SwayStar123/CelebV-HQ` | **侧脸专项**(自带 yaw 标注,桶配比给 side_face 55%) |
+| `talkvid_sample` | `FreedomIntelligence/TalkVid` | 大规模多语言(1244h, 7729 speakers) |
+| `multi_human_drama` | `Multi-Human-Interactive/MHIT` | **短剧**(12h 多说话人对谈,桶配比给 fast_motion 30%) |
+
+加新 recipe 只需往 YAML 加一段,UI 下拉自动出现,不用改代码。
+
+#### 6.5.2 三种使用方式
+
+**A. gradio UI(Tab 1 「📚 预制数据集」accordion,推荐)**
+
+1. 打开 `📚 预制数据集` accordion
+2. 下拉选 recipe(`celebv_hq_side — CelebV-HQ (1k, 带 yaw 标注, 侧脸专项)`)
+3. 填输出目录(默认 `data/init_finetune`)
+4. (可选)填 HF Token — gated 数据集需要
+5. 点 `⬇ 下载 + Curate`
+6. 完成后 `train_data_dir` + `train_fileslist` 自动填到 launch 表单
+
+**B. CLI**
+
+```bash
+# 看选项
+python tools/init_finetune_dataset.py --list
+
+# 单个 recipe
+python tools/init_finetune_dataset.py \
+    --dataset celebv_hq_side \
+    --output-dir /root/autodl-tmp/latentsync_finetune/init \
+    --n-clips 500
+
+# 全部 4 个
+python tools/init_finetune_dataset.py --dataset all
+```
+
+**C. 远程 box 上后台跑**
+
+```bash
+nohup python tools/init_finetune_dataset.py \
+    --dataset talkvid_sample \
+    --output-dir /root/autodl-tmp/latentsync_finetune/init \
+    > debug/init.log 2>&1 &
+
+# 监控
+tail -f debug/init.log
+# 看全部 completed 后:
+ls /root/autodl-tmp/latentsync_finetune/init/talkvid_sample/curated/
+cat /root/autodl-tmp/latentsync_finetune/init/talkvid_sample/curated/fileslist.txt
+```
+
+#### 6.5.3 输出布局
+
+```
+data/init_finetune/<recipe-id>/
+├── _raw/                                # 下载的原始 mp4(每个 recipe 单独缓存)
+│   ├── 00001.mp4
+│   └── ...
+├── curated/
+│   ├── frontal/000_<stem>.mp4           # symlink 到 _raw
+│   ├── side_face/000_<stem>.mp4
+│   ├── fast_motion/000_<stem>.mp4
+│   ├── fileslist.txt                    # 直接给 Tab 1 用
+│   └── curation_report.json             # 评分 + 桶信息
+└── fileslist.txt                         # 顶层,等价于 curated/fileslist.txt
+```
+
+#### 6.5.4 故障排查
+
+| 症状 | 修法 |
+|---|---|
+| `cannot list files for X: 401` | gated 仓库 → 加 `--hf-token` 或 `export HF_TOKEN=...` |
+| `no files matched allow_patterns` | repo id 错或 path 不对,改 `prebuilt_datasets.yaml` 的 `hf_allow` |
+| 跑了很久没进度 | 网络慢 + VoxCeleb2 巨大,先用 `--n-clips 200` 试速 |
+| 重跑重复下载 | 不会 — `_raw/` 里已有文件会跳过(脚本是幂等的) |
+| 桶分布不均 | YAML 改 `target_ratio`;某些 recipe 的天然分布就是偏(比如 multi_human_drama fast_motion 高) |
+
+#### 6.5.5 自定义 recipe
+
+往 `tools/prebuilt_datasets.yaml` 加一段:
+
+```yaml
+  - id: my_dataset
+    name: My Custom Talking Head Set
+    hf_repo: username/my-dataset-repo
+    hf_repo_type: dataset
+    hf_allow: ["*.mp4"]
+    n_clips: 800
+    target_ratio: {frontal: 0.5, side_face: 0.3, fast_motion: 0.2}
+    description: |
+      My custom dataset — internal interviews with side-face heavy coverage.
+    typical_use: "🧩 Structural Fix"
+```
+
+重启 gradio 即可在 Tab 1 「📚 预制数据集」下拉里看到。
+
 ---
 
 ## 7. 常见问题 FAQ
