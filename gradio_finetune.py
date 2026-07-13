@@ -169,8 +169,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "description": "LoRA 微调：adapter 仅 ~10MB，可多任务切换。需 pip install peft。",
         "lora": {
             "enabled": True,
-            "rank": 16,
-            "alpha": 32,
+            "rank": 32,
+            "alpha": 64,
             "dropout": 0.05,
             "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
             "qlora": False,
@@ -390,6 +390,7 @@ def build_config_from_form(
     max_train_steps: int,
     num_workers: int,
     train_output_dir: str,
+    freeze_attn2: bool,
 ) -> Dict[str, Any]:
     """Merge user-form values with the chosen preset's defaults."""
     preset = PRESETS[preset_name]
@@ -507,6 +508,7 @@ def build_config_from_form(
             "qlora": False,
             "freeze_attn2": False,
         }
+    cfg["lora"]["freeze_attn2"] = bool(freeze_attn2)
     return cfg
 
 
@@ -573,6 +575,7 @@ def launch_training(
     max_train_steps: int,
     num_workers: int,
     train_output_dir: str,
+    freeze_attn2: bool,
     nproc_per_node: int,
     master_port: int,
     extra_env: str,
@@ -619,6 +622,7 @@ def launch_training(
             max_train_steps=max_train_steps,
             num_workers=num_workers,
             train_output_dir=train_output_dir,
+            freeze_attn2=freeze_attn2,
         )
         logger.info("[launch_training] config built, train_output_dir=%s", cfg["data"]["train_output_dir"])
 
@@ -1328,15 +1332,22 @@ def build_ui() -> gr.Blocks:
             with gr.Row():
                 preset_dd = gr.Dropdown(
                     choices=list(PRESETS.keys()),
-                    value="Stage 2 (256, 推荐)",
+                    value="Stage 2 LoRA (256, 12-15GB)",
                     label="预设 (Preset)",
                     scale=2,
                 )
                 preset_desc = gr.Textbox(
                     label="预设说明",
-                    value=PRESETS["Stage 2 (256, 推荐)"]["description"],
+                    value=PRESETS["Stage 2 LoRA (256, 12-15GB)"]["description"],
                     interactive=False,
                     scale=3,
+                )
+
+            with gr.Row():
+                freeze_attn2 = gr.Checkbox(
+                    label="LoRA: 冻结 attn2 (audio cross-attn) — 防 sync 退化",
+                    value=True,
+                    info="仅 LoRA 生效；勾上后 attn2 的 LoRA 参数冻结,牺牲一点灵活性换取 sync_conf 稳定",
                 )
 
             with gr.Row():
@@ -1474,6 +1485,7 @@ def build_ui() -> gr.Blocks:
                     sync_loss_weight, perceptual_loss_weight, recon_loss_weight, trepa_loss_weight,
                     mixed_precision_training, enable_gradient_checkpointing, mask_image_path,
                     save_ckpt_steps, max_train_steps, num_workers, train_output_dir,
+                    freeze_attn2,
                     nproc_per_node, master_port, extra_env,
                 ],
                 outputs=[launch_status, log_path_state],
