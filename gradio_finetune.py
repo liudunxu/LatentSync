@@ -391,6 +391,9 @@ def build_config_from_form(
     num_workers: int,
     train_output_dir: str,
     freeze_attn2: bool,
+    val_inference_steps: int,
+    val_guidance_scale: float,
+    val_seed: int,
 ) -> Dict[str, Any]:
     """Merge user-form values with the chosen preset's defaults."""
     preset = PRESETS[preset_name]
@@ -426,9 +429,9 @@ def build_config_from_form(
             "perceptual_loss_weight": float(perceptual_loss_weight),
             "recon_loss_weight": float(recon_loss_weight),
             "trepa_loss_weight": float(trepa_loss_weight),
-            "guidance_scale": 1.5,
-            "inference_steps": 20,
-            "seed": 1247,
+            "guidance_scale": float(val_guidance_scale),
+            "inference_steps": int(val_inference_steps),
+            "seed": int(val_seed),
             "use_mixed_noise": True,
             "mixed_noise_alpha": 1,
             "mixed_precision_training": bool(mixed_precision_training),
@@ -576,6 +579,9 @@ def launch_training(
     num_workers: int,
     train_output_dir: str,
     freeze_attn2: bool,
+    val_inference_steps: int,
+    val_guidance_scale: float,
+    val_seed: int,
     nproc_per_node: int,
     master_port: int,
     extra_env: str,
@@ -623,6 +629,9 @@ def launch_training(
             num_workers=num_workers,
             train_output_dir=train_output_dir,
             freeze_attn2=freeze_attn2,
+            val_inference_steps=val_inference_steps,
+            val_guidance_scale=val_guidance_scale,
+            val_seed=val_seed,
         )
         logger.info("[launch_training] config built, train_output_dir=%s", cfg["data"]["train_output_dir"])
 
@@ -1505,6 +1514,24 @@ def build_ui() -> gr.Blocks:
                     trepa_loss_weight = gr.Slider(0.0, 50.0, value=10.0, step=1.0, label="trepa_loss_weight (0=关闭)")
 
                 with gr.Column():
+                    gr.Markdown("### 🖼 Validation 推理参数")
+                    gr.Markdown(
+                        "<small>每 save_ckpt_steps 步生成一段验证视频用的推理质量/速度。"
+                        "自然度默认 steps=40,guidance=1.5;快速试训可降到 20/1.5。"
+                        "推到 HF 后别人用同样的 ckpt + 这俩默认值就能复现。</small>"
+                    )
+                    val_inference_steps = gr.Slider(
+                        5, 80, value=40, step=5, label="validation inference_steps (20=快, 40=自然)"
+                    )
+                    val_guidance_scale = gr.Slider(
+                        1.0, 4.0, value=1.5, step=0.1, label="validation guidance_scale"
+                    )
+                    val_seed = gr.Number(
+                        value=1247, label="validation seed (随机种子)", precision=0
+                    )
+
+            with gr.Row():
+                with gr.Column():
                     gr.Markdown("### ⚙️ 训练设置")
                     mixed_precision_training = gr.Checkbox(value=True, label="mixed_precision_training (fp16)")
                     enable_gradient_checkpointing = gr.Checkbox(value=True, label="enable_gradient_checkpointing")
@@ -1549,6 +1576,7 @@ def build_ui() -> gr.Blocks:
                     mixed_precision_training, enable_gradient_checkpointing, mask_image_path,
                     save_ckpt_steps, max_train_steps, num_workers, train_output_dir,
                     freeze_attn2,
+                    val_inference_steps, val_guidance_scale, val_seed,
                     nproc_per_node, master_port, extra_env,
                 ],
                 outputs=[launch_status, log_path_state],
