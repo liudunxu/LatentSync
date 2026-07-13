@@ -561,35 +561,54 @@ def _on_page_load():
     refreshes, but the browser-side gr.State values (log_path, run_dd,
     …) reset to empty. This handler re-pulls from the in-process
     _TRAINER singleton.
+
+    Wrapped in try/except so any failure here (slow filesystem, weird
+    run_dir contents, etc.) NEVER blocks the page-load — the UI just
+    falls back to idle.
     """
-    if _TRAINER.is_running():
-        pid = _TRAINER.proc.pid
-        rc_hint = _TRAINER.proc.poll()
-        rc_text = f" (rc={rc_hint})" if rc_hint is not None else ""
-        trainer_text = (
-            f"⏳ 训练进行中 (pid={pid}{rc_text})\n"
-            f"📂 run_dir: {_TRAINER.run_dir or '(unknown)'}\n"
-            "💡 点击 Tab 2 的 '🔄 刷新 run 列表' + '🔄 手动刷新' 来查看进度"
-        )
-        launch_text = f"⏳ training running since {_TRAINER.started_at or '?'}"
-        # Reload runs into dropdown so the user can pick the running one
-        out_dir_text = "unet"
-        runs = list_run_dirs(FINETUNE_BASE_DIR / out_dir_text)
+    try:
+        if _TRAINER.is_running():
+            pid = _TRAINER.proc.pid
+            rc_hint = _TRAINER.proc.poll()
+            rc_text = f" (rc={rc_hint})" if rc_hint is not None else ""
+            trainer_text = (
+                f"⏳ 训练进行中 (pid={pid}{rc_text})\n"
+                f"📂 run_dir: {_TRAINER.run_dir or '(unknown)'}\n"
+                "💡 点击 Tab 2 的 '🔄 刷新 run 列表' + '🔄 手动刷新' 来查看进度"
+            )
+            launch_text = f"⏳ training running since {_TRAINER.started_at or '?'}"
+            try:
+                runs = list_run_dirs(FINETUNE_BASE_DIR / "unet")
+            except Exception as exc:
+                logger.warning("list_run_dirs failed on page load: %s", exc)
+                runs = []
+            return (
+                trainer_text,
+                launch_text,
+                gr.update(choices=runs, value=_TRAINER.run_dir.name if _TRAINER.run_dir else None),
+                gr.update(interactive=True),
+            )
+        trainer_text = "🟢 idle — 点 '🚀 启动训练' 开始"
+        launch_text = ""
+        try:
+            runs = list_run_dirs(FINETUNE_BASE_DIR / "unet")
+        except Exception as exc:
+            logger.warning("list_run_dirs failed on page load: %s", exc)
+            runs = []
         return (
             trainer_text,
             launch_text,
-            gr.update(choices=runs, value=_TRAINER.run_dir.name if _TRAINER.run_dir else None),
+            gr.update(choices=runs, value=None),
             gr.update(interactive=True),
         )
-    trainer_text = "🟢 idle — 点 '🚀 启动训练' 开始"
-    launch_text = ""
-    runs = list_run_dirs(FINETUNE_BASE_DIR / "unet")
-    return (
-        trainer_text,
-        launch_text,
-        gr.update(choices=runs, value=None),
-        gr.update(interactive=True),
-    )
+    except Exception as exc:
+        logger.exception("page-load handler failed entirely: %s", exc)
+        return (
+            f"⚠️ page-load handler 出错: {exc}",
+            "",
+            gr.update(choices=[], value=None),
+            gr.update(interactive=True),
+        )
 
 
 # ---------------------------------------------------------------------------
