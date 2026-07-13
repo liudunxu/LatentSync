@@ -1908,6 +1908,21 @@ pipe(
 | 闪烁评分 | < 8 | 嘴部帧间平均像素差 |
 | 唇音同步 | > 7 | SyncNet confidence |
 | 身份保持 | > 0.8 | Face embedding 余弦相似度 |
+
+### Badcase → 推荐操作 速查
+
+| 现象 | 数值信号 | 首选排查方向 | 备选:微调 |
+|---|---|---|---|
+| **侧脸同步弱 / 嘴唇不动** | `唇音同步 < 5` 且 yaw 大的帧 | Tab 4 把 `adaptive_quality_fallback` 打开 / 放宽 `yaw_skip_threshold` (30°→40°) | Stage 2 LoRA,feed ≥ 50 条 yaw 15-30° 样本,`freeze_attn2=True` |
+| **嘴糊** (整嘴一片糊) | `嘴糊比例 > 40%` | 检查 `mask_image_path` 是否被改成 mask2/3 (baseline 是 `mask.png`) | Stage 2 LoRA rank=32 |
+| **嘴唇外也糊** (paste-back 边界外溢) | 闪烁评分高 + 边缘像素突跳 | Tab 4 `dynamic_mask_mode` 切 `aggressive`,`paste_back_blur_sigma` 降到 5.0 | Stage 2 LoRA + 混合 clip / distance samples |
+| **人脸快速移动时嘴糊** | 闪烁评分 > 12 + sync 抖动 | 调 `mouth_temporal_stabilization_strength`↑ 到 0.25 / `mouth_audio_motion_min_scale`↑ 到 0.9 | Stage 2 LoRA + 含 motion-blur 样本 |
+| **身份漂移 (像别人了)** | `身份保持 < 0.7` | Tab 4 `ref_strategy` 改 `fixed_first_frame`,`color_match_strength`↑ 到 0.75 | LoRA 不要碰 attn1 self-attn (默认就只 wrap to_q/k/v/out.0) |
+| **训练后 sync_conf 退化** | 训练前后 sync 下降 > 1 | (训练配置)勾 `freeze_attn2` 重训 | — |
+| **显存 OOM** | torch OOM 日志 | 切 Stage 2 QLoRA | — |
+| **生成的嘴没动但能听到声音** | `唇音同步 ≈ 1` (没生成) | 看训练日志 `[FaceMatch]` 哪个 filter 跳了 — 通常是 `yaw_skip` 或 `face_jump` | Stage 2 LoRA + 多角度训练数据 |
+
+**数据先行原则**:finetune 只能缓解,不能根治。`Tab 5` 先跑一遍数据集质量评估,HyperIQA 分布去掉 < 40 的样本后再训,事半功倍。
                 """
             )
 
