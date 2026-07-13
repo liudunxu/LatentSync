@@ -53,6 +53,9 @@ from eval.syncnet_detect import SyncNetDetector
 from eval.eval_sync_conf import syncnet_eval
 import lpips
 
+from latentsync.utils.training_state import TrainingState
+from latentsync.utils.tracker import Tracker
+
 
 logger = get_logger(__name__)
 
@@ -240,6 +243,35 @@ def main(config):
         logger.info(f"  Total optimization steps = {config.run.max_train_steps}")
     global_step = resume_global_step
     first_epoch = resume_global_step // num_update_steps_per_epoch
+
+    # ---- Optional: try to fully resume from training_state.pt (optimizer / scaler / rng) ----
+    training_state = TrainingState(output_dir)
+    if training_state.can_resume() and is_main_process:
+        try:
+            saved_step, opt_state, scaler_state, sched_state = training_state.load(device)
+            if saved_step > global_step:
+                optimizer.load_state_dict(opt_state)
+                if scaler_state is not None and scaler is not None:
+                    scaler.load_state_dict(scaler_state)
+                if sched_state is not None and lr_scheduler is not None:
+                    lr_scheduler.load_state_dict(sched_state)
+                global_step = saved_step
+                first_epoch = saved_step // num_update_steps_per_epoch
+                logger.info(
+                    f"Resumed full training state from {training_state.path} at step {saved_step}"
+                )
+        except Exception as e:
+            logger.warning(f"Could not load training_state.pt: {e}. Continuing with model weights only.")
+
+    # ---- Optional experiment tracker (WandB / TensorBoard) ----
+    tracker = Tracker(
+        project="latentsync-finetune",
+        run_name=folder_name,
+        config=OmegaConf.to_container(config),
+        rank=global_rank,
+    )
+    if is_main_process and tracker.backend:
+        logger.info(f"Experiment tracking enabled: {tracker.backend}")
 
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(
@@ -499,10 +531,36 @@ def main(config):
             logs = {"step_loss": loss.item(), "epoch": epoch}
             progress_bar.set_postfix(**logs)
 
+            # ---- Push to experiment tracker (WandB / TensorBoard) ----
+            if is_main_process:
+                tracker.log({
+                    "train/loss": loss.item(),
+                    "train/recon": float(recon_loss) if not isinstance(recon_loss, int) else 0.0,
+                    "train/sync": float(sync_loss) if not isinstance(sync_loss, int) else 0.0,
+                    "train/lpips": float(lpips_loss) if not isinstance(lpips_loss, int) else 0.0,
+                    "train/trepa": float(trepa_loss) if not isinstance(trepa_loss, int) else 0.0,
+                    "train/lr": lr_scheduler.get_last_lr()[0],
+                    "train/epoch": epoch,
+                }, step=global_step)
+
+                # ---- Save full training state every save_ckpt_steps (crash recovery) ----
+                if global_step % config.ckpt.save_ckpt_steps == 0:
+                    try:
+                        training_state.save(
+                            global_step=global_step,
+                            optimizer=optimizer,
+                            scaler=scaler,
+                            lr_scheduler=lr_scheduler,
+                            extra={"best_sync_conf": max(sync_conf_list) if sync_conf_list else 0.0},
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not save training_state: {e}")
+
             if global_step >= config.run.max_train_steps:
                 break
 
     progress_bar.close()
+    tracker.finish()
     dist.destroy_process_group()
 
 

@@ -791,6 +791,265 @@ def run_compare(
 
 
 # ---------------------------------------------------------------------------
+# Tab 4: Validation - run inference on a single ckpt with quality self-check
+# ---------------------------------------------------------------------------
+
+def _check_ckpt_compatibility(ckpt_path: Path, unet_config: Path) -> List[str]:
+    """Compare a checkpoint against a UNet config and return any warnings.
+
+    Catches the common 256/512 + mask.png/mask2.png mismatches that
+    produce silent garbage rather than a clean error.
+    """
+    warnings: List[str] = []
+    try:
+        cfg = OmegaConf.load(unet_config)
+        cfg_res = int(cfg.data.resolution)
+        cfg_mask = str(cfg.data.mask_image_path)
+    except Exception as e:
+        return [f"❌ 解析 config 失败: {e}"]
+
+    ckpt_name = ckpt_path.name.lower()
+    if "512" in ckpt_name and cfg_res == 256:
+        warnings.append("⚠️ ckpt 名字带 '512' 但 config resolution=256，可能不兼容")
+    if "512" not in ckpt_name and cfg_res == 512 and "stage1" not in ckpt_name:
+        warnings.append("⚠️ config resolution=512 但 ckpt 名字没 '512'，请确认 ckpt 真是 512 训的")
+    if "mask2" in cfg_mask and "mask.png" in str(ckpt_path):
+        warnings.append(f"⚠️ config 用 {cfg_mask} 但 ckpt 可能是 256 训的（用 mask.png）")
+    if "mask2" not in cfg_mask and "mask2" in str(ckpt_path):
+        warnings.append(f"⚠️ config 用 {cfg_mask} 但 ckpt 可能是 512 训的（用 mask2.png）")
+    if "lora" in ckpt_name.lower():
+        warnings.append("⚠️ ckpt 名字含 'lora' —— 可能是 LoRA adapter，需要先 merge_lora.py")
+    if "adapter" in ckpt_name.lower():
+        warnings.append("⚠️ ckpt 是 peft adapter，需要先 merge_lora.py")
+    return warnings
+
+
+def _quick_quality_check(video_path: str) -> Dict[str, Any]:
+    """Run a lightweight quality check on a single generated video.
+
+    Computes: sharpness (Laplacian), flicker (frame diff), face
+    detection rate. Skips SyncNet / HyperIQA (those are too heavy
+    for a per-click UI call).
+    """
+    if not video_path or not Path(video_path).exists():
+        return {"error": f"video not found: {video_path}"}
+    try:
+        from decord import VideoReader
+        import numpy as np
+        import cv2
+
+        vr = VideoReader(video_path)
+        frames = [f.asnumpy() for f in vr]
+        if len(frames) < 2:
+            return {"error": "video too short"}
+
+        # sharpness per frame
+        grays = [cv2.cvtColor(f, cv2.COLOR_RGB2GRAY) for f in frames]
+        laps = [cv2.Laplacian(g, cv2.CV_64F).var() for g in grays]
+        sharpness_mean = float(np.mean(laps))
+        blurry_count = sum(1 for v in laps if v < 50)
+        blurry_ratio = blurry_count / len(laps)
+
+        # flicker
+        diffs = [
+            float(np.abs(frames[i].astype(float) - frames[i - 1].astype(float)).mean())
+            for i in range(1, len(frames))
+        ]
+        flicker = float(np.mean(diffs))
+
+        # face detection rate
+        try:
+            from latentsync.utils.face_detector import FaceDetector
+            det = FaceDetector()
+            detected = 0
+            for f in frames[::max(1, len(frames) // 10)][:10]:
+                face, _, _ = det.detect(f)
+                if face is not None:
+                    detected += 1
+            face_rate = detected / min(10, len(frames))
+        except Exception:
+            face_rate = None
+
+        return {
+            "num_frames": len(frames),
+            "sharpness_mean": round(sharpness_mean, 2),
+            "blurry_ratio": round(blurry_ratio, 3),
+            "flicker": round(flicker, 2),
+            "face_detect_rate": round(face_rate, 2) if face_rate is not None else None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _format_validation_report(metrics: Dict[str, Any], ckpt_path: str,
+                              duration_sec: float) -> str:
+    """Render a human-readable quality report."""
+    if "error" in metrics:
+        return f"❌ 质量检查失败: {metrics['error']}"
+
+    lines: List[str] = []
+    lines.append(f"📦 Checkpoint: {ckpt_path}")
+    lines.append(f"⏱ 推理耗时: {duration_sec:.1f} 秒")
+    lines.append(f"🎞 总帧数: {metrics.get('num_frames', '?')}")
+    lines.append("")
+
+    sharp = metrics.get("sharpness_mean", 0)
+    blurry = metrics.get("blurry_ratio", 0)
+    flicker = metrics.get("flicker", 0)
+    face_rate = metrics.get("face_detect_rate")
+
+    # sharpness
+    if sharp >= 200:
+        lines.append(f"✅ 清晰度 {sharp:.1f} (优秀)")
+    elif sharp >= 100:
+        lines.append(f"✅ 清晰度 {sharp:.1f} (良好)")
+    elif sharp >= 50:
+        lines.append(f"⚠️ 清晰度 {sharp:.1f} (一般，可能有点糊)")
+    else:
+        lines.append(f"❌ 清晰度 {sharp:.1f} (差，明显模糊)")
+    lines.append(f"   嘴糊比例: {blurry*100:.1f}% (目标 < 30%)")
+
+    # flicker
+    if flicker < 4:
+        lines.append(f"✅ 闪烁 {flicker:.2f} (优秀)")
+    elif flicker < 8:
+        lines.append(f"✅ 闪烁 {flicker:.2f} (正常)")
+    else:
+        lines.append(f"⚠️ 闪烁 {flicker:.2f} (偏高)")
+    lines.append("")
+
+    # face detection
+    if face_rate is None:
+        lines.append("ℹ️ 人脸检测不可用（缺 mediapipe / insightface）")
+    elif face_rate >= 0.9:
+        lines.append(f"✅ 人脸检测 {face_rate*100:.0f}% (绝大多数帧检测到)")
+    elif face_rate >= 0.5:
+        lines.append(f"⚠️ 人脸检测 {face_rate*100:.0f}% (部分帧未检测到)")
+    else:
+        lines.append(f"❌ 人脸检测 {face_rate*100:.0f}% (可能大量帧被 skip)")
+
+    # recommendations
+    lines.append("")
+    lines.append("=== 建议 ===")
+    if blurry > 0.3:
+        lines.append("• 嘴糊比例高：考虑升 512 / 加 LPIPS / 开 CodeFormer")
+    if flicker > 8:
+        lines.append("• 闪烁偏高：考虑开 TREPA / Motion Module 训够 / 加时序稳定")
+    if face_rate is not None and face_rate < 0.7:
+        lines.append("• 人脸检测率低：检查 [FaceMatch] 日志，可能是 yaw/blur 跳太多")
+    if sharp >= 100 and blurry <= 0.3 and flicker < 8:
+        lines.append("✅ 整体质量良好，可以用！")
+    return "\n".join(lines)
+
+
+def run_validation(
+    video_path: str,
+    audio_path: str,
+    ckpt_path: str,
+    unet_config: str,
+    inference_steps: int,
+    guidance_scale: float,
+    seed: int,
+    resolution: int,
+    enable_deepcache: bool,
+    skip_quality_check: bool,
+) -> Tuple[str, str, str, str]:
+    """Run inference with the chosen fine-tuned checkpoint, then a quick
+    quality self-check. Returns (output_mp4, warnings_text, report_text,
+    saved_path).
+    """
+    if not video_path or not audio_path:
+        raise gr.Error("请先上传视频和音频")
+    if not ckpt_path:
+        raise gr.Error("请选择 checkpoint")
+    if not unet_config:
+        unet_config = str(CONFIG_DIR / "stage2.yaml")
+
+    ckpt = Path(ckpt_path)
+    cfg = Path(unet_config)
+    if not ckpt.exists():
+        raise gr.Error(f"checkpoint 不存在: {ckpt}")
+    if not cfg.exists():
+        raise gr.Error(f"unet config 不存在: {cfg}")
+
+    # Pre-flight compatibility check
+    warnings = _check_ckpt_compatibility(ckpt, cfg)
+    warnings_text = "\n".join(warnings) if warnings else "✅ ckpt 与 config 兼容"
+
+    # Build a per-run config with the user-chosen resolution / steps / guidance
+    base_cfg = OmegaConf.load(cfg)
+    base_cfg.data.resolution = int(resolution)
+    base_cfg.run.inference_steps = int(inference_steps)
+    base_cfg.run.guidance_scale = float(guidance_scale)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = REPO_ROOT / "debug" / "validation_outputs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_mp4 = out_dir / f"validation_{ts}.mp4"
+    tmp_cfg = out_dir / f"validation_cfg_{ts}.yaml"
+    with open(tmp_cfg, "w") as f:
+        yaml.dump(OmegaConf.to_container(base_cfg), f)
+
+    # Run inference
+    cmd = [
+        "python", "-m", "scripts.inference",
+        "--unet_config_path", str(tmp_cfg),
+        "--inference_ckpt_path", str(ckpt),
+        "--video_path", str(video_path),
+        "--audio_path", str(audio_path),
+        "--video_out_path", str(out_mp4),
+        "--inference_steps", str(int(inference_steps)),
+        "--guidance_scale", str(float(guidance_scale)),
+        "--seed", str(int(seed)),
+        "--temp_dir", "temp",
+    ]
+    if enable_deepcache:
+        cmd.append("--enable_deepcache")
+    log_path = out_dir / f"validation_{ts}.log"
+
+    t0 = time.time()
+    try:
+        with open(log_path, "w") as logf:
+            rc = subprocess.call(cmd, cwd=REPO_ROOT, stdout=logf, stderr=subprocess.STDOUT)
+    except FileNotFoundError as e:
+        raise gr.Error(f"启动失败: {e}")
+    duration = time.time() - t0
+
+    if rc != 0:
+        err_text = (
+            f"❌ 推理失败 (rc={rc})\n"
+            f"📜 完整 log: {log_path.relative_to(REPO_ROOT)}\n\n"
+            f"最后 30 行:\n{tail_file(log_path, 30)}"
+        )
+        return ("", warnings_text, err_text, str(out_mp4))
+
+    # Quality self-check
+    if skip_quality_check:
+        report = (
+            f"✅ 推理完成 ({duration:.1f}s)\n"
+            f"⏭ 跳过质量自检（用户关闭）\n"
+            f"📂 输出: {out_mp4.relative_to(REPO_ROOT)}"
+        )
+    else:
+        metrics = _quick_quality_check(str(out_mp4))
+        report = _format_validation_report(metrics, str(ckpt), duration)
+
+    return (str(out_mp4), warnings_text, report, str(out_mp4))
+
+
+def tail_file(path: Path, n_lines: int = 30) -> str:
+    """Read the last N lines of a text file (best-effort)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 20_000))
+            data = f.read().decode("utf-8", errors="replace")
+        return "\n".join(data.splitlines()[-n_lines:])
+    except Exception as e:
+        return f"(log read failed: {e})"
+
+
+# ---------------------------------------------------------------------------
 # Gradio UI assembly
 # ---------------------------------------------------------------------------
 
@@ -803,12 +1062,37 @@ def build_ui() -> gr.Blocks:
             """
 # 🎛 LatentSync Fine-tune Studio
 
-可视化配置 / 启动 / 监控 / 对比 UNet 与 SyncNet 的微调训练。
+> **核心目的**：**以微调 UNet 为主**的端到端工作台。覆盖**训练 → 监控 → 验证 → 调参**全流程。
+> 也支持 **SyncNet 单独训练**（Tab 1 选 SyncNet preset）。
+
+## 推荐工作流
+
+```
+[Tab 1] 配数据集 + 选 preset (Stage 2 / LoRA / QLoRA) → 启动训练
+   ↓
+[Tab 2] 看 loss 曲线 / validation 视频 / 日志 / sync_conf
+   ↓
+[Tab 3.5] 单 ckpt 推理 + 质量自检（首次验证）
+   ↓
+[Tab 3]  base vs fine-tuned 并排对比
+   ↓
+[Tab 4 / 6] 调 Identity 保护 / 查 Badcase
+```
+
+## 6 个 Tab 一览
+
+| Tab | 阶段 | 核心作用 |
+|---|---|---|
+| **1. 配置 & 启动** | 训练 | 选 preset、调超参、启动 `torchrun` |
+| **2. 训练监控** | 训练 | loss 曲线、val 视频、日志、auto refresh 15s |
+| **3. 推理对比** | 推理 | base vs fine-tuned 并排跑 |
+| **3.5. 验证 (单 ckpt)** | 推理 | **新** 选 1 个 ckpt 跑 + 自动质量自检（嘴糊 / 闪烁 / 人脸检测）|
+| **4. Identity 保护** | 推理 | 调 4 层身份保持参数，生成推理 kwargs |
+| **5. 数据集质量评估** | 数据 | HyperIQA + SyncNet_conf 分布 |
+| **6. Badcase 检查** | 推理 | 量化"嘴糊不糊"等指标 |
 
 > ⚠️ **GPU 提示**：本页会本地拉起 `torchrun`。如果没有 CUDA，会启动失败。
 > 推荐在带 GPU 的机器上启动；如果在 CPU 机器上启动，至少能在 **Tab 1** 配置并保存 yaml 供远程训练使用。
->
-> 训练启动后切到 **Tab 2** 查看 loss 曲线、validation 视频、日志。
             """
         )
 
@@ -1056,6 +1340,65 @@ def build_ui() -> gr.Blocks:
                     cmp_steps, cmp_guidance, cmp_seed, cmp_resolution,
                 ],
                 outputs=[cmp_out_base, cmp_out_ft],
+            )
+
+        # =========================================================
+        # Tab 3.5: Validation - run inference with a single ckpt
+        # =========================================================
+        with gr.Tab("🧪 验证 (单 ckpt 推理)"):
+            gr.Markdown(
+                """
+选一个 checkpoint（base / fine-tuned / LoRA-merged），上传视频和音频，
+跑一次推理并自动做 **质量自检**（嘴糊比例 / 闪烁 / 人脸检测率）。
+
+> 比 Tab 3 简单：只跑一个 ckpt，更快。  
+> 跑完后输出 mp4 + 质量报告。
+                """
+            )
+            with gr.Row():
+                with gr.Column():
+                    val_video = gr.Video(label="Input Video", scale=2)
+                    val_audio = gr.Audio(label="Input Audio", type="filepath", scale=2)
+                with gr.Column():
+                    val_ckpt = gr.Dropdown(
+                        choices=list_checkpoints(),
+                        label="Checkpoint（base / fine-tuned）",
+                        value="checkpoints/latentsync_unet.pt" if (REPO_ROOT / "checkpoints/latentsync_unet.pt").exists() else None,
+                    )
+                    val_config = gr.Dropdown(
+                        choices=[
+                            "configs/unet/stage2.yaml",
+                            "configs/unet/stage2_512.yaml",
+                            "configs/unet/stage2_efficient.yaml",
+                            "configs/unet/stage2_lora.yaml",
+                        ],
+                        value="configs/unet/stage2.yaml",
+                        label="UNet config（必须和 ckpt 匹配）",
+                    )
+                    val_resolution = gr.Radio([256, 512], value=256, label="resolution")
+
+            with gr.Row():
+                val_steps = gr.Slider(10, 50, value=20, step=1, label="inference_steps")
+                val_guidance = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="guidance_scale")
+                val_seed = gr.Number(value=1247, label="seed", precision=0)
+                val_deepcache = gr.Checkbox(value=True, label="enable_deepcache (快 2x)")
+                val_skip_qc = gr.Checkbox(value=False, label="跳过质量自检（更快）")
+
+            val_btn = gr.Button("🚀 推理 + 质量自检", variant="primary")
+
+            val_compat = gr.Textbox(label="ckpt 兼容性检查", lines=4, interactive=False)
+            val_output = gr.Video(label="生成结果", interactive=False)
+            val_report = gr.Textbox(label="质量报告", lines=18, interactive=False)
+            val_saved = gr.Textbox(label="保存路径", interactive=False)
+
+            val_btn.click(
+                fn=run_validation,
+                inputs=[
+                    val_video, val_audio, val_ckpt, val_config,
+                    val_steps, val_guidance, val_seed, val_resolution,
+                    val_deepcache, val_skip_qc,
+                ],
+                outputs=[val_output, val_compat, val_report, val_saved],
             )
 
         # =========================================================
