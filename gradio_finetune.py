@@ -2796,10 +2796,14 @@ pipe(
                     bc_flicker = gr.Number(label="闪烁评分 (目标 < 8)")
                     bc_sync = gr.Number(label="唇音同步 (目标 > 7)")
                     bc_identity = gr.Number(label="身份保持 (目标 > 0.8)")
+                    bc_yaw = gr.Number(
+                        label="平均 yaw (°; 0=正面, ≥15°=侧脸, ≥25°=重度侧脸)",
+                        precision=1,
+                    )
                 with gr.Column():
                     bc_report = gr.Textbox(label="诊断报告", lines=20)
                     bc_recommendation = gr.Textbox(
-                        label="🎯 finetune preset 推荐 (基于上面 4 个数字自动判定)",
+                        label="🎯 finetune preset 推荐 (基于上面 5 个数字自动判定)",
                         lines=4,
                         interactive=False,
                         value="跑完上方 🔍 检测后,这里会自动出推荐 preset。",
@@ -2808,17 +2812,17 @@ pipe(
             bc_check_btn.click(
                 fn=run_badcase_checklist,
                 inputs=[bc_video, bc_reference],
-                outputs=[bc_blurry, bc_flicker, bc_sync, bc_identity, bc_report],
+                outputs=[bc_blurry, bc_flicker, bc_sync, bc_identity, bc_yaw, bc_report],
             )
 
-            # Whenever any of the 4 metric numbers change, refresh the
+            # Whenever any of the 5 metric numbers change, refresh the
             # preset recommendation. Tab 6 re-run fills them all in one
             # .click event, so the user sees the recommendation update
             # immediately after the numbers settle.
-            for bc_metric in (bc_blurry, bc_flicker, bc_sync, bc_identity):
+            for bc_metric in (bc_blurry, bc_flicker, bc_sync, bc_identity, bc_yaw):
                 bc_metric.change(
                     fn=_recommend_finetune_preset,
-                    inputs=[bc_blurry, bc_flicker, bc_sync, bc_identity],
+                    inputs=[bc_blurry, bc_flicker, bc_sync, bc_identity, bc_yaw],
                     outputs=bc_recommendation,
                 )
 
@@ -3189,15 +3193,18 @@ _RECO_THRESHOLDS = {
 def _recommend_finetune_preset(
     blurry: Optional[float], flicker: Optional[float],
     sync: Optional[float], identity: Optional[float],
+    avg_yaw: Optional[float] = None,
 ) -> str:
-    """Return a multi-line recommendation string given the 4 badcase metrics.
+    """Return a multi-line recommendation string given the badcase metrics.
 
     Rules (in order):
       1. identity < 0.70                         → 🧩 Structural Fix
       2. content issue AND identity 0.70-0.85    → 🧩 Structural Fix (cover both)
-      3. content issue AND identity >= 0.85     → 🎯 Content Fix
-      4. flicker > 12 alone (identity OK)       → 🎯 Content Fix
-      5. identity 0.70-0.85 alone (no content)   → 🧩 Structural Fix (mild drift)
+      3. avg_yaw ≥ 18° AND content issue         → 💋 Side-Face Lip Quality
+         (overrides 🎯 Content Fix for heavy side-face content bugs)
+      4. content issue AND identity >= 0.85     → 🎯 Content Fix
+      5. flicker > 12 alone (identity OK)       → 🎯 Content Fix
+      6. identity 0.70-0.85 alone (no content)   → 🧩 Structural Fix (mild drift)
       6. all metrics OK                           → ⚪ no finetune needed
     """
     s = _RECO_THRESHOLDS
@@ -3228,6 +3235,24 @@ def _recommend_finetune_preset(
         identity is not None
         and s["identity_critical"] <= identity < s["identity_soft"]
     )
+
+    # Rule 2 (BEFORE structural_suspect): side-face heavy + content issue
+    # → 💋. This takes priority over the 0.70-0.85 identity range because
+    # for side-face videos the shape is preserved but the lips are bad;
+    # identity 0.82 on a side-face clip does NOT mean structural issue.
+    if (
+        avg_yaw is not None and avg_yaw >= 18.0
+        and identity is not None and identity >= 0.70
+        and has_content_issue
+    ):
+        return (
+            "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)\n"
+            f"   {metric_summary}\n"
+            f"   平均 yaw = {avg_yaw:.1f}° ≥ 18° + 内容指标越界 → "
+            "侧脸唇形专项(rank=48, sync=0.18, perceptual=0.25)。"
+            "\n   数据:📚 预制 celebv_hq_side (side_face 桶 ≥ 50%)。"
+        )
+
     if has_content_issue:
         if structural_suspect:
             return (
@@ -3241,16 +3266,27 @@ def _recommend_finetune_preset(
             f"   {metric_summary}\n"
             f"   脸型 OK (id={identity:.3f}),内容指标越界 → att-only LoRA 就够。"
         )
+
+    # has_content_issue is False from here. Now check identity drift + side-face.
+    if avg_yaw is not None and avg_yaw >= 18.0:
+        return (
+            "⚪ 当前侧脸场景内容指标正常,不需要 finetune。"
+            f"\n   {metric_summary}\n"
+            f"   平均 yaw = {avg_yaw:.1f}° ≥ 18° — 侧脸场景。"
+            "如需主动加强侧脸唇形质量,可走 💋 Side-Face Lip Quality。"
+        )
+
     if identity is not None and identity < s["identity_soft"]:
         return (
             "🧩 Structural Fix (LoRA + conv, 18-22GB)\n"
             f"   {metric_summary}\n"
             f"   内容型指标正常,但身份保持 = {identity:.3f} 偏低 → 脸轮廓漂,加 conv wrap。"
         )
+
     return (
         "⚪ 不需要 finetune / 用 Stage 2 LoRA baseline\n"
         f"   {metric_summary}\n"
-        "   四个指标都在合理范围内。生成质量可用,需要换风格/换脸再调 preset。"
+        "   五个指标都在合理范围内。生成质量可用,需要换风格/换脸再调 preset。"
     )
 
 
@@ -3367,13 +3403,16 @@ def _diagnose_short_drama(
 
 def run_badcase_checklist(
     video_path: str, reference_video_path: Optional[str]
-) -> Tuple[float, float, float, float, str]:
-    """Run all 4 badcase checks on a single generated video.
+) -> Tuple[float, float, float, float, float, str]:
+    """Run all 5 badcase checks on a single generated video.
 
-    Returns (blurry_ratio, flicker_score, sync_conf, identity_sim, report).
+    Returns (blurry_ratio, flicker_score, sync_conf, identity_sim,
+    avg_yaw, report). avg_yaw is the mean |yaw| in degrees across
+    detected-face frames; used by _recommend_finetune_preset to spot
+    side-face badcases.
     """
     if not video_path:
-        return 0.0, 0.0, 0.0, 0.0, "❌ 请先上传视频"
+        return 0.0, 0.0, 0.0, 0.0, 0.0, "❌ 请先上传视频"
 
     try:
         from decord import VideoReader
@@ -3382,7 +3421,7 @@ def run_badcase_checklist(
         vr = VideoReader(video_path)
         frames = [f.asnumpy() for f in vr]
         if len(frames) < 2:
-            return 0.0, 0.0, 0.0, 0.0, "❌ 视频帧数 < 2"
+            return 0.0, 0.0, 0.0, 0.0, 0.0, "❌ 视频帧数 < 2"
 
         # ---- 1. Blurry mouth ratio ----
         # crude: convert to grayscale, Laplacian variance per frame
@@ -3435,6 +3474,23 @@ def run_badcase_checklist(
         else:
             identity_sim_note = "未提供参考视频，跳过 identity sim"
 
+        # ---- 5. Average yaw (sampled face detection) ----
+        # Sample up to 16 frames evenly; run face_detector; record |yaw|.
+        # Lightweight — face_detector runs in <1s for 16 frames.
+        try:
+            from latentsync.utils.face_detector import FaceDetector
+            _fd = FaceDetector()
+            sample_n = min(16, len(frames))
+            sample_idx = np.linspace(0, len(frames) - 1, sample_n).astype(int)
+            yaws = []
+            for idx in sample_idx:
+                _, _ = _fd(frames[int(idx)])
+                if _fd.last_pose_yaw is not None:
+                    yaws.append(abs(float(_fd.last_pose_yaw)))
+            avg_yaw = float(np.mean(yaws)) if yaws else 0.0
+        except Exception:
+            avg_yaw = 0.0
+
         # ---- Build report ----
         lines: List[str] = []
         lines.append(f"📊 视频: {video_path}")
@@ -3477,10 +3533,23 @@ def run_badcase_checklist(
             lines.append(f"\n⚠️ {sync_conf_note}")
         if 'identity_sim_note' in locals() and identity_sim_note:
             lines.append(f"⚠️ {identity_sim_note}")
+        # yaw summary
+        if avg_yaw > 0:
+            if avg_yaw >= 25:
+                lines.append("")
+                lines.append(f"⚠️ 平均 yaw {avg_yaw:.1f}° ≥ 25° — 偏侧脸场景")
+                lines.append("   建议: Tab 1 preset 选 💋 Side-Face Lip Quality "
+                             "(sync_loss↑ perceptual↑ conv wrap)")
+            elif avg_yaw >= 15:
+                lines.append("")
+                lines.append(f"ℹ️ 平均 yaw {avg_yaw:.1f}° (15-25° 区间) — 轻度侧脸")
+                lines.append("   若同步/清晰度不佳,可考虑 💋 Side-Face Lip Quality")
+            else:
+                lines.append(f"\n✅ 平均 yaw {avg_yaw:.1f}° < 15° (基本正面)")
 
-        return blurry_ratio, flicker_score, float(sync_conf), identity_sim, "\n".join(lines)
+        return blurry_ratio, flicker_score, float(sync_conf), identity_sim, avg_yaw, "\n".join(lines)
     except Exception as e:
-        return 0.0, 0.0, 0.0, 0.0, f"❌ 检测失败: {e}"
+        return 0.0, 0.0, 0.0, 0.0, 0.0, f"❌ 检测失败: {e}"
 
 
 def main() -> None:
