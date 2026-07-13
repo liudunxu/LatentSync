@@ -127,10 +127,6 @@ def inject_lora(
         unet = prepare_model_for_kbit_training(unet, use_gradient_checkpointing=False)
         logger.info("QLoRA: base UNet quantized to 4-bit (nf4).")
 
-    logger.info(f"[LoRA debug] target_modules before list(): {target_modules!r} (type={type(target_modules).__name__})")
-    target_modules = list(target_modules)
-    logger.info(f"[LoRA debug] target_modules after list(): {target_modules!r}")
-    logger.info(f"[LoRA debug] target_modules passed to LoraConfig: {target_modules!r}")
     lora_config = LoraConfig(
         r=rank,
         lora_alpha=alpha,
@@ -141,7 +137,7 @@ def inject_lora(
         # perfect enum for it, but FEATURE_EXTRACTION works in practice.
         task_type=None,
     )
-    logger.info(f"[LoRA debug] LoraConfig.target_modules after init: {lora_config.target_modules!r}")
+    
 
     unet = get_peft_model(unet, lora_config)
     unet.print_trainable_parameters()
