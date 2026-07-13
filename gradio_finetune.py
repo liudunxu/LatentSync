@@ -876,6 +876,69 @@ def read_loss_from_checkpoint(ckpt_path: str) -> str:
         return f"(could not read checkpoint: {e})"
 
 
+def _run_merge_lora(
+    base_ckpt: str,
+    adapter_dir: str,
+    out_ckpt: str,
+    push_repo: str,
+) -> str:
+    """Spawn `python -m scripts.merge_lora` and stream its output to a textbox."""
+    base_ckpt = (base_ckpt or "").strip()
+    adapter_dir = (adapter_dir or "").strip()
+    out_ckpt = (out_ckpt or "").strip()
+    push_repo = (push_repo or "").strip()
+
+    if not base_ckpt or not Path(base_ckpt).exists():
+        return f"❌ base UNet ckpt 不存在: {base_ckpt}"
+    if not adapter_dir or not Path(adapter_dir).exists():
+        return f"❌ adapter 目录不存在: {adapter_dir}"
+    if not out_ckpt:
+        return "❌ 合并输出路径为空"
+    adapter_cfg = Path(adapter_dir) / "adapter_config.json"
+    if not adapter_cfg.exists():
+        return (
+            f"❌ {adapter_dir} 不是 peft adapter 目录 (缺少 adapter_config.json)。"
+            "请指向 train_unet_lora.py 输出的 checkpoints/<step>/ 那一层。"
+        )
+
+    cmd = [
+        sys.executable, "-m", "scripts.merge_lora",
+        "--base_ckpt", base_ckpt,
+        "--adapter_dir", adapter_dir,
+        "--out_ckpt", out_ckpt,
+        "--unet_config_path", "configs/unet/stage2.yaml",
+    ]
+    if push_repo:
+        cmd += ["--push_to_hub", push_repo]
+
+    log_path = REPO_ROOT / "debug" / f"merge_lora_{datetime.now():%Y%m%d_%H%M%S}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(log_path, "w") as logf:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(REPO_ROOT),
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        log_text = log_path.read_text()
+        if proc.returncode != 0:
+            return (
+                f"❌ merge_lora 退出码 {proc.returncode},完整日志:{log_path}\n\n"
+                f"{log_text[-4000:]}"
+            )
+        summary = [
+            f"✅ merged → {out_ckpt}",
+        ]
+        if push_repo:
+            summary.append(f"☁️  pushed to https://huggingface.co/{push_repo}")
+        summary.append(f"📄  full log: {log_path}")
+        return "\n".join(summary) + "\n\n" + log_text[-2000:]
+    except FileNotFoundError as exc:
+        return f"❌ 启动失败:{exc}"
+
+
 def monitor_refresh(
     train_output_dir: str,
     selected_run: Optional[str],
@@ -1612,6 +1675,42 @@ def build_ui() -> gr.Blocks:
                     val_video_dd, log_box, ckpt_info_box, trainer_status,
                 ],
             )
+
+            # ---- 合并 LoRA 子表(训练完自然接这一步) ----
+            with gr.Accordion("🔀 合并 LoRA adapter (merge_lora)", open=False):
+                gr.Markdown(
+                    "把训练好的 LoRA adapter (~10MB) 折回 base UNet,产出可独立部署的 "
+                    "`latentsync_unet.pt`。可选同时 push 到 HuggingFace Hub。"
+                )
+                with gr.Row():
+                    merge_base_ckpt = gr.Textbox(
+                        label="base UNet ckpt",
+                        value="checkpoints/latentsync_unet.pt",
+                        scale=2,
+                    )
+                    merge_adapter_dir = gr.Textbox(
+                        label="adapter 目录 (训练产物, 含 adapter_config.json)",
+                        placeholder="debug/unet_lora/train_lora-2025.../checkpoints/checkpoint-5000",
+                        scale=3,
+                    )
+                with gr.Row():
+                    merge_out_ckpt = gr.Textbox(
+                        label="合并输出路径",
+                        value=str(FINETUNE_BASE_DIR / "unet" / "merged.pt"),
+                        scale=3,
+                    )
+                    merge_push_repo = gr.Textbox(
+                        label="(可选) HF Hub repo_id,留空不 push",
+                        placeholder="username/latentsync-lora-finetune-v1",
+                        scale=3,
+                    )
+                merge_btn = gr.Button("🔀 合并 LoRA → merged.pt (可同时 push)", variant="primary")
+                merge_log = gr.Textbox(label="merge 输出", lines=10, interactive=False)
+                merge_btn.click(
+                    fn=_run_merge_lora,
+                    inputs=[merge_base_ckpt, merge_adapter_dir, merge_out_ckpt, merge_push_repo],
+                    outputs=merge_log,
+                )
 
         # =========================================================
         # Tab 3: Compare
