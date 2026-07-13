@@ -1105,7 +1105,213 @@ trepa_loss_weight: 10
 > **本质：从"让单帧好看"升级到"让 16 帧作为一个整体好看"。**
 > **配合 Mixed Noise + Motion Module，是 LatentSync 解决"帧间闪烁"问题的三件套。**
 
-### 5.8 配置全表
+### 5.9 LPIPS & Pixel-Space Supervision：把嘴部"画清楚"
+
+> **一句话**：LPIPS 让 UNet 生成的嘴部**看起来像嘴**（像素级感知相似），pixel-space supervision 是 LPIPS / TREPA / Sync 三大损失能算的前提（因为它们都在像素空间算）。
+
+#### 5.9.1 一句话回顾：UNet 在哪个空间工作？
+
+SD 类扩散模型有**两个空间**：
+
+```mermaid
+flowchart LR
+    A[原图 256×256×3<br/>~196K 像素] -->|VAE encode| B[latent 64×64×4<br/>~16K 像素]
+    B -->|UNet 工作| C[noise / pred_noise]
+    C -->|VAE decode| D[生成的 256×256×3]
+```
+
+| 空间 | 维度（256 分辨率） | 谁在里面工作 | 损失 |
+|---|---|---|---|
+| **Pixel 空间**（原图） | `(B, 3, 16, 256, 256)` | VAE 编/解码 | LPIPS、TREPA、SyncNet |
+| **Latent 空间** | `(B, 4, 16, 64, 64)` | UNet 内部 | Recon (MSE) |
+
+#### 5.9.2 什么是 "pixel-space supervision"？
+
+**问题**：Stage 1 时只算 `recon_loss = MSE(pred_noise, noise)`，所有计算都在 latent 空间。**完全不看生成出来的像素长啥样**。
+
+```python
+# Stage 1 训练循环（极简）
+pred_noise = unet(...)           # latent 空间
+recon_loss = MSE(pred_noise, noise)  # latent 空间 MSE
+loss.backward()
+```
+
+**问题**：UNet 噪声预测准 ≠ 生成图像好看。噪声预测只是中间任务。
+
+**解决**：Stage 2 引入 `pixel_space_supervise: true`，把生成的 latent **解码到像素空间**，再加感知损失：
+
+```python
+# Stage 2 训练循环（极简）
+pred_noise = unet(...)             # latent 空间
+recon_loss = MSE(pred_noise, noise) # 主损失（仍在 latent 空间）
+
+# 解码到 pixel 空间才能算下面的损失
+pred_pixel = vae.decode(pred_latents)  # ← 这步是关键
+
+lpips_loss = LPIPS(pred_pixel, gt_pixel)  # 像素空间感知损失
+sync_loss = SyncNet(pred_pixel, audio)    # 像素空间同步损失
+trepa_loss = TREPA(pred_pixel, gt_pixel)  # 像素空间时序损失
+```
+
+**代价**：VAE decoder 必须保留 activations 给反传，**显存爆炸**（这就是为什么分两阶段训练——Stage 1 省显存，Stage 2 算全）。
+
+#### 5.9.3 什么是 LPIPS？
+
+**LPIPS = Learned Perceptual Image Patch Similarity**
+
+不是简单的"像素差"，而是**用 VGG 网络看"像不像"**。
+
+直觉：
+
+```mermaid
+flowchart TB
+    subgraph A[普通 MSE 视角]
+        A1[生成的嘴] --> A2[和 GT 嘴逐像素比较]
+        A3[GT 嘴] --> A2
+        A2 --> A4[数值差距]
+    end
+
+    subgraph B[LPIPS 视角]
+        B1[生成的嘴] --> B3[VGG 提取特征]
+        B3 --> B4[高层特征]
+        B5[GT 嘴] --> B6[VGG 提取特征]
+        B6 --> B4
+        B4 --> B7[比较特征差距<br/>'像不像嘴']
+    end
+```
+
+**为什么不用普通 MSE？**
+
+| 指标 | 普通 MSE (像素) | LPIPS (VGG 特征) |
+|---|---|---|
+| **关注点** | 每个像素的颜色值 | 图像的"语义/结构" |
+| **人眼对齐** | ❌ 不对齐（像素差 5% 人眼可能无感） | ✅ 对齐（特征差 5% 人眼能感知） |
+| **小位移敏感度** | ❌ 极敏感（嘴偏 1 像素 MSE 就大涨） | ⚠️ 中等（VGG 池化后小位移不敏感） |
+| **风格敏感度** | ❌ 极敏感（颜色偏一点就大涨） | ✅ 较鲁棒 |
+| **训练表现** | 学到"颜色对齐" | 学到"语义对齐" |
+
+**通俗比喻**：
+- **MSE** 像"严苛的复印机"——颜色稍微偏差就扣分，逼模型死磕颜色对齐
+- **LPIPS** 像"宽松的艺术总监"——只关心"看起来像不像嘴"，颜色细节交给后续优化
+
+#### 5.9.4 LPIPS 在 LatentSync 里怎么用？
+
+**只看下半脸**（`train_unet.py:373`）：
+
+```python
+# 只取下半张脸算 LPIPS（嘴部区域）
+pred_pixel_values_perceptual = pred_pixel_values[:, :, pred_pixel_values.shape[2] // 2 :, :]
+gt_pixel_values_perceptual = gt_pixel_values[:, :, gt_pixel_values.shape[2] // 2 :, :]
+lpips_loss = lpips_loss_func(pred_pixel_values_perceptual, gt_pixel_values_perceptual).mean()
+```
+
+```mermaid
+flowchart LR
+    FULL[整张脸 256×256] --> HALF[下半张脸<br/>256×128]
+    HALF --> VGG[VGG 提取特征]
+    VGG --> LOSS[LPIPS loss]
+```
+
+**为什么只看下半脸**：
+- 我们只关心嘴部生成质量
+- 上半脸（眼睛、额头）UNet 不改 → 不算 loss 免得分心
+- 节省计算量
+
+**backbone**：VGG（论文 Eq. 4 中的 `V_l`，`scripts/train_unet.py:209`）：
+
+```python
+lpips_loss_func = lpips.LPIPS(net="vgg").to(device)  # 冻结，不训
+```
+
+#### 5.9.5 LPIPS 解决了 Stage 1 没解决的问题
+
+Stage 1 只有 `recon_loss`，UNet 学到：
+- ✅ 噪声预测准（latent 空间 MSE 小）
+- ❌ 生成的嘴可能很糊（细节、纹理、对比度）
+- ❌ 颜色可能偏（skin tone、牙齿白度）
+- ❌ 边缘可能糊（mask 边界接缝）
+
+Stage 2 加 LPIPS 后：
+- ✅ 嘴部细节清晰（VGG 特征对齐）
+- ✅ 颜色自然
+- ✅ 边缘锐利
+- ❌ 但**帧间闪烁**（这是 LPIPS 解决不了的，TREPA 解决）
+
+#### 5.9.6 LPIPS 的局限性
+
+| 场景 | LPIPS 表现 |
+|---|---|
+| 正常嘴型生成 | ✅ 显著提升细节质量 |
+| 大嘴/大笑/极端嘴型 | ⚠️ mask 本身盖不到，LPIPS 也无能为力 |
+| 单帧质量本身差 | ⚠️ LPIPS 看单帧，能学到一点但被 mask 限制 |
+| **帧间闪烁** | ❌ **完全管不了**（单帧损失） |
+| 训练数据本身质量差 | ❌ 学不到高质量 |
+
+#### 5.9.7 LPIPS 权重 0.1 怎么来的？
+
+```yaml
+# configs/unet/stage2.yaml
+perceptual_loss_weight: 0.1
+```
+
+**数量级平衡**：
+- `recon_loss` (latent MSE) ≈ 0.01-0.1
+- `lpips_loss` (VGG 特征距离) ≈ 0.3-0.8
+- `sync_loss` (cosine distance) ≈ 0.05-0.2
+- `trepa_loss` (normalized feature MSE) ≈ 0.001-0.01
+
+**权重作用**：
+- LPIPS 原始值大，权重 0.1 让它和 recon_loss 数量级匹配
+- 太小 → 嘴部糊（Stage 1 病）
+- 太大 → 颜色过饱和、细节过度锐化（"油画感"）
+
+**经验值**，调参时先看 `progress_bar.step_loss` 各分项。
+
+#### 5.9.8 pixel_space_supervise 开关
+
+| config | pixel_space_supervise | LPIPS / TREPA / Sync 生效？ |
+|---|---|---|
+| `stage1.yaml` | **false** | ❌ 都不生效，只算 recon_loss |
+| `stage1_512.yaml` | false | ❌ 同上 |
+| `stage2.yaml` | **true** | ✅ 全开 |
+| `stage2_512.yaml` | true | ✅ 全开 |
+| `stage2_efficient.yaml` | true | ✅ LPIPS / Sync 开，**TREPA 关**（weight=0） |
+
+**为什么 Stage 1 不开**？
+- VAE decode 需要保留 activations → 显存爆炸
+- Stage 1 batch_size 大、训得快，先把视觉特征学好
+- Stage 2 才需要"画清楚"细节
+
+#### 5.9.9 三个 pixel 空间损失分工
+
+| 损失 | 关注维度 | 解决什么问题 |
+|---|---|---|
+| **LPIPS** | 单帧 + 感知特征 | 嘴部**细节**糊 |
+| **TREPA** | 16 帧 + 时序特征 | 帧间**闪烁** |
+| **SyncNet** | 单帧 + 视听对齐 | 嘴和音频**不同步** |
+
+```mermaid
+flowchart TB
+    G[生成的 16 帧像素视频] --> L[LPIPS<br/>VGG 特征<br/>单帧感知]
+    G --> T[TREPA<br/>VideoMAE-v2 特征<br/>16 帧时序]
+    G --> S[SyncNet<br/>2048 维 embedding<br/>视听对齐]
+
+    G2[GT 16 帧像素视频] --> L
+    G2 --> T
+    A[音频 mel] --> S
+
+    L --> LOSS[加权和]
+    T --> LOSS
+    S --> LOSS
+```
+
+三者互补，缺一不可。
+
+#### 5.9.10 一句话总结
+
+> **LPIPS 让 UNet 学会"画得像嘴"，pixel-space supervision 是 LPIPS/TREPA/Sync 三大损失能算的前提。**
+> **Stage 1 只算 recon（latent 空间），不画细节 → 23GB；Stage 2 开 pixel 监督，画清楚 → 30-55GB。**
+> **LPIPS 管单帧细节，TREPA 管帧间时序，SyncNet 管音视对齐——三个 pixel 损失各管各的，互补。**
 
 | config | 分辨率 | motion | decoder_only | trainable | trepa | sync | mask | VRAM |
 |---|---|---|---|---|---|---|---|---|
@@ -1279,7 +1485,7 @@ flowchart TB
     Q4 -->|是| FIX4[检查 ref 窗口<br/>调 identity_similarity]
     Q4 -->|否| Q5{是边界接缝?}
     Q5 -->|是| FIX5[检查 mask<br/>开颜色匹配]
-    Q5 -->|否| Q6[检查 [FaceMatch] 日志<br/>看是哪个 filter 在 skip]
+    Q5 -->|否| Q6["检查 FaceMatch 日志<br/>看是哪个 filter 在 skip"]
 ```
 
 > **诊断第一步永远是看 `[FaceMatch]` 日志**：它会告诉你每种 filter 跳过了多少帧（yaw_skip、face_jump_skip 等）。如果某类 skip 异常多，说明那类样本在过滤阶段就被丢了，根本没进生成。
