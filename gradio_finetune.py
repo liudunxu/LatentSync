@@ -4650,11 +4650,17 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=6006)
     parser.add_argument("--share", action="store_true")
+    parser.add_argument(
+        "--no-queue",
+        dest="no_queue",
+        action="store_true",
+        help="Disable Gradio queue/heartbeat. Useful for slow or high-latency networks.",
+    )
     args = parser.parse_args()
 
     demo = build_ui()
     allowed = [str(REPO_ROOT), str(FINETUNE_BASE_DIR), "/tmp"]
-    demo.queue().launch(
+    launch_kwargs = dict(
         server_name=args.host,
         server_port=args.port,
         share=args.share,
@@ -4662,6 +4668,11 @@ def main() -> None:
         allowed_paths=allowed,
         show_api=False,
     )
+    if args.no_queue:
+        logger.info("[main] starting without Gradio queue (no heartbeat)")
+        demo.launch(**launch_kwargs)
+    else:
+        demo.queue().launch(**launch_kwargs)
 
 
 if __name__ == "__main__":
