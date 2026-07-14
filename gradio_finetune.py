@@ -34,6 +34,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+# Disable Gradio telemetry / messaging fetches so the page loads faster in
+# network-restricted environments (e.g. China mainland without a proxy).
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "0")
+os.environ.setdefault("GRADIO_TELEMETRY_ENABLED", "0")
+
 import gradio as gr
 import psutil
 import yaml
@@ -2801,10 +2806,20 @@ def _safe_video_update(value):
 # Gradio UI assembly
 # ---------------------------------------------------------------------------
 
+# System font stack so the UI does not wait for Google Fonts CDN.
+_SYSTEM_FONT_CSS = """
+* {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+                 "Noto Sans", "PingFang SC", "Microsoft YaHei", sans-serif !important;
+}
+"""
+
+
 def build_ui() -> gr.Blocks:
     with gr.Blocks(
         title="LatentSync Fine-tune Studio",
         theme=gr.themes.Soft(),
+        css=_SYSTEM_FONT_CSS,
     ) as demo:
         gr.Markdown(
             """
@@ -4645,6 +4660,7 @@ def main() -> None:
         share=args.share,
         inbrowser=True,
         allowed_paths=allowed,
+        show_api=False,
     )
 
 
