@@ -422,24 +422,19 @@ class LipSyncRequest(BaseModel):
     color_match_strength: float = Field(0.60, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
     # Unsharp-mask amount applied to the generated mouth region. 0 = off,
-    # 1 = strong sharpen. Default 0.30 (was 0.0): the inpainter's output
-    # tends to be slightly soft -- the diffusion process encourages
-    # plausible-but-not-sharp, so a small amount of unsharp in the mouth
-    # region recovers the high-frequency detail (teeth, lip lines, mouth
-    # corners) that the generated content is missing. 0.30 is in the
-    # "mild" range documented in the unsharp-mask helper; values above
-    # ~0.7 start to look crunchy. Frontend can still override per request.
-    mouth_sharpen_strength: float = Field(0.30, ge=0.0, le=1.0)
-    # Frame-to-frame mouth stabilization. Keep this light: too much carryover
-    # damps open-mouth frames and makes speech look under-articulated.
-    mouth_temporal_stabilization_strength: float = Field(0.15, ge=0.0, le=0.6)
-    mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
+    # 1 = strong sharpen. Default 0.0 so the post-process stack is minimal;
+    # raise to ~0.30 if the diffusion output looks soft.
+    mouth_sharpen_strength: float = Field(0.0, ge=0.0, le=1.0)
+    # Frame-to-frame mouth stabilization. Default 0.0 (off) to avoid the
+    # "cotton" effect from over-smoothing; raise cautiously if frames flicker.
+    mouth_temporal_stabilization_strength: float = Field(0.0, ge=0.0, le=0.6)
+    mouth_temporal_stabilization_max_delta: float = Field(0.0, ge=0.0, le=2.0)
     mouth_audio_adaptive_motion_enabled: bool = True
-    # Adaptive motion: preserve more current generated mouth motion,
-    # especially on high-energy speech, so open-mouth frames are not pulled
-    # back toward the smoothed/previous-frame mouth too aggressively.
-    mouth_audio_motion_min_scale: float = Field(0.85, ge=0.0, le=2.0)
-    mouth_audio_motion_max_scale: float = Field(1.60, ge=0.0, le=2.0)
+    # Adaptive motion: scale generated mouth motion based on audio energy.
+    # Default 1.0/1.0 means no scaling; lower min / higher max makes motion
+    # more pronounced on strong audio while keeping weak audio frames alive.
+    mouth_audio_motion_min_scale: float = Field(1.0, ge=0.0, le=2.0)
+    mouth_audio_motion_max_scale: float = Field(1.0, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default
     # (self.config.data.mask_image_path, usually latentsync/utils/mask.png).
     # Set to "latentsync/utils/mask5.png" to use the tight mouth-only mask,
