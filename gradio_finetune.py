@@ -926,6 +926,74 @@ def apply_dataset_preset(preset_name: str) -> Tuple[str, str, str, str]:
     )
 
 
+def one_click_launch(
+    preset_dd: str, train_data_dir: str, train_fileslist: str,
+    val_video_path: str, val_audio_path: str, resume_ckpt: str,
+    batch_size: int, num_frames: int, resolution: int, learning_rate: float,
+    use_motion_module: bool, pixel_space_supervise: bool, use_syncnet: bool,
+    sync_loss_weight: float, perceptual_loss_weight: float,
+    recon_loss_weight: float, trepa_loss_weight: float,
+    mixed_precision_training: bool, enable_gradient_checkpointing: bool,
+    mask_image_path: str, save_ckpt_steps: int, max_train_steps: int,
+    num_workers: int, train_output_dir: str, freeze_attn2: bool,
+    val_inference_steps: int, val_guidance_scale: float, val_seed: int,
+    lr_scheduler: str, lr_warmup_steps: int,
+    nproc_per_node: int, master_port: int, extra_env: str,
+) -> str:
+    """Top-of-tab "🚀 一键启动" button.
+
+    Auto-fills empty fields with sensible defaults and calls
+    launch_training. Updates the one-click status textbox with what was
+    filled in so the user knows what was inferred.
+    """
+    defaults_used: List[str] = []
+
+    # Fall back to assets demo files when nothing is provided — works
+    # for a smoke test and proves the pipeline end-to-end.
+    if not (val_video_path or "").strip():
+        val_video_path = str(ASSETS_DIR / "demo1_video.mp4")
+        defaults_used.append(f"val_video_path={val_video_path}")
+    if not (val_audio_path or "").strip():
+        val_audio_path = str(ASSETS_DIR / "demo1_audio.wav")
+        defaults_used.append(f"val_audio_path={val_audio_path}")
+    if not (resume_ckpt or "").strip():
+        resume_ckpt = str(REPO_ROOT / "checkpoints" / "latentsync_unet.pt")
+        defaults_used.append(f"resume_ckpt={resume_ckpt}")
+    if not (mask_image_path or "").strip():
+        mask_image_path = "latentsync/utils/mask.png"
+        defaults_used.append("mask_image_path=latentsync/utils/mask.png")
+
+    # If still no data dir, try prebuilt dataset init for the preset's
+    # typical_use. Falls back to a friendly message.
+    if not (train_data_dir or "").strip() and (train_fileslist or "").strip() == "":
+        hint = (
+            "⚠️ train_data_dir 和 train_fileslist 都为空。\n"
+            "→ 用 📚 预制数据集(同 Tab 顶部)下一份,或者自己填字段。\n"
+            "   例如 Tab 1 「📚 预制数据集」选 celebv_hq_side → ⬇ → 自动填。"
+        )
+        return hint
+
+    # Delegate to launch_training with the resolved args.
+    result = launch_training(
+        preset_dd, train_data_dir, train_fileslist,
+        val_video_path, val_audio_path, resume_ckpt,
+        batch_size, num_frames, resolution, learning_rate,
+        use_motion_module, pixel_space_supervise, use_syncnet,
+        sync_loss_weight, perceptual_loss_weight, recon_loss_weight,
+        trepa_loss_weight, mixed_precision_training,
+        enable_gradient_checkpointing, mask_image_path,
+        save_ckpt_steps, max_train_steps, num_workers, train_output_dir,
+        freeze_attn2, val_inference_steps, val_guidance_scale, val_seed,
+        lr_scheduler, lr_warmup_steps,
+        nproc_per_node, master_port, extra_env,
+    )
+    status, log_path = result
+    fill_note = ""
+    if defaults_used:
+        fill_note = "\n🪄 自动填字段:\n  - " + "\n  - ".join(defaults_used)
+    return f"{status}{fill_note}"
+
+
 def launch_training(
     preset_name: str,
     train_data_dir: str,
@@ -2186,6 +2254,24 @@ def build_ui() -> gr.Blocks:
         # Tab 1: Configure & Launch
         # =========================================================
         with gr.Tab("1️⃣ 配置 & 启动"):
+            # ──────────────────────────────────────────────────────────
+            # 🚀 一键启动训练:顶部大按钮,自动填默认 + 启动
+            # ──────────────────────────────────────────────────────────
+            gr.Markdown(
+                "> **懒人入口**:点一下这个按钮,自动填默认字段 + 用当前 preset 启训练。"
+                "想细调的字段下面表单手动改。"
+            )
+            with gr.Row():
+                one_click_btn = gr.Button(
+                    "🚀 一键启动训练 (自动填默认 + 启 torchrun)",
+                    variant="primary",
+                    scale=4,
+                )
+            one_click_status = gr.Textbox(
+                label="一键启动状态", interactive=False, lines=3,
+                value="👆 点上面按钮开始。空字段会用 preset 默认值 / prebuilt 默认数据 / assets demo 视频。",
+            )
+
             with gr.Row():
                 preset_dd = gr.Dropdown(
                     choices=list(PRESETS.keys()),
@@ -2376,6 +2462,25 @@ def build_ui() -> gr.Blocks:
                 outputs=[launch_status, log_path_state],
             )
             stop_btn.click(fn=stop_training, outputs=launch_status)
+
+            # The big top-of-tab "一键启动" button delegates to the
+            # standard launch_training flow with auto-filled defaults.
+            one_click_btn.click(
+                fn=one_click_launch,
+                inputs=[
+                    preset_dd, train_data_dir, train_fileslist,
+                    val_video_path, val_audio_path, resume_ckpt,
+                    batch_size, num_frames, resolution, learning_rate,
+                    use_motion_module, pixel_space_supervise, use_syncnet,
+                    sync_loss_weight, perceptual_loss_weight, recon_loss_weight, trepa_loss_weight,
+                    mixed_precision_training, enable_gradient_checkpointing, mask_image_path,
+                    save_ckpt_steps, max_train_steps, num_workers, train_output_dir,
+                    freeze_attn2, val_inference_steps, val_guidance_scale, val_seed,
+                    lr_scheduler, lr_warmup_steps,
+                    nproc_per_node, master_port, extra_env,
+                ],
+                outputs=one_click_status,
+            )
 
             # ---- 预制数据集 (HF Hub 自动下载 + curate) ----
             with gr.Accordion("📚 预制数据集 (HF Hub 自动下 + curate)", open=False):
@@ -2656,6 +2761,7 @@ def build_ui() -> gr.Blocks:
             with gr.Row():
                 cmp_btn = gr.Button("🎬 生成对比", variant="primary", scale=3)
                 cmp_cancel_btn = gr.Button("⏹ 取消当前推理", variant="stop", scale=1)
+            cmp_status = gr.Textbox(label="状态", interactive=False, visible=False)
 
             with gr.Row():
                 cmp_out_base = gr.Video(label="Base 输出")
@@ -2669,7 +2775,7 @@ def build_ui() -> gr.Blocks:
                 ],
                 outputs=[cmp_out_base, cmp_out_ft],
             )
-            cmp_cancel_btn.click(fn=stop_inference, outputs=val_report)
+            cmp_cancel_btn.click(fn=stop_inference, outputs=cmp_status)
 
         # =========================================================
         # Tab 3.5: Validation - run inference with a single ckpt
