@@ -1,55 +1,58 @@
 # Pre-built finetune dataset recipes.
 #
 # Each entry describes one downloadable dataset. The init_finetune_dataset.py
-# script reads this YAML, downloads a configurable subset, runs the LatentSync
-# face detector, curates into yaw/motion buckets, and writes a fileslist.txt
-# ready to plug into gradio_finetune Tab 1.
+# script reads this YAML, downloads a sampled subset from HuggingFace
+# Hub, runs the LatentSync face detector, curates into yaw/motion
+# buckets, and writes a fileslist.txt ready to plug into
+# gradio_finetune Tab 1.
 #
-# Adding a new entry is the only change needed to expose a new dataset in
-# the gradio UI — no code edit required. The dropdown auto-populates from
-# this file at startup.
+# Adding a new entry is the only change needed to expose a new
+# dataset in the gradio UI — no code edit required. The dropdown
+# auto-populates from this file at startup.
 #
 # Field reference:
 #   id            — short identifier, used as the output directory name.
 #   name          — display label shown in the gradio dropdown.
-#   hf_repo       — HuggingFace dataset repo id (e.g. "Reverb/voxceleb2").
+#   hf_repo       — HuggingFace dataset repo id (e.g.
+#                   "Reverb/voxceleb2"). Repo is treated as type=dataset
+#                   unless hf_repo_type is set.
 #   hf_repo_type  — "dataset" (default) or "model".
-#   hf_allow      — optional list of glob patterns to scope the download
-#                   (e.g. ["*.mp4"]). If omitted, falls back to defaults
-#                   listed in the script.
+#   hf_allow      — list of glob patterns to scope the download.
+#                   Single-archive bundles ("videos.tar") are
+#                   auto-extracted by init_finetune_dataset.py.
 #   n_clips       — how many video clips to actually pull + curate.
-#                   Large datasets are sampled, not full-dumped.
 #   target_ratio  — yaw/motion bucket weights; must sum to ~1.0.
-#                   Defaults to {frontal: 0.45, side_face: 0.35, fast_motion: 0.20}.
-#   description   — multi-line; surfaces in the gradio dropdown description
-#                   and in the post-curation paste-able instructions.
+#                   Defaults to {frontal: 0.45, side_face: 0.35,
+#                   fast_motion: 0.20}.
+#   description   — multi-line; surfaces in the gradio dropdown
+#                   description and in the post-curation paste-able
+#                   instructions.
 #
-#   Notes on access:
-#     - All repos below are public; no HF token needed for download.
-#     - VoxCeleb2 mirrors on HF Hub (~300GB total); we sample a subset.
-#     - Multi-Human Interactive Talking Dataset: 12h multi-speaker,
-#       perfect for short-drama finetune.
-#     - TalkVid is multilingual (15 langs) — covers Chinese short-drama
-#       source material if you filter by language.
+# ──────────────────────────────────────────────────────────────
+#  Manual alternatives (NOT auto-downloadable from HF Hub):
+#
+#  • VoxCeleb2 (academic): apply at
+#    http://www.robots.ox.ac.uk/~vgg/data/voxceleb/vox2.html —
+#    ~300GB of .mp4 + .m4a files. Drop the dev/ directory under
+#    data/ and write fileslist.txt manually (or use
+#    tools/write_fileslist.py).
+#
+#  • HDTF (research-only): https://github.com/MRzzm/HDTF —
+#    ~16h of HD talking-face clips. Best for the "general baseline"
+#    recipe when you can't get VoxCeleb2 access.
+#
+#  • Multi-Human Interactive Talking Dataset (showlab, 12h,
+#    multi-speaker): https://github.com/showlab/Multi-human-
+#    Talking-Video-Dataset — not on HF Hub; clone the repo and
+#    run tools/preprocess_short_drama.py on each clip first.
+# ──────────────────────────────────────────────────────────────
 
 datasets:
-  - id: voxceleb2_sample
-    name: VoxCeleb2 (1k 采访, 通用 baseline)
-    hf_repo: Reverb/voxceleb2
-    hf_repo_type: dataset
-    hf_allow: ["**/*.mp4"]
-    n_clips: 1000
-    target_ratio: {frontal: 0.45, side_face: 0.35, fast_motion: 0.20}
-    description: |
-      通用 baseline。YouTube 采访类,自然头部转动,适合 content/structural 都有覆盖的 finetune。
-      拉到 1000 clips,默认 45/35/20 桶分布。
-    typical_use: "Stage 2 LoRA baseline / 🎯 Badcase Fix"
-
   - id: celebv_hq_side
     name: CelebV-HQ (1k, 带 yaw 标注, 侧脸专项)
     hf_repo: SwayStar123/CelebV-HQ
     hf_repo_type: dataset
-    hf_allow: ["videos.tar"]            # single archive, auto-extracted by init_finetune_dataset.py
+    hf_allow: ["videos.tar"]            # single archive, auto-extracted
     n_clips: 1000
     target_ratio: {frontal: 0.30, side_face: 0.55, fast_motion: 0.15}
     description: |
@@ -66,17 +69,6 @@ datasets:
     target_ratio: {frontal: 0.40, side_face: 0.40, fast_motion: 0.20}
     description: |
       TalkVid: 1244h, 7729 speakers, 15 语言。规模大,身份多样。
-      适合想要"广覆盖"的 finetune。
-    typical_use: "Stage 2 LoRA full / 大规模数据重训"
-
-  - id: multi_human_drama
-    name: Multi-Human Talking (12h, 多说话人 / 短剧)
-    hf_repo: "Multi-Human-Interactive/MHIT"
-    hf_repo_type: dataset
-    hf_allow: ["*.mp4"]
-    n_clips: 800
-    target_ratio: {frontal: 0.40, side_face: 0.30, fast_motion: 0.30}
-    description: |
-      12h 多说话人短剧类数据集(2-4 人对话,频繁切场景)。fast_motion 桶提到 30%。
-      适合「短剧 / 多说话人」finetune。
-    typical_use: "🎬 Short Drama (LoRA+conv, 多说话人, 18-22GB)"
+      适合想要"广覆盖"的 finetune(Stage 2 LoRA baseline)。
+      mp4 文件直接列在 repo 顶层,1500 个 mp4。
+    typical_use: "Stage 2 LoRA baseline / 🎯 Badcase Fix"
