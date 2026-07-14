@@ -180,6 +180,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
             "qlora": False,
         },
+        "freeze_attn2": False,
     },
     "🎯 Badcase Fix (侧脸+运动, LoRA, 12-15GB)": {
         "config_file": "configs/unet/stage2.yaml",
@@ -198,26 +199,28 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "mixed_precision_training": True,
         "enable_gradient_checkpointing": True,
         "mask_image_path": "latentsync/utils/mask.png",
-        "save_ckpt_steps": 1000,
+        "save_ckpt_steps": 500,
         "max_train_steps": 20000,
         "lr_scheduler": "cosine",
         "lr_warmup_steps": 200,
         "description": (
             "🟢 **推荐 — 内容型 badcase**\n"
             "只 wrap 注意力,但 sync_loss↑到 0.12, num_frames=16,"
-            "cosine+200 warmup, 每 1k 步存 ckpt。\n"
+            "cosine+200 warmup, 每 500 步存 ckpt。\n"
             "适用:嘴型/audio 同步、嘴糊、paste-back 外溢。\n"
             "注意:SyncNet 只支持 16 帧,所以不要改 num_frames。\n"
+            "freeze_attn2=True 保护基础唇音同步能力。\n"
             "结构性脸变形见 🧩 Structural Fix。"
         ),
         "lora": {
             "enabled": True,
             "rank": 32,
             "alpha": 64,
-            "dropout": 0.05,
+            "dropout": 0.10,
             "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
             "qlora": False,
         },
+        "freeze_attn2": True,
     },
     "🧩 Structural Fix (LoRA + conv, 18-22GB)": {
         "config_file": "configs/unet/stage2.yaml",
@@ -264,6 +267,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             ],
             "qlora": False,
         },
+        "freeze_attn2": True,
     },
     "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)": {
         "config_file": "configs/unet/stage2.yaml",
@@ -311,6 +315,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             ],
             "qlora": False,
         },
+        "freeze_attn2": True,
     },
     "🎬 Short Drama (LoRA+conv, 多说话人, 18-22GB)": {
         "config_file": "configs/unet/stage2.yaml",
@@ -361,6 +366,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             ],
             "qlora": False,
         },
+        "freeze_attn2": True,
     },
     "Stage 2 QLoRA (256, 8-10GB)": {
         "config_file": "configs/unet/stage2.yaml",
@@ -935,6 +941,7 @@ def on_preset_change(preset_name: str) -> Tuple[Any, ...]:
         preset.get("lr_scheduler", "constant"),
         preset.get("lr_warmup_steps", 0),
         preset["description"],
+        preset.get("freeze_attn2", False),
     )
 
 
@@ -2661,7 +2668,7 @@ def build_ui() -> gr.Blocks:
                     mixed_precision_training, enable_gradient_checkpointing, mask_image_path,
                     resume_ckpt,
                     save_ckpt_steps, max_train_steps, lr_scheduler, lr_warmup_steps,
-                    preset_desc,
+                    preset_desc, freeze_attn2,
                 ],
             )
 
