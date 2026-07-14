@@ -638,7 +638,7 @@ def _on_page_load():
             )
             launch_text = f"⏳ training running since {_TRAINER.started_at or '?'}"
             try:
-                runs = list_run_dirs(FINETUNE_BASE_DIR / "unet")
+                runs = _list_run_dirs_for_monitor("unet")
             except Exception as exc:
                 logger.warning("list_run_dirs failed on page load: %s", exc)
                 runs = []
@@ -656,7 +656,7 @@ def _on_page_load():
         trainer_text = "🟢 idle — 点 '🚀 启动训练' 开始"
         launch_text = ""
         try:
-            runs = list_run_dirs(FINETUNE_BASE_DIR / "unet")
+            runs = _list_run_dirs_for_monitor("unet")
         except Exception as exc:
             logger.warning("list_run_dirs failed on page load: %s", exc)
             runs = []
@@ -1283,9 +1283,23 @@ def _resolve_output_dir(train_output_dir: str) -> Path:
     return FINETUNE_BASE_DIR / p
 
 
-def refresh_runs(train_output_dir: str) -> gr.update:
+def _list_run_dirs_for_monitor(train_output_dir: str) -> List[str]:
+    """List runs from the configured output dir and, for migration convenience,
+    also from the legacy REPO_ROOT-based location.
+    """
     base = _resolve_output_dir(train_output_dir)
     choices = list_run_dirs(base)
+    p = Path(train_output_dir or "unet")
+    legacy_base = REPO_ROOT / p.name if p.is_absolute() else REPO_ROOT / p
+    if legacy_base != base:
+        legacy_choices = list_run_dirs(legacy_base)
+        existing = set(choices)
+        choices = choices + [c for c in legacy_choices if c not in existing]
+    return choices
+
+
+def refresh_runs(train_output_dir: str) -> gr.update:
+    choices = _list_run_dirs_for_monitor(train_output_dir)
     return gr.update(choices=choices, value=choices[-1] if choices else None)
 
 
@@ -1807,7 +1821,7 @@ def monitor_refresh(
     loss_chart, sync_conf_chart, val_video_choices, checkpoint_choices, log_tail,
     ckpt_info, trainer_status, progress_pct, progress_text)."""
     base = _resolve_output_dir(train_output_dir)
-    run_choices = list_run_dirs(base)
+    run_choices = _list_run_dirs_for_monitor(train_output_dir)
     # Auto-select the latest run if none is selected so the page isn't blank
     # on first load.
     if not selected_run and run_choices:
