@@ -240,7 +240,10 @@ def _score_one(
         cap.release()
         return VideoScore(path=str(video_path), frame_count=total, rejected_reason="too_short")
 
-    # Sample uniformly across the video.
+    # Sample uniformly across the video.  Don't request more samples than
+    # frames; otherwise short clips get padded duplicates and the face
+    # detection ratio artificially drops.
+    sample_frames = min(sample_frames, total)
     indices = np.linspace(0, total - 1, sample_frames).astype(int)
 
     yaws: List[float] = []
@@ -296,17 +299,17 @@ def _score_one(
 # ---------------------------------------------------------------------------
 
 
-def _bucket(score: VideoScore, min_frames: int = MIN_FRAMES) -> str:
+def _bucket(score: VideoScore, *, min_frames: int, face_detected_ratio: float, yaw_side_max: float) -> str:
     """Assign a single bucket to a VideoScore. Sets `rejected_reason` if rejected."""
     if score.rejected_reason:
         return "reject"
     if score.frame_count < min_frames:
         score.rejected_reason = "too_short"
         return "reject"
-    if score.face_detected_ratio < 0.4:
+    if score.face_detected_ratio < face_detected_ratio:
         score.rejected_reason = "low_face_ratio"
         return "reject"
-    if score.yaw_max_abs > YAW_SIDE_MAX:
+    if score.yaw_max_abs > yaw_side_max:
         score.rejected_reason = "extreme_yaw"
         return "reject"
     if score.sync_conf is not None and score.sync_conf < SYNC_CONF_MIN:
@@ -320,11 +323,11 @@ def _bucket(score: VideoScore, min_frames: int = MIN_FRAMES) -> str:
     return "frontal"
 
 
-def _select(scored: List[VideoScore], target_count: int, min_frames: int = MIN_FRAMES) -> Dict[str, List[VideoScore]]:
+def _select(scored: List[VideoScore], target_count: int, *, min_frames: int, face_detected_ratio: float, yaw_side_max: float) -> Dict[str, List[VideoScore]]:
     """Pick the top-N per bucket per TARGET_RATIO."""
     buckets: Dict[str, List[VideoScore]] = defaultdict(list)
     for s in scored:
-        s.bucket = _bucket(s, min_frames=min_frames)
+        s.bucket = _bucket(s, min_frames=min_frames, face_detected_ratio=face_detected_ratio, yaw_side_max=yaw_side_max)
         if s.bucket != "reject":
             buckets[s.bucket].append(s)
 
@@ -393,18 +396,13 @@ def _write_fileslist(written: List[Path], fileslist_path: Path) -> None:
             f.write(str(p.resolve()) + "\n")
 
 
-def _write_report(scored: List[VideoScore], selected: Dict[str, List[VideoScore]], out_dir: Path) -> None:
+def _write_report(scored: List[VideoScore], selected: Dict[str, List[VideoScore]], out_dir: Path, thresholds: dict) -> None:
     report = {
         "total_candidates": len(scored),
         "kept": sum(len(v) for v in selected.values()),
         "by_bucket": {cat: [s.to_dict() for s in vs] for cat, vs in selected.items()},
         "rejected": [s.to_dict() for s in scored if s.bucket == "reject"],
-        "thresholds": {
-            "yaw_frontal_max": YAW_FRONTAL_MAX,
-            "yaw_side_max": YAW_SIDE_MAX,
-            "motion_fast_threshold": MOTION_FAST_THRESHOLD,
-            "min_frames": MIN_FRAMES,
-        },
+        "thresholds": thresholds,
     }
     with open(out_dir / "curation_report.json", "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
@@ -437,6 +435,10 @@ def main():
                         help=f"min frames per video to keep ({MIN_FRAMES}=~1.2s @ 25fps; bump to 60-120 for 1000+ videos to reduce short-clip noise)")
     parser.add_argument("--sample-frames", type=int, default=SAMPLE_FRAMES,
                         help="frames subsampled per video for face detection")
+    parser.add_argument("--face-detected-ratio", type=float, default=0.4,
+                        help="minimum ratio of sampled frames that must have a detected face (default 0.4)")
+    parser.add_argument("--yaw-side-max", type=float, default=YAW_SIDE_MAX,
+                        help=f"max |yaw| allowed; beyond this is rejected as extreme yaw (default {YAW_SIDE_MAX})")
     parser.add_argument("--device", type=str, default="cuda",
                         help="face detector device (cuda/cpu)")
     parser.add_argument("--log", type=str, default="INFO")
@@ -447,6 +449,15 @@ def main():
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_dir = out_dir / "_raw"
+
+    thresholds = {
+        "yaw_frontal_max": YAW_FRONTAL_MAX,
+        "yaw_side_min": YAW_SIDE_MIN,
+        "yaw_side_max": args.yaw_side_max,
+        "motion_fast_threshold": MOTION_FAST_THRESHOLD,
+        "min_frames": args.min_frames,
+        "face_detected_ratio": args.face_detected_ratio,
+    }
 
     # ---- collect candidates ----
     urls: List[str] = []
@@ -521,7 +532,12 @@ def main():
                 n_cache_hits, len(candidates))
 
     # ---- select ----
-    selected = _select(scored, args.target_count)
+    selected = _select(
+        scored, args.target_count,
+        min_frames=args.min_frames,
+        face_detected_ratio=args.face_detected_ratio,
+        yaw_side_max=args.yaw_side_max,
+    )
     kept_total = sum(len(v) for v in selected.values())
     logger.info(
         "Kept %d / %d (target=%d): %s",
@@ -529,10 +545,22 @@ def main():
         {k: len(v) for k, v in selected.items()},
     )
 
+    # Summarize rejection reasons so users can tell *why* clips were dropped.
+    rejected = [s for s in scored if s.bucket == "reject"]
+    if rejected:
+        from collections import Counter
+        reasons = Counter(s.rejected_reason for s in rejected)
+        logger.info("Rejection reasons (%d total rejected): %s", len(rejected), dict(reasons))
+        for reason, count in reasons.most_common():
+            examples = [s.path for s in rejected if s.rejected_reason == reason][:3]
+            logger.info("  - %s: %d (e.g. %s)", reason, count, examples)
+    else:
+        logger.info("No rejections.")
+
     # ---- materialize ----
     written = _copy_selected(selected, out_dir)
     _write_fileslist(written, out_dir / "fileslist.txt")
-    _write_report(scored, selected, out_dir)
+    _write_report(scored, selected, out_dir, thresholds)
     logger.info(
         "Done. fileslist at %s, report at %s/curation_report.json",
         out_dir / "fileslist.txt", out_dir,

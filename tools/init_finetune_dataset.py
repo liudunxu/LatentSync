@@ -54,7 +54,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -271,6 +271,7 @@ def _run_curation(
     output_dir: Path,
     target_count: int,
     ratio: Dict[str, float],
+    curate_args: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Shell out to curate_finetune_samples.py with the right defaults.
 
@@ -283,6 +284,10 @@ def _run_curation(
         "--output-dir", str(output_dir),
         "--target-count", str(target_count),
     ]
+    curate_args = curate_args or {}
+    for key, val in curate_args.items():
+        arg_name = f"--{key.replace('_', '-')}"
+        cmd += [arg_name, str(val)]
     logger.info("running: %s", " ".join(cmd))
     return subprocess.call(cmd, cwd=str(REPO_ROOT))
 
@@ -341,12 +346,13 @@ def init_one(
     # Stash the ratio so the curate call knows what bucket weights we want.
     # We pass it via env so curate_finetune_samples.py can pick it up if we
     # extend it; for now curate uses its own TARGET_RATIO constant.
-    print(f"[{recipe_id}] curating with ratio={ratio} ...")
+    print(f"[{recipe_id}] curating with ratio={ratio}, curate_args={recipe.get('curate_args', {})} ...")
     rc = _run_curation(
         source_dir=raw_dir,
         output_dir=curated_dir,
         target_count=n_clips,
         ratio=ratio,
+        curate_args=recipe.get("curate_args"),
     )
     if rc != 0:
         raise SystemExit(f"❌ [{recipe_id}] curation failed (rc={rc})")

@@ -32,7 +32,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import gradio as gr
 import yaml
@@ -1512,22 +1512,33 @@ def _prebuilt_choices() -> List[str]:
     return out
 
 
+def _tail_text(path: Path, n_lines: int = 40) -> str:
+    """Return the last n lines of a text file (best-effort)."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    lines = text.splitlines()
+    return "\n".join(lines[-n_lines:])
+
+
 def _run_init_prebuilt(
     dataset_choice: str, output_dir: str, hf_token: str,
-) -> Tuple[str, str, str]:
+) -> Iterator[Tuple[str, Any, Any]]:
     """Spawn `python -m tools.init_finetune_dataset` and stream output.
 
-    On success, also returns (log_text, train_data_dir_value,
-    train_fileslist_value) so the gradio button handler can autofill
-    the launch form.
+    Yields (log_text, train_data_dir_value, train_fileslist_value) so the
+    gradio textbox updates in real time and the launch form is auto-filled
+    on success.
     """
     dataset_choice = (dataset_choice or "").strip()
     output_dir = (output_dir or "").strip()
     if not dataset_choice:
-        return ("❌ 请先选一个预制数据集(下拉里选)",
-                gr.update(), gr.update())
+        yield ("❌ 请先选一个预制数据集(下拉里选)", gr.update(), gr.update())
+        return
     if not output_dir:
-        return ("❌ 输出目录为空", gr.update(), gr.update())
+        yield ("❌ 输出目录为空", gr.update(), gr.update())
+        return
     dataset_id = dataset_choice.split(" — ")[0].strip()
 
     cmd = [
@@ -1540,32 +1551,57 @@ def _run_init_prebuilt(
         cmd += ["--hf-token", hf_token]
     log_path = REPO_ROOT / "debug" / f"init_prebuilt_{datetime.now():%Y%m%d_%H%M%S}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    yield (
+        f"🚀 开始初始化数据集 `{dataset_id}`\n"
+        f"📜 实时日志: {log_path}\n"
+        f"   可另开终端查看: tail -f {log_path}\n"
+        f"   (窗口下方会每 0.5s 刷新一次最新日志)\n",
+        gr.update(), gr.update(),
+    )
+
     try:
         with open(log_path, "w") as logf:
-            proc = subprocess.run(cmd, cwd=str(REPO_ROOT), stdout=logf, stderr=subprocess.STDOUT)
-        log_text = log_path.read_text()
-        if proc.returncode != 0:
-            return (
-                f"❌ init 退出码 {proc.returncode}\n"
-                f"📜 log: {log_path}\n\n最后 60 行:\n{log_text[-6000:]}",
-                gr.update(), gr.update(),
+            proc = subprocess.Popen(
+                cmd, cwd=str(REPO_ROOT),
+                stdout=logf, stderr=subprocess.STDOUT,
+                bufsize=1, universal_newlines=True,
             )
-        curated_dir = (Path(output_dir).resolve() / dataset_id / "curated")
-        fileslist = curated_dir / "fileslist.txt"
-        summary = (
-            f"✅ 完成 — 已自动填到 launch 表单\n"
-            f"   train_data_dir:  {curated_dir}\n"
-            f"   train_fileslist: {fileslist}\n"
-            f"📜 log: {log_path}\n\n"
-            f"{log_text[-4000:]}"
-        )
-        return (
-            summary,
-            str(curated_dir),
-            str(fileslist),
-        )
+            while proc.poll() is None:
+                time.sleep(0.5)
+                tail = _tail_text(log_path, n_lines=40)
+                yield (
+                    f"🚀 `{dataset_id}` 处理中...\n"
+                    f"📜 log: {log_path}\n\n{tail}",
+                    gr.update(), gr.update(),
+                )
     except FileNotFoundError as exc:
-        return (f"❌ 启动失败: {exc}", gr.update(), gr.update())
+        yield (f"❌ 启动失败: {exc}\n📜 log: {log_path}", gr.update(), gr.update())
+        return
+
+    log_text = log_path.read_text()
+    if proc.returncode != 0:
+        yield (
+            f"❌ init 退出码 {proc.returncode}\n"
+            f"📜 log: {log_path}\n\n最后 60 行:\n{log_text[-6000:]}",
+            gr.update(), gr.update(),
+        )
+        return
+
+    curated_dir = (Path(output_dir).resolve() / dataset_id / "curated")
+    fileslist = curated_dir / "fileslist.txt"
+    summary = (
+        f"✅ 完成 — 已自动填到 launch 表单\n"
+        f"   train_data_dir:  {curated_dir}\n"
+        f"   train_fileslist: {fileslist}\n"
+        f"📜 log: {log_path}\n\n"
+        f"{log_text[-4000:]}"
+    )
+    yield (
+        summary,
+        str(curated_dir),
+        str(fileslist),
+    )
 
 
 def _run_merge_lora(
