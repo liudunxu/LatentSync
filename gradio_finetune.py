@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import gradio as gr
+import psutil
 import yaml
 from omegaconf import OmegaConf
 
@@ -587,7 +588,12 @@ _INFERENCE = InferenceManager()
 
 
 class TrainingProcess:
-    """Track a single background training subprocess."""
+    """Track a single background training subprocess.
+
+    State is persisted to disk so that if the Gradio service restarts,
+    we can reattach to a training subprocess that survived the restart
+    (it runs in its own session via os.setsid).
+    """
 
     def __init__(self) -> None:
         self.proc: Optional[subprocess.Popen] = None
@@ -595,22 +601,140 @@ class TrainingProcess:
         self.run_dir: Optional[Path] = None
         self.started_at: Optional[str] = None
         self.cmd: List[str] = []
+        self._pid: Optional[int] = None
+
+    @staticmethod
+    def _state_path() -> Path:
+        path = FINETUNE_BASE_DIR / "training_logs" / "active_trainer.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def save_state(self) -> None:
+        """Write active trainer metadata to disk."""
+        pid = self.proc.pid if self.proc else self._pid
+        if pid is None:
+            return
+        data = {
+            "pid": pid,
+            "log_path": str(self.log_path) if self.log_path else None,
+            "run_dir": str(self.run_dir) if self.run_dir else None,
+            "started_at": self.started_at,
+            "cmd": self.cmd,
+        }
+        try:
+            self._state_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning("[TrainingProcess] failed to save state: %s", e)
+
+    def clear_state(self) -> None:
+        """Remove persisted state."""
+        path = self._state_path()
+        if path.exists():
+            try:
+                path.unlink()
+            except Exception as e:
+                logger.warning("[TrainingProcess] failed to clear state: %s", e)
+
+    def reattach(self) -> bool:
+        """On startup, try to reattach to a training subprocess that is still alive."""
+        path = self._state_path()
+        if not path.exists():
+            return False
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("[TrainingProcess] corrupt state file %s: %s", path, e)
+            self.clear_state()
+            return False
+
+        pid = data.get("pid")
+        if not pid or not isinstance(pid, int):
+            self.clear_state()
+            return False
+
+        if not self._pid_alive(pid):
+            logger.info("[TrainingProcess] previously tracked pid=%s is no longer alive; clearing state", pid)
+            self.clear_state()
+            return False
+
+        # Sanity check: the process should look like a LatentSync training job.
+        try:
+            cmdline = " ".join(psutil.Process(pid).cmdline() or [])
+        except Exception:
+            cmdline = ""
+        if not any(token in cmdline for token in ("torchrun", "train_unet", "train_syncnet")):
+            logger.warning(
+                "[TrainingProcess] pid=%s does not look like a LatentSync training process (cmdline=%r); clearing state",
+                pid, cmdline,
+            )
+            self.clear_state()
+            return False
+
+        self._pid = pid
+        self.proc = None  # we don't have the Popen object, but we know the PID
+        self.log_path = Path(data["log_path"]) if data.get("log_path") else None
+        self.run_dir = Path(data["run_dir"]) if data.get("run_dir") else None
+        self.started_at = data.get("started_at")
+        self.cmd = data.get("cmd", [])
+        logger.info(
+            "[TrainingProcess] reattached to surviving training subprocess pid=%s, log=%s, run_dir=%s",
+            pid, self.log_path, self.run_dir,
+        )
+        return True
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            proc = psutil.Process(pid)
+            return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return False
 
     def is_running(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
+        if self.proc is not None:
+            return self.proc.poll() is None
+        if self._pid is not None:
+            alive = self._pid_alive(self._pid)
+            if not alive:
+                self._pid = None
+                self.clear_state()
+            return alive
+        return False
+
+    @property
+    def pid(self) -> Optional[int]:
+        if self.proc is not None:
+            return self.proc.pid
+        return self._pid
 
     def stop(self) -> None:
-        if self.proc and self.proc.poll() is None:
+        pid = self.pid
+        if self.proc is not None and self.proc.poll() is None:
             try:
                 self.proc.send_signal(signal.SIGINT)
                 self.proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait(timeout=5)
+        elif pid is not None:
+            # Reattached process: we only have the PID, send SIGINT to its group.
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGINT)
+                # Wait briefly for it to terminate.
+                for _ in range(30):
+                    if not self._pid_alive(pid):
+                        break
+                    time.sleep(0.5)
+            except (ProcessLookupError, OSError) as e:
+                logger.warning("[TrainingProcess] failed to signal pid=%s: %s", pid, e)
         self.proc = None
+        self._pid = None
+        self.clear_state()
 
 
 _TRAINER = TrainingProcess()
+# On module load, attempt to reattach to a training subprocess that survived a service restart.
+_TRAINER.reattach()
 
 
 def _on_page_load(train_output_dir: str = "unet"):
@@ -1105,10 +1229,10 @@ def launch_training(
         if _TRAINER.is_running():
             logger.warning(
                 "[launch_training] rejected: another training is already running (pid=%s)",
-                _TRAINER.proc.pid,
+                _TRAINER.pid,
             )
             return (
-                f"❌ 训练已在运行中 (pid={_TRAINER.proc.pid}, run={_TRAINER.run_dir.name})",
+                f"❌ 训练已在运行中 (pid={_TRAINER.pid}, run={_TRAINER.run_dir.name})",
                 "",
             )
 
@@ -1217,6 +1341,7 @@ def launch_training(
         _TRAINER.run_dir = _resolve_output_dir(cfg["data"]["train_output_dir"])
         _TRAINER.started_at = datetime.now().isoformat(timespec="seconds")
         _TRAINER.cmd = cmd
+        _TRAINER.save_state()
 
         status = (
             f"✅ 已启动 (pid={proc.pid})\n"
@@ -1240,7 +1365,7 @@ def launch_training(
 def stop_training() -> str:
     if not _TRAINER.is_running():
         return "ℹ️ 没有正在运行的训练任务"
-    pid = _TRAINER.proc.pid
+    pid = _TRAINER.pid
     _TRAINER.stop()
     return f"⏹ 已停止 (pid={pid})"
 
@@ -1250,21 +1375,17 @@ def refresh_training_log() -> Tuple[str, str]:
     if not _TRAINER.log_path or not _TRAINER.log_path.exists():
         status = "ℹ️ 暂无训练日志"
         if _TRAINER.is_running():
-            status = f"🟡 训练已启动但日志尚未写入 (pid={_TRAINER.proc.pid})"
+            status = f"🟡 训练已启动但日志尚未写入 (pid={_TRAINER.pid})"
         return "(log file not found yet)", status
 
     log_text = tail_file(_TRAINER.log_path, n_lines=80)
 
     if _TRAINER.is_running():
-        status = f"🟢 训练中 (pid={_TRAINER.proc.pid}, started={_TRAINER.started_at})"
+        status = f"🟢 训练中 (pid={_TRAINER.pid}, started={_TRAINER.started_at})"
     else:
-        exit_code = _TRAINER.proc.poll() if _TRAINER.proc else "?"
-        if exit_code == 0:
-            status = f"✅ 训练已正常结束 (exit_code=0)"
-        elif exit_code is None:
-            status = "ℹ️ 无正在运行的训练任务"
-        else:
-            status = f"🔴 训练异常退出 (exit_code={exit_code})，请看下方日志"
+        # After the process finishes, clear persisted state.
+        _TRAINER.clear_state()
+        status = "ℹ️ 无正在运行的训练任务"
     return log_text, status
 
 
@@ -1872,7 +1993,7 @@ def _monitor_refresh_core(
     if not run_dir:
         if _TRAINER.is_running():
             status = (
-                f"🟢 训练进行中 (pid={_TRAINER.proc.pid}, "
+                f"🟢 训练进行中 (pid={_TRAINER.pid}, "
                 f"started={_TRAINER.started_at or '-'}, log={_TRAINER.log_path or '-'}) | "
                 f"未选择 run，请点击 '🔄 刷新 run 列表'"
             )
@@ -1880,12 +2001,12 @@ def _monitor_refresh_core(
             status = "ℹ️ 未选择 run"
     elif _TRAINER.is_running() and _TRAINER.run_dir and run_dir.parent == _TRAINER.run_dir:
         status = (
-            f"🟢 当前 run 训练中 (pid={_TRAINER.proc.pid}, "
+            f"🟢 当前 run 训练中 (pid={_TRAINER.pid}, "
             f"started={_TRAINER.started_at or '-'}, log={_TRAINER.log_path or '-'})"
         )
     elif _TRAINER.is_running():
         status = (
-            f"ℹ️ 有其它训练在跑 (pid={_TRAINER.proc.pid}); "
+            f"ℹ️ 有其它训练在跑 (pid={_TRAINER.pid}); "
             f"当前选中 run 未在训练"
         )
     else:
