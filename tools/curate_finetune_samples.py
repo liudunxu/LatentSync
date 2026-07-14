@@ -353,7 +353,8 @@ def _score_one(
     # treat the clip as frontal rather than rejecting it outright.
     if not yaws:
         logger.warning(
-            "Faces detected in %s but yaw unavailable; treating as frontal.",
+            "Faces detected in %s but yaw unavailable (pose/landmark model missing?). "
+            "Treating as frontal. If many clips show this, run: python tools/download_checkpoints.py",
             video_path,
         )
         yaws = [0.0]
@@ -652,6 +653,15 @@ def main():
     written = _copy_selected(selected, out_dir)
     _write_fileslist(written, out_dir / "fileslist.txt")
     _write_report(scored, selected, out_dir, thresholds)
+    if kept_total == 0:
+        logger.error(
+            "No clips survived curation. Common causes:\n"
+            "  - face detection failed (run `python tools/download_checkpoints.py`)\n"
+            "  - all clips are too short / low face ratio / extreme yaw\n"
+            "Check %s/curation_report.json for per-video rejection reasons.",
+            out_dir,
+        )
+        sys.exit(1)
     logger.info(
         "Done. fileslist at %s, report at %s/curation_report.json",
         out_dir / "fileslist.txt", out_dir,

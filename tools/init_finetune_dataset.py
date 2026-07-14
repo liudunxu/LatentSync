@@ -184,6 +184,12 @@ def _download_hf_subset(
             else:
                 missing.append(repo_path)
 
+    n_ready = len(ready_files) + len(archives_to_extract)
+    logger.info(
+        "%d/%d files already present; %d need download",
+        n_ready, len(expected_files), len(missing),
+    )
+
     if missing:
         logger.info("downloading %d files from %s ...", len(missing), hf_repo)
         # Retry snapshot_download with exponential backoff. 并发下载容易触发
@@ -373,7 +379,7 @@ def init_one(
     n_clips = n_clips_override or recipe.get("n_clips", 1000)
     ratio = recipe.get("target_ratio") or DEFAULT_TARGET_RATIO
 
-    print(f"\n[{recipe_id}] downloading {n_clips} clips from {recipe['hf_repo']} ...")
+    print(f"\n[{recipe_id}] preparing {n_clips} clips from {recipe['hf_repo']} ...")
     raw_paths = _download_hf_subset(
         hf_repo=recipe["hf_repo"],
         repo_type=recipe.get("hf_repo_type", "dataset"),
@@ -382,14 +388,11 @@ def init_one(
         max_files=n_clips,
         hf_token=hf_token,
     )
-    print(f"[{recipe_id}] downloaded {len(raw_paths)} files → {raw_dir}")
+    print(f"[{recipe_id}] ready {len(raw_paths)} files under {raw_dir} (already-present files are skipped)")
 
     if not raw_paths:
         raise SystemExit(f"❌ [{recipe_id}] download produced no files")
 
-    # Stash the ratio so the curate call knows what bucket weights we want.
-    # We pass it via env so curate_finetune_samples.py can pick it up if we
-    # extend it; for now curate uses its own TARGET_RATIO constant.
     print(f"[{recipe_id}] curating with ratio={ratio}, curate_args={recipe.get('curate_args', {})} ...")
     rc = _run_curation(
         source_dir=raw_dir,
@@ -405,7 +408,16 @@ def init_one(
     # so the user can drop it straight into gradio Tab 1.
     curated_fileslist = curated_dir / "fileslist.txt"
     top_fileslist = output_dir / "fileslist.txt"
+    kept = 0
     if curated_fileslist.exists():
+        kept = len([line for line in curated_fileslist.read_text().splitlines() if line.strip()])
+        if kept == 0:
+            raise SystemExit(
+                f"❌ [{recipe_id}] curation produced an empty fileslist.\n"
+                f"   Likely face detection failed (missing InsightFace checkpoints).\n"
+                f"   Run: python tools/download_checkpoints.py\n"
+                f"   Then retry."
+            )
         shutil.copy2(curated_fileslist, top_fileslist)
 
     _print_paste_able(recipe_id, recipe, curated_dir)

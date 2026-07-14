@@ -52,12 +52,45 @@ from eval.syncnet import SyncNetEval
 from eval.syncnet_detect import SyncNetDetector
 from eval.eval_sync_conf import syncnet_eval
 import lpips
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from latentsync.utils.training_state import TrainingState
 from latentsync.utils.tracker import Tracker
 
 
 logger = get_logger(__name__)
+
+
+def _save_loss_chart(
+    save_path: str,
+    steps: list,
+    losses: dict,
+    lr_list: list,
+) -> None:
+    """Plot training losses (left y-axis) and learning rate (right y-axis)."""
+    import os
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig, ax1 = plt.subplots()
+    for name, values in losses.items():
+        if values:
+            ax1.plot(steps[: len(values)], values, label=name)
+    ax1.set_xlabel("Step")
+    ax1.set_ylabel("Loss")
+    ax1.legend(loc="upper left")
+
+    if lr_list:
+        ax2 = ax1.twinx()
+        ax2.plot(steps[: len(lr_list)], lr_list, color="black", linestyle="--", alpha=0.5, label="lr")
+        ax2.set_ylabel("Learning rate", color="black")
+        ax2.tick_params(axis="y", labelcolor="black")
+
+    fig.tight_layout()
+    fig.savefig(save_path)
+    plt.close(fig)
 
 
 def main(config):
@@ -88,6 +121,7 @@ def main(config):
         os.makedirs(f"{output_dir}/checkpoints", exist_ok=True)
         os.makedirs(f"{output_dir}/val_videos", exist_ok=True)
         os.makedirs(f"{output_dir}/sync_conf_results", exist_ok=True)
+        os.makedirs(f"{output_dir}/loss_charts", exist_ok=True)
         shutil.copy(config.unet_config_path, output_dir)
         shutil.copy(config.data.syncnet_config_path, output_dir)
 
@@ -282,6 +316,11 @@ def main(config):
     )
 
     train_step_list = []
+    train_loss_list = []
+    recon_loss_list = []
+    lpips_loss_list = []
+    sync_loss_list = []
+    lr_list = []
     val_step_list = []
     sync_conf_list = []
 
@@ -422,6 +461,7 @@ def main(config):
                 trepa_loss = 0
 
             if config.model.add_audio_layer and config.run.use_syncnet:
+                syncnet_num_frames = syncnet_config.data.num_frames
                 if config.run.pixel_space_supervise:
                     if config.data.resolution != syncnet_config.data.resolution:
                         pred_pixel_values = F.interpolate(
@@ -429,11 +469,49 @@ def main(config):
                             size=(syncnet_config.data.resolution, syncnet_config.data.resolution),
                             mode="bicubic",
                         )
+                    if config.data.num_frames != syncnet_num_frames:
+                        if is_main_process:
+                            logger.warning(
+                                "UNet num_frames=%d differs from SyncNet num_frames=%d; "
+                                "temporal interpolation will be used for sync loss.",
+                                config.data.num_frames,
+                                syncnet_num_frames,
+                            )
+                        pred_pixel_values_5d = rearrange(
+                            pred_pixel_values, "(b f) c h w -> b c f h w", f=config.data.num_frames
+                        )
+                        pred_pixel_values_5d = F.interpolate(
+                            pred_pixel_values_5d.float(),
+                            size=(syncnet_num_frames, pred_pixel_values_5d.shape[-2], pred_pixel_values_5d.shape[-1]),
+                            mode="trilinear",
+                            align_corners=False,
+                        ).to(dtype=pred_pixel_values.dtype)
+                        pred_pixel_values_aligned = rearrange(
+                            pred_pixel_values_5d, "b c f h w -> (b f) c h w"
+                        )
+                    else:
+                        pred_pixel_values_aligned = pred_pixel_values
                     syncnet_input = rearrange(
-                        pred_pixel_values, "(b f) c h w -> b (f c) h w", f=config.data.num_frames
+                        pred_pixel_values_aligned, "(b f) c h w -> b (f c) h w", f=syncnet_num_frames
                     )
                 else:
-                    syncnet_input = rearrange(pred_latents, "b c f h w -> b (f c) h w")
+                    if config.data.num_frames != syncnet_num_frames:
+                        if is_main_process:
+                            logger.warning(
+                                "UNet num_frames=%d differs from SyncNet num_frames=%d; "
+                                "temporal interpolation will be used for sync loss.",
+                                config.data.num_frames,
+                                syncnet_num_frames,
+                            )
+                        pred_latents_aligned = F.interpolate(
+                            pred_latents.float(),
+                            size=(syncnet_num_frames, pred_latents.shape[-2], pred_latents.shape[-1]),
+                            mode="trilinear",
+                            align_corners=False,
+                        ).to(dtype=pred_latents.dtype)
+                    else:
+                        pred_latents_aligned = pred_latents
+                    syncnet_input = rearrange(pred_latents_aligned, "b c f h w -> b (f c) h w")
 
                 if syncnet_config.data.lower_half:
                     height = syncnet_input.shape[2]
@@ -451,7 +529,13 @@ def main(config):
                 + trepa_loss * config.run.trepa_loss_weight
             )
 
-            train_step_list.append(global_step)
+            if is_main_process:
+                train_step_list.append(global_step)
+                train_loss_list.append(float(loss.item()))
+                recon_loss_list.append(float(recon_loss))
+                lpips_loss_list.append(float(lpips_loss))
+                sync_loss_list.append(float(sync_loss))
+                lr_list.append(float(lr_scheduler.get_last_lr()[0]))
 
             optimizer.zero_grad()
 
@@ -526,6 +610,19 @@ def main(config):
                     plot_loss_chart(
                         os.path.join(output_dir, f"sync_conf_results/sync_conf_chart-{global_step}.png"),
                         ("Sync confidence", val_step_list, sync_conf_list),
+                    )
+
+                if train_loss_list:
+                    _save_loss_chart(
+                        os.path.join(output_dir, f"loss_charts/loss_chart-{global_step}.png"),
+                        train_step_list,
+                        {
+                            "total": train_loss_list,
+                            "recon": recon_loss_list,
+                            "lpips": lpips_loss_list,
+                            "sync": sync_loss_list,
+                        },
+                        lr_list,
                     )
 
             logs = {"step_loss": loss.item(), "epoch": epoch}
