@@ -678,15 +678,17 @@ def list_run_dirs(base: Path) -> List[str]:
     """List timestamped run directories produced by train_unet.py / train_unet_lora.py / train_syncnet.py.
 
     Matches both `train-...` (full training) and `train_lora-...` (LoRA).
+    Sorted by directory creation time (oldest first) so the latest run is
+    last and can be auto-selected.
     """
     if not base.exists():
         return []
-    runs = sorted([
+    runs = [
         p for p in base.iterdir()
         if p.is_dir() and (p.name.startswith("train-") or p.name.startswith("train_lora-"))
-    ])
-    # If base is inside REPO_ROOT, keep paths relative for compact display.
-    # Otherwise (e.g. /root/autodl-tmp/...), return absolute paths.
+    ]
+    # Sort by birth/creation time when available, falling back to ctime.
+    runs.sort(key=lambda p: getattr(p.stat(), "st_birthtime", p.stat().st_ctime))
     try:
         return [str(p.relative_to(REPO_ROOT)) for p in runs]
     except ValueError:
@@ -1264,7 +1266,8 @@ def _resolve_output_dir(train_output_dir: str) -> Path:
 
 def refresh_runs(train_output_dir: str) -> gr.update:
     base = _resolve_output_dir(train_output_dir)
-    return gr.update(choices=list_run_dirs(base))
+    choices = list_run_dirs(base)
+    return gr.update(choices=choices, value=choices[-1] if choices else None)
 
 
 # ---------------------------------------------------------------------------
@@ -1422,6 +1425,26 @@ def read_loss_from_checkpoint(ckpt_path: str) -> str:
         return f"(could not read checkpoint: {e})"
 
 
+def _run_dir_start_time(run_dir: Path) -> Optional[float]:
+    """Best-effort start timestamp for a run directory.
+
+    The directory name contains an ISO-like timestamp (e.g.
+    train_lora-2026_07_14-14:12:26). Parse it when possible; otherwise fall
+    back to filesystem birth/ctime.
+    """
+    import re
+    m = re.search(r"-(\d{4}_\d{2}_\d{2}-\d{2}:\d{2}:\d{2})\Z", run_dir.name)
+    if m:
+        try:
+            from datetime import datetime
+            dt = datetime.strptime(m.group(1), "%Y_%m_%d-%H:%M:%S")
+            return dt.timestamp()
+        except Exception:
+            pass
+    stat = run_dir.stat()
+    return getattr(stat, "st_birthtime", stat.st_ctime)
+
+
 def _compute_progress(run_dir: Optional[Path]) -> Dict[str, Any]:
     """Pull step / max_step / elapsed / throughput / ETA for the run.
 
@@ -1459,26 +1482,25 @@ def _compute_progress(run_dir: Optional[Path]) -> Dict[str, Any]:
                 "latest_loss": None}
 
     # max_step from the yaml config that train_unet*.py copied into the
-    # run dir at startup.
+    # run dir at startup. Skip syncnet config files which also have run.max_train_steps.
     max_step = None
     try:
-        yamls = list(Path(run_dir).glob("*.yaml"))
+        yamls = [
+            y for y in Path(run_dir).glob("*.yaml")
+            if not y.name.lower().startswith("syncnet")
+        ]
         if yamls:
             cfg = OmegaConf.load(str(yamls[0]))
             max_step = int(cfg.run.max_train_steps)
     except Exception:
         pass
 
-    # elapsed = wall-clock since _TRAINER.started_at (ISO string) OR
-    # from filesystem mtime of the run dir if trainer not registered.
+    # elapsed = wall-clock since the run started. Prefer the timestamp encoded
+    # in the directory name; fall back to filesystem birth/ctime.
     elapsed_s = 0.0
     try:
-        if _TRAINER.started_at:
-            from datetime import datetime as _dt
-            started = _dt.fromisoformat(_TRAINER.started_at)
-            elapsed_s = max(0.0, (_dt.now() - started).total_seconds())
-        elif Path(run_dir).exists():
-            elapsed_s = max(0.0, time.time() - Path(run_dir).stat().st_mtime)
+        start_ts = _run_dir_start_time(Path(run_dir))
+        elapsed_s = max(0.0, time.time() - start_ts)
     except Exception:
         pass
 
@@ -1767,6 +1789,11 @@ def monitor_refresh(
     trainer_status, progress_pct, progress_text)."""
     base = _resolve_output_dir(train_output_dir)
     run_choices = list_run_dirs(base)
+    # Auto-select the latest run if none is selected so the page isn't blank
+    # on first load.
+    if not selected_run and run_choices:
+        selected_run = run_choices[-1]
+
     run_dir = _resolve_run_dir(selected_run)
     run_path = str(run_dir) if run_dir else None
     chart = parse_loss_chart(run_path)
@@ -1782,16 +1809,28 @@ def monitor_refresh(
         ckpt_info = read_loss_from_checkpoint(str(ckpt_path))
     else:
         ckpt_info = "(no checkpoint yet)"
-    status = (
-        f"📌 trainer running: {_TRAINER.is_running()} | "
-        f"pid: {_TRAINER.proc.pid if _TRAINER.proc else '-'} | "
-        f"started: {_TRAINER.started_at or '-'}"
-    )
+
+    # Trainer status should reflect the selected run, not just any trainer.
+    if not run_dir:
+        status = "ℹ️ 未选择 run"
+    elif _TRAINER.is_running() and _TRAINER.run_dir and run_dir.parent == _TRAINER.run_dir:
+        status = (
+            f"🟢 当前 run 训练中 (pid={_TRAINER.proc.pid}, "
+            f"started={_TRAINER.started_at or '-'}, log={_TRAINER.log_path or '-'})"
+        )
+    elif _TRAINER.is_running():
+        status = (
+            f"ℹ️ 有其它训练在跑 (pid={_TRAINER.proc.pid}); "
+            f"当前选中 run 未在训练"
+        )
+    else:
+        status = "⏸ 当前选中 run 未在训练"
+
     progress = _compute_progress(run_dir)
     progress_pct = float(progress["progress_pct"])
     progress_text = _format_progress_text(progress)
     return (
-        gr.update(choices=run_choices),
+        gr.update(choices=run_choices, value=selected_run),
         str(run_dir) if run_dir else "",
         chart,
         sync_chart,
@@ -2755,7 +2794,7 @@ def build_ui() -> gr.Blocks:
 
             with gr.Row():
                 with gr.Column():
-                    loss_chart_img = gr.Image(label="Loss 曲线 (lr + total + recon + lpips)", type="filepath")
+                    loss_chart_img = gr.Image(label="Loss 曲线 (lr + total + recon + lpips + sync)", type="filepath")
                     sync_conf_img = gr.Image(label="Sync_conf 曲线 (finetune 核心信号)", type="filepath")
                 with gr.Column():
                     val_video_dd = gr.Dropdown(label="Validation 视频", choices=[])
