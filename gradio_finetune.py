@@ -2606,6 +2606,58 @@ def _format_preview_info(video_path: str, analysis: Dict[str, Dict[str, Any]]) -
     )
 
 
+def _preview_cache_path(data_dir: str, fileslist: str) -> Optional[Path]:
+    """Pick a stable location for the yaw-analysis cache.
+
+    If a fileslist is used, cache next to it; otherwise cache inside data_dir.
+    Returns None if neither path is available.
+    """
+    fileslist = (fileslist or "").strip()
+    data_dir = (data_dir or "").strip()
+    if fileslist:
+        return Path(fileslist).parent / "preview_analysis_cache.json"
+    if data_dir:
+        return Path(data_dir) / "preview_analysis_cache.json"
+    return None
+
+
+def _load_preview_cache(cache_path: Optional[Path], videos: List[str]) -> Optional[Dict[str, Any]]:
+    """Load cached yaw analysis if the video list matches exactly."""
+    if cache_path is None or not cache_path.exists():
+        return None
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        if data.get("videos") == videos:
+            logger.info("Loaded preview analysis cache from %s", cache_path)
+            return data.get("analysis", {})
+    except Exception as exc:
+        logger.warning("Failed to read preview cache %s: %s", cache_path, exc)
+    return None
+
+
+def _save_preview_cache(
+    cache_path: Optional[Path],
+    videos: List[str],
+    analysis: Dict[str, Any],
+    threshold: float,
+) -> None:
+    """Persist yaw analysis so the next load can skip face detection."""
+    if cache_path is None:
+        return
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "videos": videos,
+            "analysis": analysis,
+            "threshold": threshold,
+            "cached_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        cache_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("Saved preview analysis cache to %s", cache_path)
+    except Exception as exc:
+        logger.warning("Failed to save preview cache %s: %s", cache_path, exc)
+
+
 def _safe_video_update(value):
     """Coerce arbitrary value to a gr.update that's safe for gr.Video in
     Gradio 5.x.
@@ -3622,8 +3674,20 @@ pipe(
             preview_videos_state = gr.State([])
             preview_analysis_state = gr.State({})
 
-            def _load_preview_videos(data_dir: str, fileslist: str):
+            def _load_preview_videos(data_dir: str, fileslist: str, threshold: float):
                 videos, status = _list_training_videos(data_dir, fileslist)
+                cache_path = _preview_cache_path(data_dir, fileslist)
+                cached_analysis = _load_preview_cache(cache_path, videos)
+                if cached_analysis is not None:
+                    status += " | 已使用缓存"
+                    return (
+                        gr.update(choices=videos, value=videos[0] if videos else None),
+                        status,
+                        gr.update(value=None),
+                        videos,
+                        cached_analysis,
+                        _format_preview_info(videos[0] if videos else "", cached_analysis),
+                    )
                 return (
                     gr.update(choices=videos, value=videos[0] if videos else None),
                     status,
@@ -3633,7 +3697,12 @@ pipe(
                     "",
                 )
 
-            def _analyze_preview_videos(videos: List[str], threshold: float):
+            def _analyze_preview_videos(
+                videos: List[str],
+                threshold: float,
+                data_dir: str,
+                fileslist: str,
+            ):
                 if not videos:
                     return (
                         gr.update(choices=[], value=None),
@@ -3658,6 +3727,12 @@ pipe(
                 status = f"已分析 {len(videos)} 个 | 正脸 {frontal} | 侧脸 {side}"
                 if unknown:
                     status += f" | 未检测 {unknown}"
+                _save_preview_cache(
+                    _preview_cache_path(data_dir, fileslist),
+                    videos,
+                    analysis,
+                    threshold,
+                )
                 return (
                     gr.update(choices=videos, value=videos[0] if videos else None),
                     status,
@@ -3699,7 +3774,7 @@ pipe(
 
             preview_load_btn.click(
                 fn=_load_preview_videos,
-                inputs=[preview_data_dir, preview_fileslist],
+                inputs=[preview_data_dir, preview_fileslist, preview_threshold],
                 outputs=[
                     preview_video_dd, preview_count, preview_video_player,
                     preview_videos_state, preview_analysis_state, preview_yaw_info,
@@ -3707,7 +3782,7 @@ pipe(
             )
             preview_analyze_btn.click(
                 fn=_analyze_preview_videos,
-                inputs=[preview_videos_state, preview_threshold],
+                inputs=[preview_videos_state, preview_threshold, preview_data_dir, preview_fileslist],
                 outputs=[
                     preview_video_dd, preview_count,
                     preview_analysis_state, preview_yaw_info,
