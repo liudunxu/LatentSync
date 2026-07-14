@@ -2475,6 +2475,54 @@ def tail_file(path: Path, n_lines: int = 30) -> str:
         return f"(log read failed: {e})"
 
 
+def _resolve_training_video_path(line: str, data_dir: Optional[str]) -> Optional[Path]:
+    """Best-effort resolve a path from a fileslist or scan result.
+
+    Tries the literal path first, then relative to data_dir if provided.
+    """
+    candidates = [Path(line.strip())]
+    if data_dir:
+        candidates.append(Path(data_dir) / line.strip())
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def _list_training_videos(data_dir: str, fileslist: str) -> Tuple[List[str], str]:
+    """List training videos from a fileslist or by scanning data_dir.
+
+    Returns (video_paths, status_text).
+    """
+    data_dir = (data_dir or "").strip()
+    fileslist = (fileslist or "").strip()
+
+    if fileslist and Path(fileslist).exists():
+        try:
+            with open(fileslist, "r", encoding="utf-8") as f:
+                raw_lines = [line.strip() for line in f if line.strip()]
+        except Exception as exc:
+            return [], f"❌ 读取 fileslist 失败: {exc}"
+        resolved = []
+        missing = []
+        for line in raw_lines:
+            p = _resolve_training_video_path(line, data_dir)
+            if p is not None:
+                resolved.append(str(p))
+            else:
+                missing.append(line)
+        status = f"📁 fileslist: {len(resolved)} 个视频"
+        if missing:
+            status += f" ({len(missing)} 个路径未找到)"
+        return resolved, status
+
+    if data_dir and Path(data_dir).exists():
+        videos = sorted([str(p) for p in Path(data_dir).rglob("*.mp4")])
+        return videos, f"📁 扫描目录: {len(videos)} 个 mp4"
+
+    return [], "⚠️ 请提供有效的 train_data_dir 或 train_fileslist"
+
+
 def _safe_video_update(value):
     """Coerce arbitrary value to a gr.update that's safe for gr.Video in
     Gradio 5.x.
@@ -3424,6 +3472,64 @@ pipe(
                     inputs=[bc_video],
                     outputs=drama_report,
                 )
+
+        # =========================================================
+        # Tab 7: Training-set preview
+        # =========================================================
+        with gr.Tab("📁 训练集预览"):
+            gr.Markdown(
+                """
+浏览并播放训练集中的原始视频样本。
+支持从 `train_fileslist` 读取（优先），或扫描 `train_data_dir` 下的 `.mp4` 文件。
+                """
+            )
+            with gr.Row():
+                preview_data_dir = gr.Textbox(
+                    label="train_data_dir",
+                    value="",
+                    scale=2,
+                )
+                preview_fileslist = gr.Textbox(
+                    label="train_fileslist（优先使用）",
+                    value="",
+                    scale=2,
+                )
+                preview_load_btn = gr.Button("🔄 加载视频列表", variant="primary", scale=1)
+
+            with gr.Row():
+                preview_video_dd = gr.Dropdown(
+                    label="选择视频",
+                    choices=[],
+                    value=None,
+                    scale=3,
+                )
+                preview_count = gr.Textbox(
+                    label="统计",
+                    value="",
+                    interactive=False,
+                    scale=1,
+                )
+
+            preview_video_player = gr.Video(label="预览", interactive=False)
+
+            def _load_preview_videos(data_dir: str, fileslist: str):
+                videos, status = _list_training_videos(data_dir, fileslist)
+                return (
+                    gr.update(choices=videos, value=videos[0] if videos else None),
+                    status,
+                    gr.update(value=None),
+                )
+
+            preview_load_btn.click(
+                fn=_load_preview_videos,
+                inputs=[preview_data_dir, preview_fileslist],
+                outputs=[preview_video_dd, preview_count, preview_video_player],
+            )
+            preview_video_dd.change(
+                fn=_safe_video_update,
+                inputs=preview_video_dd,
+                outputs=preview_video_player,
+            )
 
             # On page (re)load: repopulate trainer status + run dropdown
             # from the in-process _TRAINER singleton. This survives browser
