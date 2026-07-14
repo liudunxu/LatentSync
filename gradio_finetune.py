@@ -3564,7 +3564,7 @@ pipe(
                 """
 浏览并播放训练集中的原始视频样本。
 支持从 `train_fileslist` 读取（优先），或扫描 `train_data_dir` 下的 `.mp4` 文件。
-加载后会分析人脸 yaw，可按正脸 / 侧脸筛选。
+可先快速加载列表，再按需分析人脸 yaw 并筛选正脸 / 侧脸。
                 """
             )
             with gr.Row():
@@ -3578,7 +3578,8 @@ pipe(
                     value="",
                     scale=2,
                 )
-                preview_load_btn = gr.Button("🔄 加载并分析", variant="primary", scale=1)
+                preview_load_btn = gr.Button("🔄 加载视频列表", variant="primary", scale=1)
+                preview_analyze_btn = gr.Button("🔍 分析 yaw", variant="secondary", scale=1)
 
             with gr.Row():
                 preview_filter = gr.Dropdown(
@@ -3618,10 +3619,28 @@ pipe(
                 )
 
             preview_video_player = gr.Video(label="预览", interactive=False)
+            preview_videos_state = gr.State([])
             preview_analysis_state = gr.State({})
 
-            def _load_preview_videos(data_dir: str, fileslist: str, threshold: float):
+            def _load_preview_videos(data_dir: str, fileslist: str):
                 videos, status = _list_training_videos(data_dir, fileslist)
+                return (
+                    gr.update(choices=videos, value=videos[0] if videos else None),
+                    status,
+                    gr.update(value=None),
+                    videos,
+                    {},
+                    "",
+                )
+
+            def _analyze_preview_videos(videos: List[str], threshold: float):
+                if not videos:
+                    return (
+                        gr.update(choices=[], value=None),
+                        "⚠️ 没有视频可分析",
+                        {},
+                        "",
+                    )
                 analysis: Dict[str, Any] = {}
                 frontal = 0
                 side = 0
@@ -3636,31 +3655,40 @@ pipe(
                         side += 1
                     else:
                         unknown += 1
-                status += f" | 正脸 {frontal} | 侧脸 {side}"
+                status = f"已分析 {len(videos)} 个 | 正脸 {frontal} | 侧脸 {side}"
                 if unknown:
                     status += f" | 未检测 {unknown}"
                 return (
                     gr.update(choices=videos, value=videos[0] if videos else None),
                     status,
-                    gr.update(value=None),
                     analysis,
                     _format_preview_info(videos[0] if videos else "", analysis),
                 )
 
-            def _apply_preview_filter(filter_type: str, threshold: float, analysis: Dict[str, Any]):
+            def _apply_preview_filter(
+                filter_type: str,
+                threshold: float,
+                analysis: Dict[str, Any],
+                videos: List[str],
+            ):
+                if filter_type == "全部":
+                    return (
+                        gr.update(choices=videos, value=videos[0] if videos else None),
+                        f"共 {len(videos)} 个视频",
+                    )
                 if not analysis:
-                    return gr.update(choices=[], value=None), ""
+                    return (
+                        gr.update(choices=[], value=None),
+                        "⚠️ 请先点击 🔍 分析 yaw",
+                    )
                 filtered: List[str] = []
                 for path, info in analysis.items():
-                    if filter_type == "全部":
+                    yaw_mean = info.get("yaw_mean")
+                    is_side = yaw_mean is not None and yaw_mean >= threshold
+                    if filter_type == "侧脸" and is_side:
                         filtered.append(path)
-                    else:
-                        yaw_mean = info.get("yaw_mean")
-                        is_side = yaw_mean is not None and yaw_mean >= threshold
-                        if filter_type == "侧脸" and is_side:
-                            filtered.append(path)
-                        elif filter_type == "正脸" and not is_side and yaw_mean is not None:
-                            filtered.append(path)
+                    elif filter_type == "正脸" and not is_side and yaw_mean is not None:
+                        filtered.append(path)
                 return (
                     gr.update(choices=filtered, value=filtered[0] if filtered else None),
                     f"筛选后: {len(filtered)} 个视频",
@@ -3671,15 +3699,23 @@ pipe(
 
             preview_load_btn.click(
                 fn=_load_preview_videos,
-                inputs=[preview_data_dir, preview_fileslist, preview_threshold],
+                inputs=[preview_data_dir, preview_fileslist],
                 outputs=[
                     preview_video_dd, preview_count, preview_video_player,
+                    preview_videos_state, preview_analysis_state, preview_yaw_info,
+                ],
+            )
+            preview_analyze_btn.click(
+                fn=_analyze_preview_videos,
+                inputs=[preview_videos_state, preview_threshold],
+                outputs=[
+                    preview_video_dd, preview_count,
                     preview_analysis_state, preview_yaw_info,
                 ],
             )
             preview_filter.change(
                 fn=_apply_preview_filter,
-                inputs=[preview_filter, preview_threshold, preview_analysis_state],
+                inputs=[preview_filter, preview_threshold, preview_analysis_state, preview_videos_state],
                 outputs=[preview_video_dd, preview_count],
             )
             preview_video_dd.change(
