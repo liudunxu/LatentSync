@@ -622,6 +622,7 @@ def _on_page_load():
     falls back to idle.
     """
     try:
+        log_path = str(_TRAINER.log_path) if _TRAINER.log_path else ""
         if _TRAINER.is_running():
             pid = _TRAINER.proc.pid
             rc_hint = _TRAINER.proc.poll()
@@ -644,6 +645,7 @@ def _on_page_load():
             return (
                 trainer_text,
                 launch_text,
+                log_path,
                 gr.update(choices=runs, value=value),
                 gr.update(interactive=True),
             )
@@ -657,6 +659,7 @@ def _on_page_load():
         return (
             trainer_text,
             launch_text,
+            log_path,
             gr.update(choices=runs, value=None),
             gr.update(interactive=True),
         )
@@ -664,6 +667,7 @@ def _on_page_load():
         logger.exception("page-load handler failed entirely: %s", exc)
         return (
             f"⚠️ page-load handler 出错: {exc}",
+            "",
             "",
             gr.update(choices=[], value=None),
             gr.update(interactive=True),
@@ -3281,7 +3285,7 @@ pipe(
             demo.load(
                 fn=_on_page_load,
                 outputs=[
-                    trainer_status, launch_status, run_dd, monitor_btn,
+                    trainer_status, launch_status, log_path_state, run_dd, monitor_btn,
                 ],
             )
 
