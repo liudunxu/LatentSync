@@ -147,17 +147,35 @@ def _download_hf_subset(
         return sorted([target_dir / Path(f).name for f in matched[:max_files]])
 
     logger.info("downloading %d files from %s ...", len(to_download), hf_repo)
-    try:
-        snapshot_download(
-            repo_id=hf_repo,
-            repo_type=repo_type,
-            local_dir=str(target_dir),
-            allow_patterns=to_download,
-            max_workers=4,
-            token=hf_token,
+    # Retry snapshot_download with exponential backoff — HF Hub is
+    # intermittently 503 / connection-reset and a single retry is
+    # often enough to ride through a transient blip.
+    last_exc = None
+    for attempt in range(3):
+        try:
+            snapshot_download(
+                repo_id=hf_repo,
+                repo_type=repo_type,
+                local_dir=str(target_dir),
+                allow_patterns=to_download,
+                max_workers=4,
+                token=hf_token,
+            )
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            backoff = 5 * (2 ** attempt)
+            logger.warning(
+                "snapshot_download attempt %d/3 failed (%s); retrying in %ds ...",
+                attempt + 1, type(exc).__name__, backoff,
+            )
+            import time as _time
+            _time.sleep(backoff)
+    if last_exc is not None:
+        raise SystemExit(
+            f"❌ snapshot_download failed for {hf_repo} after 3 attempts: {last_exc}"
         )
-    except Exception as exc:
-        raise SystemExit(f"❌ snapshot_download failed for {hf_repo}: {exc}")
 
     # Some HF dataset repos (e.g. SwayStar123/CelebV-HQ) ship a single
     # .tar / .zip that bundles the actual mp4s. If matched files are all
