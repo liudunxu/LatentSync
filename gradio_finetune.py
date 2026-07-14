@@ -1798,10 +1798,10 @@ def monitor_refresh(
     train_output_dir: str,
     selected_run: Optional[str],
     log_path: Optional[str],
-) -> Tuple[Any, str, Any, Any, str, str, str, str, float, str]:
+) -> Tuple[Any, str, Any, Any, Any, str, str, str, str, float, str]:
     """Pull the latest snapshot. Returns: (run_dir_choices, selected_run_disp,
-    loss_chart, sync_conf_chart, val_video_choices, log_tail, ckpt_info,
-    trainer_status, progress_pct, progress_text)."""
+    loss_chart, sync_conf_chart, val_video_choices, checkpoint_choices, log_tail,
+    ckpt_info, trainer_status, progress_pct, progress_text)."""
     base = _resolve_output_dir(train_output_dir)
     run_choices = list_run_dirs(base)
     # Auto-select the latest run if none is selected so the page isn't blank
@@ -1815,8 +1815,9 @@ def monitor_refresh(
     sync_chart = parse_sync_conf_chart(run_path)
     val_videos = list_validation_videos(run_path)
     val_video_update = gr.update(choices=val_videos, value=val_videos[0] if val_videos else None)
-    log_text = tail_log(log_path, n_lines=80)
     ckpts = list_checkpoints_in_run(run_path)
+    ckpt_update = gr.update(choices=ckpts, value=ckpts[-1] if ckpts else None)
+    log_text = tail_log(log_path, n_lines=80)
     if ckpts:
         ckpt_path = Path(ckpts[-1])
         if not ckpt_path.is_absolute():
@@ -1857,6 +1858,7 @@ def monitor_refresh(
         chart,
         sync_chart,
         val_video_update,
+        ckpt_update,
         log_text,
         ckpt_info,
         status,
@@ -2812,7 +2814,8 @@ def build_ui() -> gr.Blocks:
 
             trainer_status = gr.Textbox(label="Trainer 状态", interactive=False)
             log_box = gr.Textbox(label="最新日志 (尾部 80 行)", lines=20, interactive=False)
-            ckpt_info_box = gr.Textbox(label="最新 checkpoint 信息", lines=10, interactive=False)
+            ckpt_dd = gr.Dropdown(label="Checkpoint", choices=[], value=None)
+            ckpt_info_box = gr.Textbox(label="Checkpoint 信息", lines=10, interactive=False)
 
             with gr.Row():
                 with gr.Column():
@@ -2827,6 +2830,7 @@ def build_ui() -> gr.Blocks:
                 sync_chart = parse_sync_conf_chart(run_path)
                 vids = list_validation_videos(run_path)
                 ckpts = list_checkpoints_in_run(run_path)
+                ckpt_update = gr.update(choices=ckpts, value=ckpts[-1] if ckpts else None)
                 if ckpts:
                     ckpt_path = Path(ckpts[-1])
                     if not ckpt_path.is_absolute():
@@ -2838,13 +2842,27 @@ def build_ui() -> gr.Blocks:
                     chart,
                     sync_chart,
                     gr.update(choices=vids, value=vids[0] if vids else None),
+                    ckpt_update,
                     ck_info,
                 )
+
+            def _on_ckpt_change(run_path, ckpt_path):
+                if not ckpt_path:
+                    return "(no checkpoint selected)"
+                p = Path(ckpt_path)
+                if not p.is_absolute():
+                    p = REPO_ROOT / p
+                return read_loss_from_checkpoint(str(p))
 
             run_dd.change(
                 fn=_on_run_change,
                 inputs=run_dd,
-                outputs=[loss_chart_img, sync_conf_img, val_video_dd, ckpt_info_box],
+                outputs=[loss_chart_img, sync_conf_img, val_video_dd, ckpt_dd, ckpt_info_box],
+            )
+            ckpt_dd.change(
+                fn=_on_ckpt_change,
+                inputs=[run_dd, ckpt_dd],
+                outputs=ckpt_info_box,
             )
             val_video_dd.change(
                 fn=_safe_video_update,
@@ -2868,7 +2886,7 @@ def build_ui() -> gr.Blocks:
                 inputs=[monitor_output_dir, run_dd, log_path_state],
                 outputs=[
                     run_dd, gr.Textbox(visible=False), loss_chart_img, sync_conf_img,
-                    val_video_dd, log_box, ckpt_info_box, trainer_status,
+                    val_video_dd, ckpt_dd, log_box, ckpt_info_box, trainer_status,
                     progress_bar, progress_text,
                 ],
             )
@@ -2879,7 +2897,7 @@ def build_ui() -> gr.Blocks:
                 inputs=[monitor_output_dir, run_dd, log_path_state],
                 outputs=[
                     run_dd, gr.Textbox(visible=False), loss_chart_img, sync_conf_img,
-                    val_video_dd, log_box, ckpt_info_box, trainer_status,
+                    val_video_dd, ckpt_dd, log_box, ckpt_info_box, trainer_status,
                     progress_bar, progress_text,
                 ],
             )
