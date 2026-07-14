@@ -739,12 +739,26 @@ def list_datasets() -> List[str]:
 
 
 def list_checkpoints() -> List[str]:
-    """Available UNet / SyncNet checkpoints under checkpoints/."""
-    if not CHECKPOINT_DIR.exists():
-        return []
+    """Available UNet / SyncNet checkpoints and LoRA adapter directories.
+
+    Returns .pt files under checkpoints/ plus peft-format LoRA adapter
+    directories found under FINETUNE_BASE_DIR/unet/*/checkpoints/.
+    """
     out: List[str] = []
-    for p in sorted(CHECKPOINT_DIR.rglob("*.pt")):
-        out.append(str(p.relative_to(REPO_ROOT)))
+    if CHECKPOINT_DIR.exists():
+        for p in sorted(CHECKPOINT_DIR.rglob("*.pt")):
+            out.append(str(p.relative_to(REPO_ROOT)))
+
+    # LoRA adapter directories produced by train_unet_lora.py
+    lora_base = FINETUNE_BASE_DIR / "unet"
+    if lora_base.exists():
+        for ckpt_dir in sorted(lora_base.rglob("checkpoints")):
+            for p in sorted(ckpt_dir.iterdir()):
+                if p.is_dir() and (p / "adapter_config.json").exists():
+                    try:
+                        out.append(str(p.relative_to(REPO_ROOT)))
+                    except ValueError:
+                        out.append(str(p))
     return out
 
 
@@ -2134,6 +2148,40 @@ def _format_validation_report(metrics: Dict[str, Any], ckpt_path: str,
     return "\n".join(lines)
 
 
+def _merge_adapter_to_temp_pt(
+    adapter_dir: Path,
+    base_ckpt: str,
+    unet_config: Path,
+) -> Path:
+    """Merge a peft LoRA adapter into the base UNet and save a temporary .pt.
+
+    Used by Tab 3.5 so users can select a LoRA adapter directory directly
+    without manually running scripts/merge_lora.py first.
+    """
+    from latentsync.models.unet import UNet3DConditionModel
+
+    logger.info("[validation] merging adapter %s into base %s", adapter_dir, base_ckpt)
+    cfg = OmegaConf.load(unet_config)
+    base, _ = UNet3DConditionModel.from_pretrained(
+        OmegaConf.to_container(cfg.model),
+        base_ckpt,
+        device="cpu",
+    )
+
+    from peft import PeftModel
+
+    peft_model = PeftModel.from_pretrained(base, str(adapter_dir), device="cpu")
+    merged = peft_model.merge_and_unload()
+
+    out_dir = REPO_ROOT / "debug" / "validation_outputs" / "merged_adapters"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_pt = out_dir / f"{adapter_dir.name}_{ts}.pt"
+    torch.save({"global_step": 0, "state_dict": merged.state_dict()}, out_pt)
+    logger.info("[validation] saved merged ckpt to %s", out_pt)
+    return out_pt
+
+
 def run_validation(
     video_path: str,
     audio_path: str,
@@ -2164,7 +2212,32 @@ def run_validation(
     if not unet_config or not Path(unet_config).exists():
         return (gr.update(value=None), gr.update(), gr.update(value=f"❌ config 不存在: {unet_config}"), gr.update())
 
+    # If the user selected a LoRA adapter directory, merge it into the base
+    # UNet on-the-fly so the rest of the validation path can treat it as a
+    # regular .pt checkpoint.
+    ckpt = Path(ckpt_path)
+    merged_from_adapter: Optional[Path] = None
+    if ckpt.is_dir() and (ckpt / "adapter_config.json").exists():
+        try:
+            merged_from_adapter = _merge_adapter_to_temp_pt(
+                ckpt,
+                base_ckpt="checkpoints/latentsync_unet.pt",
+                unet_config=Path(unet_config),
+            )
+            ckpt_path = str(merged_from_adapter)
+            ckpt = merged_from_adapter
+        except Exception as exc:
+            logger.exception("[run_validation] failed to merge adapter %s", ckpt_path)
+            return (
+                gr.update(value=None),
+                gr.update(),
+                gr.update(value=f"❌ LoRA adapter 合并失败: {exc}"),
+                gr.update(),
+            )
+
     warnings = _check_ckpt_compatibility(ckpt_path, unet_config)
+    if merged_from_adapter is not None:
+        warnings.insert(0, f"ℹ️ 已自动合并 LoRA adapter: {merged_from_adapter.name}")
     warnings_text = "\n".join(warnings) if warnings else "✅ ckpt 与 config 兼容"
 
     _prune_debug_files(REPO_ROOT / "debug" / "validation_outputs", "validation_cfg_*.yaml")
@@ -3063,7 +3136,7 @@ def build_ui() -> gr.Blocks:
                 val_guidance = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="guidance_scale")
                 val_seed = gr.Number(value=1247, label="seed", precision=0)
                 val_deepcache = gr.Checkbox(value=True, label="enable_deepcache (快 2x)")
-                val_skip_qc = gr.Checkbox(value=False, label="跳过质量自检（更快）")
+                val_skip_qc = gr.Checkbox(value=True, label="跳过质量自检（更快）")
 
             with gr.Row():
                 val_btn = gr.Button("🚀 推理 + 质量自检", variant="primary", scale=3)
