@@ -24,6 +24,9 @@ fi
     "$PY" -m pip install -q gradio peft bitsandbytes matplotlib scikit-image
 }
 
+# Patch Google Fonts CDN references so the page loads faster in network-restricted environments.
+"$PY" tools/patch_gradio_fonts.py
+
 echo "[start.sh] Using: $PY"
 echo "[start.sh] Starting Fine-tune Studio on http://0.0.0.0:6006 ..."
 echo "[start.sh] (use --port / --share / --host to override)"
