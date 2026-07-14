@@ -185,7 +185,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "config_file": "configs/unet/stage2.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
         "batch_size": 1,
-        "num_frames": 24,
+        "num_frames": 16,
         "resolution": 256,
         "learning_rate": 5e-5,
         "use_motion_module": True,
@@ -204,9 +204,10 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "lr_warmup_steps": 200,
         "description": (
             "🟢 **推荐 — 内容型 badcase**\n"
-            "只 wrap 注意力,但 sync_loss↑到 0.12, num_frames=24,"
+            "只 wrap 注意力,但 sync_loss↑到 0.12, num_frames=16,"
             "cosine+200 warmup, 每 1k 步存 ckpt。\n"
             "适用:嘴型/audio 同步、嘴糊、paste-back 外溢。\n"
+            "注意:SyncNet 只支持 16 帧,所以不要改 num_frames。\n"
             "结构性脸变形见 🧩 Structural Fix。"
         ),
         "lora": {
@@ -268,8 +269,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "config_file": "configs/unet/stage2.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
         "batch_size": 1,
-        # 长时序上下文 → 唇形连贯
-        "num_frames": 32,
+        # SyncNet 只支持 16 帧,长时序上下文需用 motion module 补偿
+        "num_frames": 16,
         "resolution": 256,
         "learning_rate": 3e-5,
         "use_motion_module": True,
@@ -294,7 +295,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             "针对侧脸时嘴部遮挡 (~30-50%) + 唇纹理变化的双重挑战。\n"
             "LoRA target 加 conv(11 项,同 Structural),rank=48 留更多 capacity 学唇形。\n"
             "sync_loss=0.18 强推唇音同步; perceptual=0.25 锐化唇部纹理;\n"
-            "num_frames=32 给时序更长上下文让唇形连贯。\n"
+            "num_frames=16 (SyncNet 只支持 16 帧),motion module 补偿时序连贯。\n"
             "数据:用 celebv_hq_side recipe(side_face 桶 ≥ 50%)。"
         ),
         "lora": {
@@ -879,6 +880,27 @@ def build_config_from_form(
             "freeze_attn2": False,
         }
     cfg["lora"]["freeze_attn2"] = bool(freeze_attn2)
+
+    # Validate syncnet / num_frames compatibility early so the user gets a
+    # clear message instead of a conv2d channel mismatch deep in training.
+    if cfg["run"]["use_syncnet"] and cfg["run"]["pixel_space_supervise"]:
+        import yaml as _yaml
+        syncnet_cfg_path = Path(cfg["data"]["syncnet_config_path"])
+        syncnet_cfg = _yaml.safe_load(syncnet_cfg_path.read_text())
+        syncnet_num_frames = syncnet_cfg.get("data", {}).get("num_frames")
+        if syncnet_num_frames is not None and syncnet_num_frames != cfg["data"]["num_frames"]:
+            raise ValueError(
+                f"SyncNet config `{syncnet_cfg_path.name}` expects num_frames={syncnet_num_frames}, "
+                f"but training is configured with num_frames={cfg['data']['num_frames']}. "
+                f"Please set num_frames to {syncnet_num_frames} (or disable use_syncnet)."
+            )
+        syncnet_ckpt = syncnet_cfg.get("ckpt", {}).get("inference_ckpt_path", "")
+        if not syncnet_ckpt:
+            raise ValueError(
+                f"SyncNet config `{syncnet_cfg_path.name}` has no inference_ckpt_path. "
+                "Please use a syncnet config that points to a valid checkpoint."
+            )
+
     return cfg
 
 
@@ -1047,38 +1069,41 @@ def launch_training(
                 "",
             )
 
-        cfg = build_config_from_form(
-            preset_name=preset_name,
-            train_data_dir=train_data_dir,
-            train_fileslist=train_fileslist,
-            val_video_path=val_video_path,
-            val_audio_path=val_audio_path,
-            resume_ckpt=resume_ckpt,
-            batch_size=batch_size,
-            num_frames=num_frames,
-            resolution=resolution,
-            learning_rate=learning_rate,
-            use_motion_module=use_motion_module,
-            pixel_space_supervise=pixel_space_supervise,
-            use_syncnet=use_syncnet,
-            sync_loss_weight=sync_loss_weight,
-            perceptual_loss_weight=perceptual_loss_weight,
-            recon_loss_weight=recon_loss_weight,
-            trepa_loss_weight=trepa_loss_weight,
-            mixed_precision_training=mixed_precision_training,
-            enable_gradient_checkpointing=enable_gradient_checkpointing,
-            mask_image_path=mask_image_path,
-            save_ckpt_steps=save_ckpt_steps,
-            max_train_steps=max_train_steps,
-            num_workers=num_workers,
-            train_output_dir=train_output_dir,
-            freeze_attn2=freeze_attn2,
-            val_inference_steps=val_inference_steps,
-            val_guidance_scale=val_guidance_scale,
-            val_seed=val_seed,
-            lr_scheduler=lr_scheduler,
-            lr_warmup_steps=lr_warmup_steps,
-        )
+        try:
+            cfg = build_config_from_form(
+                preset_name=preset_name,
+                train_data_dir=train_data_dir,
+                train_fileslist=train_fileslist,
+                val_video_path=val_video_path,
+                val_audio_path=val_audio_path,
+                resume_ckpt=resume_ckpt,
+                batch_size=batch_size,
+                num_frames=num_frames,
+                resolution=resolution,
+                learning_rate=learning_rate,
+                use_motion_module=use_motion_module,
+                pixel_space_supervise=pixel_space_supervise,
+                use_syncnet=use_syncnet,
+                sync_loss_weight=sync_loss_weight,
+                perceptual_loss_weight=perceptual_loss_weight,
+                recon_loss_weight=recon_loss_weight,
+                trepa_loss_weight=trepa_loss_weight,
+                mixed_precision_training=mixed_precision_training,
+                enable_gradient_checkpointing=enable_gradient_checkpointing,
+                mask_image_path=mask_image_path,
+                save_ckpt_steps=save_ckpt_steps,
+                max_train_steps=max_train_steps,
+                num_workers=num_workers,
+                train_output_dir=train_output_dir,
+                freeze_attn2=freeze_attn2,
+                val_inference_steps=val_inference_steps,
+                val_guidance_scale=val_guidance_scale,
+                val_seed=val_seed,
+                lr_scheduler=lr_scheduler,
+                lr_warmup_steps=lr_warmup_steps,
+            )
+        except ValueError as exc:
+            return (f"❌ 配置错误: {exc}", "")
         logger.info("[launch_training] config built, train_output_dir=%s", cfg["data"]["train_output_dir"])
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
