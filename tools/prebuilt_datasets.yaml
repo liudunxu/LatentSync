@@ -84,7 +84,7 @@ datasets:
     hf_allow: ["*.mp4"]
     n_clips: 78
     target_ratio: {frontal: 0.50, side_face: 0.30, fast_motion: 0.20}
-    curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 60}
+    curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 60, det_threshold: 0.2}
     description: |
       小而干净的 78 个 mp4 + 配对 txt 转录。适合作为最小 finetune seed
       (LoRA 几十个 epoch 验证流程),后续再加数据。若 HF Xet 后端 401,

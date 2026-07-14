@@ -519,6 +519,8 @@ def main():
                         help="minimum ratio of sampled frames that must have a detected face (default 0.4)")
     parser.add_argument("--yaw-side-max", type=float, default=YAW_SIDE_MAX,
                         help=f"max |yaw| allowed; beyond this is rejected as extreme yaw (default {YAW_SIDE_MAX})")
+    parser.add_argument("--det-threshold", type=float, default=0.3,
+                        help="InsightFace detection threshold; lower keeps more hard faces (default 0.3)")
     parser.add_argument("--device", type=str, default="cuda",
                         help="face detector device (cuda/cpu)")
     parser.add_argument("--log", type=str, default="INFO")
@@ -537,6 +539,7 @@ def main():
         "motion_fast_threshold": MOTION_FAST_THRESHOLD,
         "min_frames": args.min_frames,
         "face_detected_ratio": args.face_detected_ratio,
+        "det_threshold": args.det_threshold,
     }
 
     # ---- collect candidates ----
@@ -598,7 +601,7 @@ def main():
                 p, detector,
                 sample_frames=args.sample_frames,
                 min_frames=args.min_frames,
-                det_threshold=0.3,
+                det_threshold=args.det_threshold,
             )
         except Exception as exc:
             logger.warning("Failed to score %s: %s", p, exc)
@@ -654,13 +657,27 @@ def main():
     _write_fileslist(written, out_dir / "fileslist.txt")
     _write_report(scored, selected, out_dir, thresholds)
     if kept_total == 0:
-        logger.error(
-            "No clips survived curation. Common causes:\n"
-            "  - face detection failed (run `python tools/download_checkpoints.py`)\n"
-            "  - all clips are too short / low face ratio / extreme yaw\n"
-            "Check %s/curation_report.json for per-video rejection reasons.",
-            out_dir,
-        )
+        from collections import Counter
+        reasons = Counter(s.rejected_reason for s in scored if s.bucket == "reject")
+        no_face_count = reasons.get("no_face", 0)
+        if no_face_count == len(scored):
+            logger.error(
+                "All %d clips were rejected with 'no_face'. This usually means\n"
+                "  1. InsightFace models are missing -> run `python tools/download_checkpoints.py`\n"
+                "  2. Videos are unreadable / zero frames -> check with `ffprobe -i <path>`\n"
+                "  3. Faces are too small / too blurry -> try lowering --det-threshold (e.g. 0.2)\n"
+                "Check %s/curation_report.json for per-video details.",
+                len(scored), out_dir,
+            )
+        else:
+            logger.error(
+                "No clips survived curation. Rejection reasons: %s\n"
+                "Common fixes:\n"
+                "  - face detection failed (run `python tools/download_checkpoints.py`)\n"
+                "  - all clips are too short / low face ratio / extreme yaw\n"
+                "Check %s/curation_report.json for per-video rejection reasons.",
+                dict(reasons), out_dir,
+            )
         sys.exit(1)
     logger.info(
         "Done. fileslist at %s, report at %s/curation_report.json",
