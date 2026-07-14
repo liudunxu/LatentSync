@@ -2498,9 +2498,9 @@ def build_ui() -> gr.Blocks:
                         scale=2,
                     )
                     prebuilt_target = gr.Textbox(
-                        label="输出目录 (留空默认 data/init_finetune)",
-                        placeholder="data/init_finetune",
-                        value="data/init_finetune",
+                        label=f"输出目录 (默认 {FINETUNE_BASE_DIR}/init_finetune)",
+                        placeholder=str(FINETUNE_BASE_DIR / "init_finetune"),
+                        value=str(FINETUNE_BASE_DIR / "init_finetune"),
                         scale=2,
                     )
                 prebuilt_hf_token = gr.Textbox(

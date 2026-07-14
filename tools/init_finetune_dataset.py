@@ -328,7 +328,13 @@ def main():
                         help="list available prebuilt recipes and exit")
     parser.add_argument("--dataset", type=str, default=None,
                         help="dataset id from prebuilt_datasets.yaml (or 'all')")
-    parser.add_argument("--output-dir", type=str, default="data/init_finetune",
+    # Default lands under the standard finetune base dir so data stays
+    # on the data disk rather than under the repo working copy.
+    _DEFAULT_OUTPUT_DIR = os.environ.get(
+        "LATENTSYNC_FINETUNE_DIR", "/root/autodl-tmp/latentsync_finetune"
+    )
+    parser.add_argument("--output-dir", type=str,
+                        default=f"{_DEFAULT_OUTPUT_DIR}/init_finetune",
                         help="root directory for downloaded + curated data")
     parser.add_argument("--recipes", type=str, default=str(DEFAULT_YAML),
                         help="path to prebuilt_datasets.yaml")
