@@ -119,7 +119,9 @@ def _download_hf_subset(
     target_dir.mkdir(parents=True, exist_ok=True)
     api_kwargs = {"token": hf_token} if hf_token else {}
     try:
-        all_files = api.list_repo_files(hf_repo, repo_type=repo_type, **api_kwargs)
+        from huggingface_hub import HfApi
+        api = HfApi(**api_kwargs)
+        all_files = api.list_repo_files(hf_repo, repo_type=repo_type)
     except Exception as exc:
         raise SystemExit(
             f"❌ cannot list files for {hf_repo}: {exc}\n"
