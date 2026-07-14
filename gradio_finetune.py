@@ -2235,7 +2235,7 @@ def run_validation(
                 gr.update(),
             )
 
-    warnings = _check_ckpt_compatibility(ckpt_path, unet_config)
+    warnings = _check_ckpt_compatibility(Path(ckpt_path), Path(unet_config))
     if merged_from_adapter is not None:
         warnings.insert(0, f"ℹ️ 已自动合并 LoRA adapter: {merged_from_adapter.name}")
     warnings_text = "\n".join(warnings) if warnings else "✅ ckpt 与 config 兼容"
