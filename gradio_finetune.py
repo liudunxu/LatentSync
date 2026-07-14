@@ -1714,6 +1714,7 @@ def monitor_refresh(
     chart = parse_loss_chart(run_path)
     sync_chart = parse_sync_conf_chart(run_path)
     val_videos = list_validation_videos(run_path)
+    val_video_update = gr.update(choices=val_videos, value=val_videos[0] if val_videos else None)
     log_text = tail_log(log_path, n_lines=80)
     ckpts = list_checkpoints_in_run(run_path)
     if ckpts:
@@ -1736,7 +1737,7 @@ def monitor_refresh(
         str(run_dir) if run_dir else "",
         chart,
         sync_chart,
-        val_videos,
+        val_video_update,
         log_text,
         ckpt_info,
         status,
