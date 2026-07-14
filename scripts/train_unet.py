@@ -104,8 +104,14 @@ def main(config):
     set_seed(seed)
 
     # Logging folder
+    train_output_dir = config.data.train_output_dir
+    if not os.path.isabs(train_output_dir):
+        base_dir = os.environ.get("LATENTSYNC_FINETUNE_DIR", os.getcwd())
+        train_output_dir = os.path.join(base_dir, train_output_dir)
+        config.data.train_output_dir = train_output_dir
     folder_name = "train" + datetime.datetime.now().strftime(f"-%Y_%m_%d-%H:%M:%S")
     output_dir = os.path.join(config.data.train_output_dir, folder_name)
+    logger.info("output_dir: %s", output_dir)
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(

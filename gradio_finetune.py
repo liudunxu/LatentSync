@@ -65,6 +65,10 @@ except OSError as e:
     )
     FINETUNE_BASE_DIR = REPO_ROOT / "debug"
     FINETUNE_BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Propagate the effective base dir to child training processes so they can
+# resolve relative train_output_dir consistently.
+os.environ.setdefault("LATENTSYNC_FINETUNE_DIR", str(FINETUNE_BASE_DIR))
 TRAIN_OUTPUT_DIR = FINETUNE_BASE_DIR
 
 ASSETS_DIR = REPO_ROOT / "assets"

@@ -214,8 +214,14 @@ def main(config):
     lora_cfg = config.lora
 
     # Output dir
+    train_output_dir = config.data.train_output_dir
+    if not os.path.isabs(train_output_dir):
+        base_dir = os.environ.get("LATENTSYNC_FINETUNE_DIR", os.getcwd())
+        train_output_dir = os.path.join(base_dir, train_output_dir)
+        config.data.train_output_dir = train_output_dir
     folder_name = "train_lora" + datetime.datetime.now().strftime(f"-%Y_%m_%d-%H:%M:%S")
     output_dir = os.path.join(config.data.train_output_dir, folder_name)
+    logger.info("output_dir: %s", output_dir)
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
