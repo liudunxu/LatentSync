@@ -748,14 +748,13 @@ def _on_page_load(train_output_dir: str = "unet"):
     timer tick.
     """
     blank_monitor = (
-        "",          # hidden run_dir
+        "",          # selected_run_disp
         None,        # loss_chart
         None,        # sync_conf_chart
         gr.update(), # val_video_dd
         gr.update(), # ckpt_dd
         "",          # log_box
         "",          # ckpt_info
-        "⚠️ 初始化失败",  # trainer_status
         0.0,         # progress_pct
         "",          # progress_text
     )
@@ -770,21 +769,23 @@ def _on_page_load(train_output_dir: str = "unet"):
 
         core = _monitor_refresh_core(train_output_dir, run_name, log_path)
         run_dd_update = core[0]
+        # Gradio >= 4 returns gr.update() as a plain dict.
+        dd_choices = run_dd_update.get("choices") if isinstance(run_dd_update, dict) else getattr(run_dd_update, "choices", None)
         # If a training run is alive, prefer selecting it over the latest run.
         if (
             run_name
-            and run_dd_update.choices
-            and run_name in run_dd_update.choices
+            and dd_choices
+            and run_name in dd_choices
         ):
-            run_dd_update = gr.update(choices=run_dd_update.choices, value=run_name)
+            run_dd_update = gr.update(choices=dd_choices, value=run_name)
         elif (
             run_name
             and _TRAINER.run_dir
-            and run_dd_update.choices
-            and str(_TRAINER.run_dir) in run_dd_update.choices
+            and dd_choices
+            and str(_TRAINER.run_dir) in dd_choices
         ):
             run_dd_update = gr.update(
-                choices=run_dd_update.choices, value=str(_TRAINER.run_dir)
+                choices=dd_choices, value=str(_TRAINER.run_dir)
             )
 
         return (
