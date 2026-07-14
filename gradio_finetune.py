@@ -2719,18 +2719,6 @@ def build_ui() -> gr.Blocks:
 
 > ⚠️ **GPU 提示**：本页会本地拉起 `torchrun`。如果没有 CUDA，会启动失败。
 > 推荐在带 GPU 的机器上启动；如果在 CPU 机器上启动，至少能在 **Tab 1** 配置并保存 yaml 供远程训练使用。
-
-## 📚 文档导航
-
-| 文档 | 何时读 |
-|---|---|
-| [`docs/README.md`](docs/README.md) | 所有文档的总索引 |
-| [`docs/finetune_studio_guide.md`](docs/finetune_studio_guide.md) | 完整 finetune 操作手册 (preset 选择 / 数据准备 / badcase 排查 / 短剧 / 预制数据集) |
-| [`docs/short_drama_workflow.md`](docs/short_drama_workflow.md) | 短剧 1 页速查卡 |
-| [`docs/training_pipeline.md`](docs/training_pipeline.md) | 训练 deep reference (改 model 时看) |
-| [`docs/lipsync_optimization_roadmap.md`](docs/lipsync_optimization_roadmap.md) | 优化 roadmap + 已知瓶颈 |
-
-> 路径相对 `gradio_finetune.py` 启动目录;若用 systemd / docker 跑,改 `LATENTSYNC_FINETUNE_DIR` env 或软链 docs。
             """
         )
 
