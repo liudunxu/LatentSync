@@ -2523,6 +2523,89 @@ def _list_training_videos(data_dir: str, fileslist: str) -> Tuple[List[str], str
     return [], "⚠️ 请提供有效的 train_data_dir 或 train_fileslist"
 
 
+def _analyze_training_video_yaw(video_path: str, n_frames: int = 5) -> Dict[str, Any]:
+    """Sample frames from a training video and estimate face yaw.
+
+    Returns a dict with yaw_mean, yaw_max, detect_rate, face_type and an
+    optional error key. Used by the training-set preview tab to filter
+    frontal / side-face samples.
+    """
+    try:
+        from latentsync.utils.av_reader import AVReader
+        from latentsync.utils.face_detector import FaceDetector
+    except Exception as exc:
+        return {"error": f"import failed: {exc}"}
+
+    try:
+        reader = AVReader(video_path)
+        total_frames = len(reader)
+        if total_frames <= 0:
+            return {"error": "no frames", "yaw_mean": None, "yaw_max": None, "detect_rate": 0.0}
+
+        if n_frames <= 1:
+            indices = [0]
+        else:
+            indices = [int(i * (total_frames - 1) / (n_frames - 1)) for i in range(n_frames)]
+
+        import torch
+
+        detector = FaceDetector(
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            allowed_modules=["detection", "landmark_2d_106", "pose"],
+        )
+
+        yaws: List[float] = []
+        for idx in indices:
+            _, frame = reader[idx]
+            if hasattr(frame, "asnumpy"):
+                frame = frame.asnumpy()
+            face, _ = detector.detect(frame)
+            if face is not None and detector.last_pose_yaw is not None:
+                yaws.append(detector.last_pose_yaw)
+
+        if not yaws:
+            return {
+                "yaw_mean": None,
+                "yaw_max": None,
+                "detect_rate": 0.0,
+                "face_type": "unknown",
+            }
+
+        yaw_mean = sum(yaws) / len(yaws)
+        yaw_max = max(yaws)
+        detect_rate = len(yaws) / len(indices)
+        return {
+            "yaw_mean": round(yaw_mean, 1),
+            "yaw_max": round(yaw_max, 1),
+            "detect_rate": round(detect_rate, 2),
+            "face_type": "frontal" if yaw_mean < 15.0 else "side",
+        }
+    except Exception as exc:
+        return {"error": str(exc), "yaw_mean": None, "yaw_max": None, "detect_rate": 0.0}
+
+
+def _format_preview_info(video_path: str, analysis: Dict[str, Dict[str, Any]]) -> str:
+    """Render yaw/face info for the selected training video."""
+    if not video_path:
+        return ""
+    info = analysis.get(video_path, {})
+    if "error" in info:
+        return f"⚠️ 分析失败: {info['error']}"
+    yaw_mean = info.get("yaw_mean")
+    yaw_max = info.get("yaw_max")
+    detect_rate = info.get("detect_rate")
+    face_type = info.get("face_type", "unknown")
+    if yaw_mean is None:
+        return "⚠️ 未检测到人脸"
+    face_type_text = "正脸" if face_type == "frontal" else "侧脸"
+    return (
+        f"类型: {face_type_text}\n"
+        f"平均 yaw: {yaw_mean}°\n"
+        f"最大 yaw: {yaw_max}°\n"
+        f"人脸检测率: {detect_rate * 100:.0f}%"
+    )
+
+
 def _safe_video_update(value):
     """Coerce arbitrary value to a gr.update that's safe for gr.Video in
     Gradio 5.x.
@@ -3481,6 +3564,7 @@ pipe(
                 """
 浏览并播放训练集中的原始视频样本。
 支持从 `train_fileslist` 读取（优先），或扫描 `train_data_dir` 下的 `.mp4` 文件。
+加载后会分析人脸 yaw，可按正脸 / 侧脸筛选。
                 """
             )
             with gr.Row():
@@ -3494,7 +3578,29 @@ pipe(
                     value="",
                     scale=2,
                 )
-                preview_load_btn = gr.Button("🔄 加载视频列表", variant="primary", scale=1)
+                preview_load_btn = gr.Button("🔄 加载并分析", variant="primary", scale=1)
+
+            with gr.Row():
+                preview_filter = gr.Dropdown(
+                    label="筛选",
+                    choices=["全部", "正脸", "侧脸"],
+                    value="全部",
+                    scale=1,
+                )
+                preview_threshold = gr.Slider(
+                    label="yaw 阈值 (°)，≥ 为侧脸",
+                    minimum=0,
+                    maximum=45,
+                    value=15,
+                    step=1,
+                    scale=2,
+                )
+                preview_count = gr.Textbox(
+                    label="统计",
+                    value="",
+                    interactive=False,
+                    scale=2,
+                )
 
             with gr.Row():
                 preview_video_dd = gr.Dropdown(
@@ -3503,32 +3609,88 @@ pipe(
                     value=None,
                     scale=3,
                 )
-                preview_count = gr.Textbox(
-                    label="统计",
+                preview_yaw_info = gr.Textbox(
+                    label="人脸 / yaw 信息",
                     value="",
+                    lines=4,
                     interactive=False,
                     scale=1,
                 )
 
             preview_video_player = gr.Video(label="预览", interactive=False)
+            preview_analysis_state = gr.State({})
 
-            def _load_preview_videos(data_dir: str, fileslist: str):
+            def _load_preview_videos(data_dir: str, fileslist: str, threshold: float):
                 videos, status = _list_training_videos(data_dir, fileslist)
+                analysis: Dict[str, Any] = {}
+                frontal = 0
+                side = 0
+                unknown = 0
+                for v in videos:
+                    info = _analyze_training_video_yaw(v, n_frames=5)
+                    analysis[v] = info
+                    ft = info.get("face_type", "unknown")
+                    if ft == "frontal":
+                        frontal += 1
+                    elif ft == "side":
+                        side += 1
+                    else:
+                        unknown += 1
+                status += f" | 正脸 {frontal} | 侧脸 {side}"
+                if unknown:
+                    status += f" | 未检测 {unknown}"
                 return (
                     gr.update(choices=videos, value=videos[0] if videos else None),
                     status,
                     gr.update(value=None),
+                    analysis,
+                    _format_preview_info(videos[0] if videos else "", analysis),
                 )
+
+            def _apply_preview_filter(filter_type: str, threshold: float, analysis: Dict[str, Any]):
+                if not analysis:
+                    return gr.update(choices=[], value=None), ""
+                filtered: List[str] = []
+                for path, info in analysis.items():
+                    if filter_type == "全部":
+                        filtered.append(path)
+                    else:
+                        yaw_mean = info.get("yaw_mean")
+                        is_side = yaw_mean is not None and yaw_mean >= threshold
+                        if filter_type == "侧脸" and is_side:
+                            filtered.append(path)
+                        elif filter_type == "正脸" and not is_side and yaw_mean is not None:
+                            filtered.append(path)
+                return (
+                    gr.update(choices=filtered, value=filtered[0] if filtered else None),
+                    f"筛选后: {len(filtered)} 个视频",
+                )
+
+            def _on_preview_video_change(video_path: str, analysis: Dict[str, Any]):
+                return _format_preview_info(video_path, analysis)
 
             preview_load_btn.click(
                 fn=_load_preview_videos,
-                inputs=[preview_data_dir, preview_fileslist],
-                outputs=[preview_video_dd, preview_count, preview_video_player],
+                inputs=[preview_data_dir, preview_fileslist, preview_threshold],
+                outputs=[
+                    preview_video_dd, preview_count, preview_video_player,
+                    preview_analysis_state, preview_yaw_info,
+                ],
+            )
+            preview_filter.change(
+                fn=_apply_preview_filter,
+                inputs=[preview_filter, preview_threshold, preview_analysis_state],
+                outputs=[preview_video_dd, preview_count],
             )
             preview_video_dd.change(
                 fn=_safe_video_update,
                 inputs=preview_video_dd,
                 outputs=preview_video_player,
+            )
+            preview_video_dd.change(
+                fn=_on_preview_video_change,
+                inputs=[preview_video_dd, preview_analysis_state],
+                outputs=preview_yaw_info,
             )
 
             # On page (re)load: repopulate trainer status + run dropdown
