@@ -228,6 +228,7 @@ def _score_one(
     detector,
     sample_frames: int = SAMPLE_FRAMES,
     min_frames: int = MIN_FRAMES,
+    det_threshold: float = 0.3,
 ) -> VideoScore:
     """Run face detection + motion scoring on a single video.
 
@@ -256,7 +257,7 @@ def _score_one(
         if not ok or frame is None:
             continue
         try:
-            bbox, _ = detector(frame)
+            bbox, _ = detector(frame, threshold=det_threshold)
         except Exception:
             bbox = None
         if bbox is None:
@@ -271,13 +272,24 @@ def _score_one(
 
     cap.release()
 
-    if not yaws or not face_centers:
+    if not face_centers:
         return VideoScore(
             path=str(video_path),
             frame_count=total,
             face_detected_ratio=face_detected / max(1, sample_frames),
             rejected_reason="no_face",
         )
+
+    # If the detector returned faces but no yaw (e.g. pose model not loaded),
+    # treat the clip as frontal rather than rejecting it outright.  Curated
+    # datasets with mixed poses still benefit from the motion score.
+    if not yaws:
+        logger.warning(
+            "Faces detected in %s but yaw unavailable (pose model missing?); "
+            "treating as frontal. Consider running `python tools/download_checkpoints.py`.",
+            video_path,
+        )
+        yaws = [0.0]
 
     yaw_arr = np.array(yaws)
     centers = np.array(face_centers)
@@ -479,7 +491,10 @@ def main():
     # ---- load face detector ----
     try:
         from latentsync.utils.face_detector import FaceDetector
-        detector = FaceDetector(device=args.device)
+        # Curation needs faces across the full yaw range so we can bucket
+        # side_face clips.  The default FaceDetector skips faces with |yaw|>15,
+        # which would starve the side_face bucket and even reject mild poses.
+        detector = FaceDetector(device=args.device, skip_side_face_threshold=None)
     except Exception as exc:
         logger.error("Could not load FaceDetector: %s", exc)
         logger.error("Install insightface + run `python tools/download_checkpoints.py` first.")
@@ -507,7 +522,12 @@ def main():
             n_cache_hits += 1
             continue
         try:
-            s = _score_one(p, detector, sample_frames=args.sample_frames, min_frames=args.min_frames)
+            s = _score_one(
+                p, detector,
+                sample_frames=args.sample_frames,
+                min_frames=args.min_frames,
+                det_threshold=0.3,
+            )
         except Exception as exc:
             logger.warning("Failed to score %s: %s", p, exc)
             s = VideoScore(path=str(p), rejected_reason="score_error")
