@@ -22,6 +22,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 import shlex
 import shutil
 import signal
