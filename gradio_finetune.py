@@ -1329,6 +1329,11 @@ def list_validation_videos(run_dir_path: Optional[str]) -> List[str]:
 
 
 def list_checkpoints_in_run(run_dir_path: Optional[str]) -> List[str]:
+    """List checkpoints in a run dir.
+
+    Supports both full-UNet .pt checkpoints and LoRA adapter directories
+    (peft format, contain adapter_config.json).
+    """
     if not run_dir_path:
         return []
     rd = Path(run_dir_path)
@@ -1339,22 +1344,66 @@ def list_checkpoints_in_run(run_dir_path: Optional[str]) -> List[str]:
     ck = rd / "checkpoints"
     if not ck.exists():
         return []
+
+    candidates: List[Path] = []
+    # Full UNet checkpoints
+    candidates.extend(ck.glob("*.pt"))
+    # LoRA adapter directories
+    for p in ck.iterdir():
+        if p.is_dir() and (p / "adapter_config.json").exists():
+            candidates.append(p)
+
+    candidates.sort(key=lambda p: p.stat().st_mtime)
     try:
-        return [str(p.relative_to(REPO_ROOT)) for p in sorted(ck.glob("*.pt"))]
+        return [str(p.relative_to(REPO_ROOT)) for p in candidates]
     except ValueError:
-        return [str(p) for p in sorted(ck.glob("*.pt"))]
+        return [str(p) for p in candidates]
 
 
 def read_loss_from_checkpoint(ckpt_path: str) -> str:
     """Best-effort: dump global_step + a couple of scalar fields from the
     latest checkpoint so the user gets a textual progress signal without
-    loading the full state."""
-    if not ckpt_path or not Path(ckpt_path).exists():
+    loading the full state.
+
+    Supports both full-UNet .pt files and LoRA adapter directories.
+    """
+    if not ckpt_path:
+        return "(checkpoint path empty)"
+    p = Path(ckpt_path)
+    if not p.exists():
         return "(checkpoint not found)"
+
+    # LoRA adapter directory (peft format)
+    if p.is_dir():
+        adapter_cfg = p / "adapter_config.json"
+        if adapter_cfg.exists():
+            try:
+                import json
+                cfg = json.loads(adapter_cfg.read_text())
+                # global_step is encoded in the directory name: checkpoint-XXXX
+                step_str = p.name.split("-")[-1]
+                try:
+                    global_step = int(step_str)
+                except ValueError:
+                    global_step = "?"
+                info = {
+                    "type": "LoRA adapter",
+                    "global_step": global_step,
+                    "lora_rank": cfg.get("r", "?"),
+                    "lora_alpha": cfg.get("lora_alpha", "?"),
+                    "target_modules": cfg.get("target_modules", []),
+                    "adapter_path": str(p),
+                }
+                return json.dumps(info, indent=2)
+            except Exception as e:
+                return f"(could not read adapter config: {e})"
+        return "(directory is not a LoRA adapter)"
+
     try:
         import torch
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         info = {
+            "type": "full UNet checkpoint",
             "global_step": ckpt.get("global_step", "?"),
             "state_dict_keys": len(ckpt.get("state_dict", {})),
             "train_step_list_len": len(ckpt.get("train_step_list", []))
@@ -1389,12 +1438,21 @@ def _compute_progress(run_dir: Optional[Path]) -> Dict[str, Any]:
         latest_ckpt = Path(ckpts[-1]) if ckpts else None
         if latest_ckpt and not latest_ckpt.is_absolute():
             latest_ckpt = REPO_ROOT / latest_ckpt
-        import torch as _torch
-        ckpt = _torch.load(str(latest_ckpt), map_location="cpu", weights_only=False)
-        step = int(ckpt.get("global_step", 0) or 0)
+        if latest_ckpt is None:
+            raise ValueError("no checkpoint")
+
+        step = 0
         latest_loss = None
-        if ckpt.get("train_loss_list"):
-            latest_loss = float(ckpt["train_loss_list"][-1])
+        # LoRA adapter directory: step is encoded in the directory name.
+        if latest_ckpt.is_dir() and (latest_ckpt / "adapter_config.json").exists():
+            step_str = latest_ckpt.name.split("-")[-1]
+            step = int(step_str) if step_str.isdigit() else 0
+        else:
+            import torch as _torch
+            ckpt = _torch.load(str(latest_ckpt), map_location="cpu", weights_only=False)
+            step = int(ckpt.get("global_step", 0) or 0)
+            if ckpt.get("train_loss_list"):
+                latest_loss = float(ckpt["train_loss_list"][-1])
     except Exception:
         return {"step": None, "max_step": None, "elapsed_s": 0,
                 "throughput": 0.0, "eta_s": None, "progress_pct": 0.0,
