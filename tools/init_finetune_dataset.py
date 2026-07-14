@@ -108,8 +108,8 @@ def _download_hf_subset(
 ) -> List[Path]:
     """Download up to max_files matching allow_patterns from an HF dataset repo.
 
-    Idempotent: re-running skips files already present in target_dir.
-    Returns the absolute paths of the downloaded files.
+    Idempotent: re-running skips files already present and non-empty in
+    target_dir. Returns the absolute paths of the downloaded files.
 
     For gated datasets (VoxCeleb2 mirror, CelebV-HQ gated splits, etc.),
     pass `hf_token` (or set the HF_TOKEN / HUGGINGFACE_TOKEN env var).
@@ -143,106 +143,150 @@ def _download_hf_subset(
             "Check the repo id and patterns."
         )
 
-    to_download = [f for f in matched[:max_files * 2]
-                   if not (target_dir / Path(f).name).exists()]
-    to_download = to_download[:max_files]
+    expected_files = matched[:max_files]
+    archive_suffixes = {".tar", ".tar.gz", ".tgz", ".tbz2", ".zip"}
 
-    if not to_download:
-        logger.info("all %d expected files already in %s", max_files, target_dir)
-        return sorted([target_dir / Path(f).name for f in matched[:max_files]])
+    def _is_archive(path: str) -> bool:
+        return any(path.lower().endswith(suffix) for suffix in archive_suffixes)
 
-    logger.info("downloading %d files from %s ...", len(to_download), hf_repo)
-    # Retry snapshot_download with exponential backoff. 并发下载容易触发
-    # Xet CAS 401/RuntimeError，所以 max_workers=1；若仍失败则逐文件 fallback。
-    last_exc = None
-    for attempt in range(3):
-        try:
-            snapshot_download(
-                repo_id=hf_repo,
-                repo_type=repo_type,
-                local_dir=str(target_dir),
-                allow_patterns=to_download,
-                max_workers=1,
-                token=hf_token,
-            )
-            last_exc = None
-            break
-        except Exception as exc:
-            last_exc = exc
-            backoff = 5 * (2 ** attempt)
-            logger.warning(
-                "snapshot_download attempt %d/3 failed (%s); retrying in %ds ...",
-                attempt + 1, type(exc).__name__, backoff,
-            )
-            import time as _time
-            _time.sleep(backoff)
+    def _local_path(repo_path: str) -> Path:
+        # snapshot_download / hf_hub_download preserve the repo directory
+        # structure under local_dir.
+        return target_dir / repo_path
 
-    # Fallback: 如果 snapshot_download 整体失败，逐文件 hf_hub_download。
-    # 配合 HF_HUB_DISABLE_XET=1 后，这通常能绕过 Xet CAS 的并发/鉴权问题。
-    if last_exc is not None:
-        logger.warning(
-            "snapshot_download failed for %s; falling back to per-file download ...",
-            hf_repo,
-        )
-        from huggingface_hub import hf_hub_download
-        failed_files: List[str] = []
-        for fname in to_download:
-            f_last_exc = None
-            for attempt in range(3):
-                try:
-                    hf_hub_download(
-                        repo_id=hf_repo,
-                        repo_type=repo_type,
-                        filename=fname,
-                        local_dir=str(target_dir),
-                        token=hf_token,
-                    )
-                    f_last_exc = None
-                    break
-                except Exception as exc:
-                    f_last_exc = exc
-                    backoff = 5 * (2 ** attempt)
-                    logger.warning(
-                        "hf_hub_download %s attempt %d/3 failed (%s); retrying in %ds ...",
-                        fname, attempt + 1, type(exc).__name__, backoff,
-                    )
-                    import time as _time
-                    _time.sleep(backoff)
-            if f_last_exc is not None:
-                failed_files.append(fname)
-                logger.error("hf_hub_download failed for %s: %s", fname, f_last_exc)
-        if failed_files:
-            raise SystemExit(
-                f"❌ download failed for {hf_repo} after per-file fallback. "
-                f"Failed files ({len(failed_files)}/{len(to_download)}): {failed_files[:10]}{'...' if len(failed_files) > 10 else ''}\n"
-                f"Original snapshot_download error: {last_exc}\n"
-                "   If this repo is gated or Xet keeps failing, pass --hf-token or set HF_TOKEN."
-            )
-        last_exc = None
+    def _file_ready(path: Path) -> bool:
+        return path.exists() and path.stat().st_size > 0
 
-    # Some HF dataset repos (e.g. SwayStar123/CelebV-HQ) ship a single
-    # .tar / .zip that bundles the actual mp4s. If matched files are all
-    # archives, extract them into target_dir before returning.
-    downloaded: List[Path] = []
-    archives: List[Path] = []
-    for f in matched[:max_files]:
-        local = target_dir / Path(f).name
-        if not local.exists() or local.stat().st_size == 0:
-            continue
-        if local.suffix.lower() in {".tar", ".tar.gz", ".tgz", ".tbz2", ".zip"}:
-            archives.append(local)
+    # Decide what actually needs downloading.
+    missing: List[str] = []
+    archives_to_extract: List[Path] = []
+    ready_files: List[Path] = []
+
+    for repo_path in expected_files:
+        local = _local_path(repo_path)
+        if _is_archive(repo_path):
+            # Already extracted mp4s present? Then skip both download & extract.
+            if _file_ready(local) and any(
+                p.suffix.lower() == ".mp4" and p.stat().st_size > 0
+                for p in target_dir.rglob("*")
+                if p != local
+            ):
+                logger.info("archive %s already extracted, skipping", repo_path)
+                continue
+            if not _file_ready(local):
+                missing.append(repo_path)
+            else:
+                archives_to_extract.append(local)
         else:
-            downloaded.append(local)
+            if _file_ready(local):
+                logger.info("file already exists, skipping: %s", repo_path)
+                ready_files.append(local)
+            else:
+                missing.append(repo_path)
 
-    if not downloaded and archives:
-        logger.info("repo shipped archives; extracting %s ...", [a.name for a in archives])
-        for arc in archives:
+    if missing:
+        logger.info("downloading %d files from %s ...", len(missing), hf_repo)
+        # Retry snapshot_download with exponential backoff. 并发下载容易触发
+        # Xet CAS 401/RuntimeError，所以 max_workers=1；若仍失败则逐文件 fallback。
+        last_exc = None
+        for attempt in range(3):
+            try:
+                snapshot_download(
+                    repo_id=hf_repo,
+                    repo_type=repo_type,
+                    local_dir=str(target_dir),
+                    allow_patterns=missing,
+                    max_workers=1,
+                    token=hf_token,
+                )
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                backoff = 5 * (2 ** attempt)
+                logger.warning(
+                    "snapshot_download attempt %d/3 failed (%s); retrying in %ds ...",
+                    attempt + 1, type(exc).__name__, backoff,
+                )
+                import time as _time
+                _time.sleep(backoff)
+
+        # Fallback: 如果 snapshot_download 整体失败，逐文件 hf_hub_download。
+        # 配合 HF_HUB_DISABLE_XET=1 后，这通常能绕过 Xet CAS 的并发/鉴权问题。
+        if last_exc is not None:
+            logger.warning(
+                "snapshot_download failed for %s; falling back to per-file download ...",
+                hf_repo,
+            )
+            from huggingface_hub import hf_hub_download
+            failed_files: List[str] = []
+            for fname in missing:
+                f_last_exc = None
+                for attempt in range(3):
+                    try:
+                        hf_hub_download(
+                            repo_id=hf_repo,
+                            repo_type=repo_type,
+                            filename=fname,
+                            local_dir=str(target_dir),
+                            token=hf_token,
+                        )
+                        f_last_exc = None
+                        break
+                    except Exception as exc:
+                        f_last_exc = exc
+                        backoff = 5 * (2 ** attempt)
+                        logger.warning(
+                            "hf_hub_download %s attempt %d/3 failed (%s); retrying in %ds ...",
+                            fname, attempt + 1, type(exc).__name__, backoff,
+                        )
+                        import time as _time
+                        _time.sleep(backoff)
+                if f_last_exc is not None:
+                    failed_files.append(fname)
+                    logger.error("hf_hub_download failed for %s: %s", fname, f_last_exc)
+            if failed_files:
+                raise SystemExit(
+                    f"❌ download failed for {hf_repo} after per-file fallback. "
+                    f"Failed files ({len(failed_files)}/{len(missing)}): {failed_files[:10]}{'...' if len(failed_files) > 10 else ''}\n"
+                    f"Original snapshot_download error: {last_exc}\n"
+                    "   If this repo is gated or Xet keeps failing, pass --hf-token or set HF_TOKEN."
+                )
+
+        # Re-evaluate which archives need extraction after download.
+        for repo_path in expected_files:
+            if not _is_archive(repo_path):
+                continue
+            local = _local_path(repo_path)
+            if _file_ready(local) and not any(
+                p.suffix.lower() == ".mp4" and p.stat().st_size > 0
+                for p in target_dir.rglob("*")
+                if p != local
+            ):
+                archives_to_extract.append(local)
+
+    # Extract archives (idempotent: only if no extracted mp4s were found).
+    if archives_to_extract:
+        logger.info("extracting archives: %s", [a.name for a in archives_to_extract])
+        for arc in archives_to_extract:
             _extract_archive(arc, target_dir)
-        # Re-scan: extracted mp4s now live directly in target_dir.
-        for p in target_dir.iterdir():
-            if p.suffix.lower() == ".mp4" and p.stat().st_size > 0:
-                downloaded.append(p)
 
+    # Collect final file list.
+    downloaded: List[Path] = []
+    for repo_path in expected_files:
+        local = _local_path(repo_path)
+        if _is_archive(repo_path):
+            # Return the extracted mp4s instead of the archive itself.
+            for p in target_dir.rglob("*.mp4"):
+                if p.stat().st_size > 0:
+                    downloaded.append(p)
+        else:
+            if _file_ready(local):
+                downloaded.append(local)
+
+    # De-duplicate and sort for stable output.
+    downloaded = sorted(set(p.resolve() for p in downloaded))
+    logger.info("ready: %d files under %s", len(downloaded), target_dir)
     return downloaded
 
 
