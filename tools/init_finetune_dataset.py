@@ -58,6 +58,11 @@ from typing import Dict, List, Optional
 
 import yaml
 
+# HuggingFace Hub 从 0.26 开始默认走 Xet 存储后端。Xet 对匿名/部分网络
+# 环境会偶发 401 (cas-server.xethub.hf.co)，且并发下载容易触发 CAS 错误。
+# 强制回退到普通 HTTP/LFS 可显著提升预置数据集下载成功率。
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -147,9 +152,8 @@ def _download_hf_subset(
         return sorted([target_dir / Path(f).name for f in matched[:max_files]])
 
     logger.info("downloading %d files from %s ...", len(to_download), hf_repo)
-    # Retry snapshot_download with exponential backoff — HF Hub is
-    # intermittently 503 / connection-reset and a single retry is
-    # often enough to ride through a transient blip.
+    # Retry snapshot_download with exponential backoff. 并发下载容易触发
+    # Xet CAS 401/RuntimeError，所以 max_workers=1；若仍失败则逐文件 fallback。
     last_exc = None
     for attempt in range(3):
         try:
@@ -158,7 +162,7 @@ def _download_hf_subset(
                 repo_type=repo_type,
                 local_dir=str(target_dir),
                 allow_patterns=to_download,
-                max_workers=4,
+                max_workers=1,
                 token=hf_token,
             )
             last_exc = None
@@ -172,10 +176,49 @@ def _download_hf_subset(
             )
             import time as _time
             _time.sleep(backoff)
+
+    # Fallback: 如果 snapshot_download 整体失败，逐文件 hf_hub_download。
+    # 配合 HF_HUB_DISABLE_XET=1 后，这通常能绕过 Xet CAS 的并发/鉴权问题。
     if last_exc is not None:
-        raise SystemExit(
-            f"❌ snapshot_download failed for {hf_repo} after 3 attempts: {last_exc}"
+        logger.warning(
+            "snapshot_download failed for %s; falling back to per-file download ...",
+            hf_repo,
         )
+        from huggingface_hub import hf_hub_download
+        failed_files: List[str] = []
+        for fname in to_download:
+            f_last_exc = None
+            for attempt in range(3):
+                try:
+                    hf_hub_download(
+                        repo_id=hf_repo,
+                        repo_type=repo_type,
+                        filename=fname,
+                        local_dir=str(target_dir),
+                        token=hf_token,
+                    )
+                    f_last_exc = None
+                    break
+                except Exception as exc:
+                    f_last_exc = exc
+                    backoff = 5 * (2 ** attempt)
+                    logger.warning(
+                        "hf_hub_download %s attempt %d/3 failed (%s); retrying in %ds ...",
+                        fname, attempt + 1, type(exc).__name__, backoff,
+                    )
+                    import time as _time
+                    _time.sleep(backoff)
+            if f_last_exc is not None:
+                failed_files.append(fname)
+                logger.error("hf_hub_download failed for %s: %s", fname, f_last_exc)
+        if failed_files:
+            raise SystemExit(
+                f"❌ download failed for {hf_repo} after per-file fallback. "
+                f"Failed files ({len(failed_files)}/{len(to_download)}): {failed_files[:10]}{'...' if len(failed_files) > 10 else ''}\n"
+                f"Original snapshot_download error: {last_exc}\n"
+                "   If this repo is gated or Xet keeps failing, pass --hf-token or set HF_TOKEN."
+            )
+        last_exc = None
 
     # Some HF dataset repos (e.g. SwayStar123/CelebV-HQ) ship a single
     # .tar / .zip that bundles the actual mp4s. If matched files are all
