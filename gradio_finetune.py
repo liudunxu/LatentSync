@@ -613,60 +613,63 @@ class TrainingProcess:
 _TRAINER = TrainingProcess()
 
 
-def _on_page_load():
+def _on_page_load(train_output_dir: str = "unet"):
     """Repopulate training-status UI on page (re)load.
 
     The Python process keeps the trainer subprocess alive across browser
     refreshes, but the browser-side gr.State values (log_path, run_dd,
     …) reset to empty. This handler re-pulls from the in-process
-    _TRAINER singleton.
-
-    Wrapped in try/except so any failure here (slow filesystem, weird
-    run_dir contents, etc.) NEVER blocks the page-load — the UI just
-    falls back to idle.
+    _TRAINER singleton and also refreshes the monitor tab so charts /
+    logs / videos appear immediately instead of waiting for the first
+    timer tick.
     """
+    blank_monitor = (
+        "",          # hidden run_dir
+        None,        # loss_chart
+        None,        # sync_conf_chart
+        gr.update(), # val_video_dd
+        gr.update(), # ckpt_dd
+        "",          # log_box
+        "",          # ckpt_info
+        "⚠️ 初始化失败",  # trainer_status
+        0.0,         # progress_pct
+        "",          # progress_text
+    )
     try:
         log_path = str(_TRAINER.log_path) if _TRAINER.log_path else ""
         if _TRAINER.is_running():
-            pid = _TRAINER.proc.pid
-            rc_hint = _TRAINER.proc.poll()
-            rc_text = f" (rc={rc_hint})" if rc_hint is not None else ""
-            trainer_text = (
-                f"⏳ 训练进行中 (pid={pid}{rc_text})\n"
-                f"📂 run_dir: {_TRAINER.run_dir or '(unknown)'}\n"
-                "💡 点击 Tab 2 的 '🔄 刷新 run 列表' + '🔄 手动刷新' 来查看进度"
-            )
             launch_text = f"⏳ training running since {_TRAINER.started_at or '?'}"
-            try:
-                runs = _list_run_dirs_for_monitor("unet")
-            except Exception as exc:
-                logger.warning("list_run_dirs failed on page load: %s", exc)
-                runs = []
-            # Make sure dropdown value is in choices (gradio raises
-            # "X is not in the list of choices" otherwise).
             run_name = _TRAINER.run_dir.name if _TRAINER.run_dir else None
-            value = run_name if run_name in runs else None
-            return (
-                trainer_text,
-                launch_text,
-                log_path,
-                gr.update(choices=runs, value=value),
-                gr.update(interactive=True),
+        else:
+            launch_text = ""
+            run_name = None
+
+        core = _monitor_refresh_core(train_output_dir, run_name, log_path)
+        run_dd_update = core[0]
+        # If a training run is alive, prefer selecting it over the latest run.
+        if (
+            run_name
+            and run_dd_update.choices
+            and run_name in run_dd_update.choices
+        ):
+            run_dd_update = gr.update(choices=run_dd_update.choices, value=run_name)
+        elif (
+            run_name
+            and _TRAINER.run_dir
+            and run_dd_update.choices
+            and str(_TRAINER.run_dir) in run_dd_update.choices
+        ):
+            run_dd_update = gr.update(
+                choices=run_dd_update.choices, value=str(_TRAINER.run_dir)
             )
-        trainer_text = "🟢 idle — 点 '🚀 启动训练' 开始"
-        launch_text = ""
-        try:
-            runs = _list_run_dirs_for_monitor("unet")
-        except Exception as exc:
-            logger.warning("list_run_dirs failed on page load: %s", exc)
-            runs = []
+
         return (
-            trainer_text,
+            core[8],          # trainer_status
             launch_text,
             log_path,
-            gr.update(choices=runs, value=None),
+            run_dd_update,
             gr.update(interactive=True),
-        )
+        ) + core[1:8] + core[9:]
     except Exception as exc:
         logger.exception("page-load handler failed entirely: %s", exc)
         return (
@@ -675,9 +678,7 @@ def _on_page_load():
             "",
             gr.update(choices=[], value=None),
             gr.update(interactive=True),
-        )
-
-
+        ) + blank_monitor
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1812,15 +1813,17 @@ def _run_merge_lora(
         return f"❌ 启动失败:{exc}"
 
 
-def monitor_refresh(
+def _monitor_refresh_core(
     train_output_dir: str,
     selected_run: Optional[str],
     log_path: Optional[str],
 ) -> Tuple[Any, str, Any, Any, Any, str, str, str, str, float, str]:
-    """Pull the latest snapshot. Returns: (run_dir_choices, selected_run_disp,
-    loss_chart, sync_conf_chart, val_video_choices, checkpoint_choices, log_tail,
-    ckpt_info, trainer_status, progress_pct, progress_text)."""
-    base = _resolve_output_dir(train_output_dir)
+    """Shared implementation for monitor_refresh and page-load refresh.
+
+    Returns: (run_dir_choices, selected_run_disp, loss_chart, sync_conf_chart,
+    val_video_choices, checkpoint_choices, log_tail, ckpt_info, trainer_status,
+    progress_pct, progress_text).
+    """
     run_choices = _list_run_dirs_for_monitor(train_output_dir)
     # Auto-select the latest run if none is selected so the page isn't blank
     # on first load.
@@ -1835,7 +1838,14 @@ def monitor_refresh(
     val_video_update = gr.update(choices=val_videos, value=val_videos[0] if val_videos else None)
     ckpts = list_checkpoints_in_run(run_path)
     ckpt_update = gr.update(choices=ckpts, value=ckpts[-1] if ckpts else None)
-    log_text = tail_log(log_path, n_lines=80)
+
+    # Fall back to the in-process trainer log if the browser-side state is empty
+    # (common right after a page refresh).
+    effective_log_path = log_path
+    if not effective_log_path and _TRAINER.is_running() and _TRAINER.log_path:
+        effective_log_path = str(_TRAINER.log_path)
+    log_text = tail_log(effective_log_path, n_lines=80)
+
     if ckpts:
         ckpt_path = Path(ckpts[-1])
         if not ckpt_path.is_absolute():
@@ -1883,6 +1893,15 @@ def monitor_refresh(
         progress_pct,
         progress_text,
     )
+
+
+def monitor_refresh(
+    train_output_dir: str,
+    selected_run: Optional[str],
+    log_path: Optional[str],
+) -> Tuple[Any, str, Any, Any, Any, str, str, str, str, float, str]:
+    """Pull the latest snapshot."""
+    return _monitor_refresh_core(train_output_dir, selected_run, log_path)
 
 
 # ---------------------------------------------------------------------------
@@ -2889,6 +2908,7 @@ def build_ui() -> gr.Blocks:
             )
 
             monitor_btn = gr.Button("🔄 手动刷新", variant="primary")
+            run_dir_hidden = gr.Textbox(visible=False)
             with gr.Row():
                 progress_bar = gr.Slider(
                     0, 100, value=0, step=0.1, interactive=False,
@@ -2903,7 +2923,7 @@ def build_ui() -> gr.Blocks:
                 fn=monitor_refresh,
                 inputs=[monitor_output_dir, run_dd, log_path_state],
                 outputs=[
-                    run_dd, gr.Textbox(visible=False), loss_chart_img, sync_conf_img,
+                    run_dd, run_dir_hidden, loss_chart_img, sync_conf_img,
                     val_video_dd, ckpt_dd, log_box, ckpt_info_box, trainer_status,
                     progress_bar, progress_text,
                 ],
@@ -2914,7 +2934,7 @@ def build_ui() -> gr.Blocks:
                 fn=monitor_refresh,
                 inputs=[monitor_output_dir, run_dd, log_path_state],
                 outputs=[
-                    run_dd, gr.Textbox(visible=False), loss_chart_img, sync_conf_img,
+                    run_dd, run_dir_hidden, loss_chart_img, sync_conf_img,
                     val_video_dd, ckpt_dd, log_box, ckpt_info_box, trainer_status,
                     progress_bar, progress_text,
                 ],
@@ -3338,8 +3358,12 @@ pipe(
             # alive even if the user's tab disconnects, so we re-detect here.
             demo.load(
                 fn=_on_page_load,
+                inputs=[monitor_output_dir],
                 outputs=[
                     trainer_status, launch_status, log_path_state, run_dd, monitor_btn,
+                    run_dir_hidden, loss_chart_img, sync_conf_img,
+                    val_video_dd, ckpt_dd, log_box, ckpt_info_box,
+                    progress_bar, progress_text,
                 ],
             )
 
