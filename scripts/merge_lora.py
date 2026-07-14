@@ -180,7 +180,9 @@ def main():
 
     print(f"[merge_lora] Loading base UNet from {args.base_ckpt} ...")
     cfg = OmegaConf.load(args.unet_config_path)
-    base = UNet3DConditionModel.from_pretrained(OmegaConf.to_container(cfg.model), args.base_ckpt, device="cpu")
+    base, _ = UNet3DConditionModel.from_pretrained(
+        OmegaConf.to_container(cfg.model), args.base_ckpt, device="cpu"
+    )
 
     print(f"[merge_lora] Loading LoRA adapter from {args.adapter_dir} ...")
     try:
