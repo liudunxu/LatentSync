@@ -85,3 +85,29 @@ datasets:
       (LoRA 几十个 epoch 验证流程),后续再加数据。若 HF Xet 后端 401,
       init_finetune_dataset.py 会自动禁用 Xet 并回退到普通 HTTP 下载。
     typical_use: "Stage 2 LoRA smoke test / 流程验证"
+
+  - id: celebv_hq_head_talk_side
+    name: CelebV-HQ Head-Talk (1k, 侧脸/转头专项)
+    hf_repo: saeed-5959/celebv_hq_head_talking
+    hf_repo_type: dataset
+    hf_allow: ["head_talk/*.mp4", "head_talk_2/*.mp4"]
+    n_clips: 1000
+    target_ratio: {frontal: 0.25, side_face: 0.60, fast_motion: 0.15}
+    description: |
+      CelebV-HQ 中专注于头部说话的 512×512 片段。head_talk / head_talk_2
+      子集包含丰富的 yaw 变化与转头动作,侧脸桶提到 60%,专门用来改善
+      侧脸唇形同步 badcase。约 1GB,比原 CelebV-HQ 39GB tar 包轻量很多。
+    typical_use: "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)"
+
+  - id: lipsync_full_159
+    name: LipSync Full (159 mp4+txt, 通用扩展)
+    hf_repo: yashlanjewar20/lipsync
+    hf_repo_type: dataset
+    hf_allow: ["*.mp4"]
+    n_clips: 159
+    target_ratio: {frontal: 0.45, side_face: 0.35, fast_motion: 0.20}
+    description: |
+      yashlanjewar20/lipsync_clean 的完整版 159 个片段 + 配对 txt。
+      在 clean 78 条基础上翻倍,身份/场景更多,适合作为通用 finetune seed
+      或和侧脸专项数据混合训练。
+    typical_use: "Stage 2 LoRA baseline / 🎯 Badcase Fix"
