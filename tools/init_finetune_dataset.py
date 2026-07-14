@@ -159,13 +159,49 @@ def _download_hf_subset(
     except Exception as exc:
         raise SystemExit(f"❌ snapshot_download failed for {hf_repo}: {exc}")
 
-    # Find downloaded files
+    # Some HF dataset repos (e.g. SwayStar123/CelebV-HQ) ship a single
+    # .tar / .zip that bundles the actual mp4s. If matched files are all
+    # archives, extract them into target_dir before returning.
     downloaded: List[Path] = []
+    archives: List[Path] = []
     for f in matched[:max_files]:
         local = target_dir / Path(f).name
-        if local.exists() and local.stat().st_size > 0:
+        if not local.exists() or local.stat().st_size == 0:
+            continue
+        if local.suffix.lower() in {".tar", ".tar.gz", ".tgz", ".tbz2", ".zip"}:
+            archives.append(local)
+        else:
             downloaded.append(local)
+
+    if not downloaded and archives:
+        logger.info("repo shipped archives; extracting %s ...", [a.name for a in archives])
+        for arc in archives:
+            _extract_archive(arc, target_dir)
+        # Re-scan: extracted mp4s now live directly in target_dir.
+        for p in target_dir.iterdir():
+            if p.suffix.lower() == ".mp4" and p.stat().st_size > 0:
+                downloaded.append(p)
+
     return downloaded
+
+
+def _extract_archive(archive: Path, dest: Path) -> None:
+    """Extract .tar / .tar.gz / .tgz / .tbz2 / .zip into `dest`."""
+    import tarfile
+    import zipfile
+    dest.mkdir(parents=True, exist_ok=True)
+    name = archive.name.lower()
+    try:
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(archive) as z:
+                z.extractall(dest)
+        elif tarfile.is_tarfile(archive):
+            with tarfile.open(archive) as t:
+                t.extractall(dest)
+        else:
+            logger.warning("unknown archive format, skipping: %s", archive)
+    except Exception as exc:
+        raise SystemExit(f"❌ failed to extract {archive}: {exc}")
 
 
 def _run_curation(

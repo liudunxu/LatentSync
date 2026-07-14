@@ -49,12 +49,12 @@ datasets:
     name: CelebV-HQ (1k, 带 yaw 标注, 侧脸专项)
     hf_repo: SwayStar123/CelebV-HQ
     hf_repo_type: dataset
-    hf_allow: ["*.mp4"]
+    hf_allow: ["videos.tar"]            # single archive, auto-extracted by init_finetune_dataset.py
     n_clips: 1000
     target_ratio: {frontal: 0.30, side_face: 0.55, fast_motion: 0.15}
     description: |
       CelebV-HQ 含 head pose 标注,侧脸/转头场景丰富。side_face 桶提到 55%,
-      适合「侧脸唇形」类 badcase。
+      适合「侧脸唇形」类 badcase。repo 只提供单个 videos.tar,脚本自动解压。
     typical_use: "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)"
 
   - id: talkvid_sample
