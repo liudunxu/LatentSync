@@ -70,6 +70,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
+import math
 import numpy as np
 from tqdm import tqdm
 
@@ -223,6 +224,71 @@ def _save_score_cache(path: Path, cache: Dict[str, dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _estimate_yaw_from_lmk(lmk: np.ndarray) -> float:
+    """Fallback yaw estimator from 106-point InsightFace landmarks.
+
+    Mirrors the conservative multi-signal logic in
+    lipsync_pipeline._estimate_yaw_degrees so curation can bucket side-face
+    clips even when the InsightFace pose model is not loaded.
+    """
+    if lmk is None or len(lmk) < 106:
+        return 0.0
+    try:
+        pt_left_eye = np.mean(lmk[[43, 48, 49, 51, 50]], axis=0)
+        pt_right_eye = np.mean(lmk[101:106], axis=0)
+        pt_nose = np.mean(lmk[[74, 77, 83, 86]], axis=0)
+    except (IndexError, TypeError):
+        return 0.0
+    inter_ocular = float(pt_right_eye[0] - pt_left_eye[0])
+    if abs(inter_ocular) < 1e-3:
+        return 0.0
+    expected = inter_ocular / 2.0
+
+    nose_to_left = float(abs(pt_nose[0] - pt_left_eye[0]))
+    delta = (expected - nose_to_left) / expected
+    nose_yaw = delta * 60.0
+
+    left_eye_x_range = float(np.ptp(lmk[[43, 48, 49, 51, 50], 0]))
+    right_eye_x_range = float(np.ptp(lmk[101:106, 0]))
+    eye_yaw = 0.0
+    if min(left_eye_x_range, right_eye_x_range) > 1e-3:
+        eye_asym = max(left_eye_x_range, right_eye_x_range) / min(left_eye_x_range, right_eye_x_range)
+        if eye_asym > 1.5:
+            eye_yaw = (eye_asym - 1.5) * 30.0
+
+    d_left = float(np.linalg.norm(lmk[48] - pt_nose))
+    d_right = float(np.linalg.norm(lmk[54] - pt_nose))
+    mouth_yaw = 0.0
+    if min(d_left, d_right) > 1e-3:
+        mouth_asym = abs(d_left - d_right) / max(d_left, d_right)
+        if mouth_asym > 0.2:
+            mouth_yaw = (mouth_asym - 0.2) * 100.0
+
+    area_yaw = 0.0
+    aspect_yaw = 0.0
+    try:
+        lmk_x_min = float(lmk[:, 0].min())
+        lmk_x_max = float(lmk[:, 0].max())
+        lmk_y_min = float(lmk[:, 1].min())
+        lmk_y_max = float(lmk[:, 1].max())
+        face_area = (lmk_x_max - lmk_x_min) * (lmk_y_max - lmk_y_min)
+        if face_area > 1e-3:
+            mouth_w = float(np.linalg.norm(lmk[54] - lmk[48]))
+            mouth_h = float(max(np.linalg.norm(lmk[57] - lmk[51]) / 2.0, 2.0))
+            area_norm = (math.pi * (mouth_w / 2.0) * mouth_h) / face_area
+            if area_norm < 0.025:
+                area_yaw = (0.025 - area_norm) * 1200.0
+            if mouth_w > 1e-3 and mouth_h > 1e-3:
+                aspect = mouth_w / mouth_h
+                if aspect < 2.0:
+                    aspect_yaw = (2.0 - aspect) * 60.0
+    except (IndexError, TypeError, ValueError):
+        pass
+
+    sign = 1.0 if nose_yaw >= 0 else -1.0
+    return float(sign * max(abs(nose_yaw), eye_yaw, mouth_yaw, area_yaw, aspect_yaw))
+
+
 def _score_one(
     video_path: Path,
     detector,
@@ -257,9 +323,10 @@ def _score_one(
         if not ok or frame is None:
             continue
         try:
-            bbox, _ = detector(frame, threshold=det_threshold)
+            bbox, lmk = detector(frame, threshold=det_threshold)
         except Exception:
             bbox = None
+            lmk = None
         if bbox is None:
             continue
         face_detected += 1
@@ -267,6 +334,8 @@ def _score_one(
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         face_centers.append((cx, cy))
         yaw = detector.last_pose_yaw
+        if yaw is None and lmk is not None:
+            yaw = _estimate_yaw_from_lmk(lmk)
         if yaw is not None:
             yaws.append(float(yaw))
 
@@ -280,13 +349,11 @@ def _score_one(
             rejected_reason="no_face",
         )
 
-    # If the detector returned faces but no yaw (e.g. pose model not loaded),
-    # treat the clip as frontal rather than rejecting it outright.  Curated
-    # datasets with mixed poses still benefit from the motion score.
+    # If both detector pose and landmark fallback failed to produce yaw,
+    # treat the clip as frontal rather than rejecting it outright.
     if not yaws:
         logger.warning(
-            "Faces detected in %s but yaw unavailable (pose model missing?); "
-            "treating as frontal. Consider running `python tools/download_checkpoints.py`.",
+            "Faces detected in %s but yaw unavailable; treating as frontal.",
             video_path,
         )
         yaws = [0.0]
@@ -497,7 +564,7 @@ def main():
         detector = FaceDetector(
             device=args.device,
             skip_side_face_threshold=None,
-            allowed_modules=["detection", "landmark_2d_106", "pose"],
+            allowed_modules=None,  # load all available modules (pose, genderage, ...)
         )
     except Exception as exc:
         logger.error("Could not load FaceDetector: %s", exc)
