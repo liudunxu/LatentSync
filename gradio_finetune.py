@@ -777,6 +777,17 @@ def build_config_from_form(
 ) -> Dict[str, Any]:
     """Merge user-form values with the chosen preset's defaults."""
     preset = PRESETS[preset_name]
+
+    # Resolve train_output_dir relative to FINETUNE_BASE_DIR so the training
+    # script (which runs with cwd=REPO_ROOT) puts outputs where the UI expects.
+    train_output_dir = (train_output_dir or "").strip()
+    if train_output_dir:
+        p = Path(train_output_dir)
+        if not p.is_absolute():
+            train_output_dir = str(FINETUNE_BASE_DIR / p)
+    else:
+        train_output_dir = str(FINETUNE_BASE_DIR / "unet")
+
     cfg: Dict[str, Any] = {
         "data": {
             "train_data_dir": train_data_dir or "",
@@ -793,7 +804,7 @@ def build_config_from_form(
             "audio_sample_rate": 16000,
             "video_fps": 25,
             "audio_feat_length": [2, 2],
-            "train_output_dir": train_output_dir or str(FINETUNE_BASE_DIR / "unet"),
+            "train_output_dir": train_output_dir,
             # train_unet.py loads this to get the StableSyncNet checkpoint path.
             # It must point to a syncnet config, not the UNet config.
             "syncnet_config_path": str(SYNCNET_CONFIG_DIR / "syncnet_16_pixel_attn.yaml"),
@@ -1816,7 +1827,14 @@ def monitor_refresh(
 
     # Trainer status should reflect the selected run, not just any trainer.
     if not run_dir:
-        status = "ℹ️ 未选择 run"
+        if _TRAINER.is_running():
+            status = (
+                f"🟢 训练进行中 (pid={_TRAINER.proc.pid}, "
+                f"started={_TRAINER.started_at or '-'}, log={_TRAINER.log_path or '-'}) | "
+                f"未选择 run，请点击 '🔄 刷新 run 列表'"
+            )
+        else:
+            status = "ℹ️ 未选择 run"
     elif _TRAINER.is_running() and _TRAINER.run_dir and run_dir.parent == _TRAINER.run_dir:
         status = (
             f"🟢 当前 run 训练中 (pid={_TRAINER.proc.pid}, "
