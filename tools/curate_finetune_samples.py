@@ -491,10 +491,14 @@ def main():
     # ---- load face detector ----
     try:
         from latentsync.utils.face_detector import FaceDetector
-        # Curation needs faces across the full yaw range so we can bucket
-        # side_face clips.  The default FaceDetector skips faces with |yaw|>15,
-        # which would starve the side_face bucket and even reject mild poses.
-        detector = FaceDetector(device=args.device, skip_side_face_threshold=None)
+        # Curation needs yaw across the full range so we can bucket side_face
+        # clips.  Load the pose module too; otherwise face.pose is None and we
+        # cannot estimate yaw.
+        detector = FaceDetector(
+            device=args.device,
+            skip_side_face_threshold=None,
+            allowed_modules=["detection", "landmark_2d_106", "pose"],
+        )
     except Exception as exc:
         logger.error("Could not load FaceDetector: %s", exc)
         logger.error("Install insightface + run `python tools/download_checkpoints.py` first.")
