@@ -72,3 +72,15 @@ datasets:
       适合想要"广覆盖"的 finetune(Stage 2 LoRA baseline)。
       mp4 文件直接列在 repo 顶层,1500 个 mp4。
     typical_use: "Stage 2 LoRA baseline / 🎯 Badcase Fix"
+
+  - id: lipsync_clean_78
+    name: LipSync Clean (78 mp4+txt, 最小可信 finetune seed)
+    hf_repo: yashlanjewar20/lipsync_clean
+    hf_repo_type: dataset
+    hf_allow: ["*.mp4"]
+    n_clips: 78
+    target_ratio: {frontal: 0.50, side_face: 0.30, fast_motion: 0.20}
+    description: |
+      小而干净的 78 个 mp4 + 配对 txt 转录。已实测可下(HF 直接 .mp4,无 Xet/CAS)。
+      适合作为最小 finetune seed(LoRA 几十个 epoch 验证流程),后续再加数据。
+    typical_use: "Stage 2 LoRA smoke test / 流程验证"
