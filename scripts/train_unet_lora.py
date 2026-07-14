@@ -270,24 +270,55 @@ def main(config):
         audio_feat_length=config.data.audio_feat_length,
     )
 
-    # ---- Load base UNet ----
-    unet, resume_global_step = UNet3DConditionModel.from_pretrained(
-        OmegaConf.to_container(config.model),
-        config.ckpt.resume_ckpt_path,
-        device=device,
-    )
+    # ---- Load base UNet / resume LoRA adapter ----
+    resume_ckpt = config.ckpt.resume_ckpt_path
+    adapter_resume_dir = None
+    if os.path.isdir(resume_ckpt) and os.path.exists(os.path.join(resume_ckpt, "adapter_config.json")):
+        adapter_resume_dir = resume_ckpt
+        base_ckpt = config.ckpt.get("base_unet_ckpt", "checkpoints/latentsync_unet.pt")
+        logger.info("Resuming LoRA adapter from %s; base UNet from %s", adapter_resume_dir, base_ckpt)
+        unet, _ = UNet3DConditionModel.from_pretrained(
+            OmegaConf.to_container(config.model),
+            base_ckpt,
+            device=device,
+        )
+        try:
+            from peft import PeftModel
+            unet = PeftModel.from_pretrained(unet, adapter_resume_dir)
+            unet.to(device)
+        except Exception as e:
+            raise RuntimeError(f"Could not load LoRA adapter from {adapter_resume_dir}: {e}") from e
+        step_str = os.path.basename(adapter_resume_dir).split("-")[-1]
+        try:
+            resume_global_step = int(step_str)
+        except ValueError:
+            resume_global_step = 0
+    else:
+        unet, resume_global_step = UNet3DConditionModel.from_pretrained(
+            OmegaConf.to_container(config.model),
+            resume_ckpt,
+            device=device,
+        )
 
     # ---- Inject LoRA ----
-    unet = inject_lora(
-        unet,
-        rank=int(lora_cfg.rank),
-        alpha=int(lora_cfg.alpha),
-        dropout=float(lora_cfg.dropout),
-        target_modules=list(lora_cfg.target_modules),
-        qlora=bool(lora_cfg.qlora),
-    )
-    if bool(lora_cfg.get("freeze_attn2", False)):
-        freeze_attn2_lora(unet)
+    if adapter_resume_dir is None:
+        unet = inject_lora(
+            unet,
+            rank=int(lora_cfg.rank),
+            alpha=int(lora_cfg.alpha),
+            dropout=float(lora_cfg.dropout),
+            target_modules=list(lora_cfg.target_modules),
+            qlora=bool(lora_cfg.qlora),
+        )
+        if bool(lora_cfg.get("freeze_attn2", False)):
+            freeze_attn2_lora(unet)
+    else:
+        # Adapter resumed: LoRA structure already loaded from the adapter dir.
+        if is_main_process:
+            try:
+                unet.print_trainable_parameters()
+            except Exception:
+                pass
 
     # ---- StableSyncNet (Stage 2 supervision) ----
     syncnet = None
