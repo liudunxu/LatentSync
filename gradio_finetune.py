@@ -4052,7 +4052,14 @@ def main() -> None:
     args = parser.parse_args()
 
     demo = build_ui()
-    demo.queue().launch(server_name=args.host, server_port=args.port, share=args.share, inbrowser=True)
+    allowed = [str(REPO_ROOT), str(FINETUNE_BASE_DIR), "/tmp"]
+    demo.queue().launch(
+        server_name=args.host,
+        server_port=args.port,
+        share=args.share,
+        inbrowser=True,
+        allowed_paths=allowed,
+    )
 
 
 if __name__ == "__main__":
