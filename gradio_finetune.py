@@ -2299,6 +2299,7 @@ def _merge_adapter_to_temp_pt(
     without manually running scripts/merge_lora.py first.
     """
     from latentsync.models.unet import UNet3DConditionModel
+    import torch
 
     logger.info("[validation] merging adapter %s into base %s", adapter_dir, base_ckpt)
     cfg = OmegaConf.load(unet_config)
