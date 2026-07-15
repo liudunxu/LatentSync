@@ -284,13 +284,13 @@ def one_step_sampling(ddim_scheduler, pred_noise, timesteps, x_t):
     return pred_original_sample
 
 
-def plot_loss_chart(save_path: str, *args):
+def plot_loss_chart(save_path: str, *args, ylabel: str = "Loss"):
     # Creating the plot
     plt.figure()
     for loss_line in args:
         plt.plot(loss_line[1], loss_line[2], label=loss_line[0])
     plt.xlabel("Step")
-    plt.ylabel("Loss")
+    plt.ylabel(ylabel)
     plt.legend()
 
     # Save the figure to a file

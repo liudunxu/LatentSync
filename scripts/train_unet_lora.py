@@ -763,6 +763,7 @@ def main(config):
                     plot_loss_chart(
                         os.path.join(output_dir, f"sync_conf_results/sync_conf_chart-{global_step}.png"),
                         ("Sync confidence", val_step_list, sync_conf_list),
+                        ylabel="Sync confidence",
                     )
 
                 if train_loss_list:
