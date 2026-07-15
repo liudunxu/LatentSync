@@ -197,7 +197,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
         "batch_size": 1,
         "num_frames": 16,
-        "resolution": 512,
+        "resolution": 256,
         "learning_rate": 5e-5,
         "use_motion_module": True,
         "pixel_space_supervise": True,
@@ -215,12 +215,12 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "lr_warmup_steps": 500,
         "description": (
             "🟢 **推荐 — 内容型 badcase**\n"
-            "resolution=512 与 base model 训练分布一致,"
+            "resolution=256 显存友好,训练快;"
             "LoRA rank=64, lr=5e-5, sync_loss=0.02, cosine+500 warmup, 每 500 步存 ckpt。\n"
             "适用:嘴型/audio 同步、嘴糊、paste-back 外溢、侧脸唇形不同步。\n"
             "注意:SyncNet 只支持 16 帧,所以不要改 num_frames。\n"
             "freeze_attn2=True 保护基础唇音同步能力。\n"
-            "训练前请确认数据集已做人脸对齐(init_finetune_dataset.py --align)。"
+            "训练前请确认数据集已做人脸对齐(init_finetune_dataset.py --align --align-resolution 256)。"
         ),
         "lora": {
             "enabled": True,
