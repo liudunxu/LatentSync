@@ -63,6 +63,7 @@ from latentsync.models.stable_syncnet import StableSyncNet
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from latentsync.utils.util import init_dist, cosine_loss, one_step_sampling
 from latentsync.utils.util import plot_loss_chart
+from latentsync.utils.tracker import Tracker
 from latentsync.whisper.audio2feature import Audio2Feature
 from latentsync.trepa.loss import TREPALoss
 from eval.syncnet import SyncNetEval
@@ -417,6 +418,16 @@ def main(config):
     if config.run.trepa_loss_weight != 0 and config.run.pixel_space_supervise:
         trepa_loss_func = TREPALoss(device=device, with_cp=True)
 
+    # ---- Optional experiment tracker (WandB / TensorBoard) ----
+    tracker = Tracker(
+        project="latentsync-finetune",
+        run_name=folder_name,
+        config=OmegaConf.to_container(config),
+        rank=global_rank,
+    )
+    if is_main_process and tracker.backend:
+        logger.info(f"Experiment tracking enabled: {tracker.backend}")
+
     # ---- Validation pipeline (uses base UNet with LoRA baked in for this step) ----
     # merge_and_unload mutates the source in-place, so deep-copy first to
     # preserve the LoRA-wrapped `unet` for DDP training.
@@ -654,6 +665,17 @@ def main(config):
                 sync_loss_list.append(float(sync_loss))
                 lr_list.append(float(lr_scheduler.get_last_lr()[0]))
 
+                # ---- Push to experiment tracker (WandB / TensorBoard) ----
+                tracker.log({
+                    "train/loss": loss.item(),
+                    "train/recon": float(recon_loss) if not isinstance(recon_loss, int) else 0.0,
+                    "train/sync": float(sync_loss) if not isinstance(sync_loss, int) else 0.0,
+                    "train/lpips": float(lpips_loss) if not isinstance(lpips_loss, int) else 0.0,
+                    "train/trepa": float(trepa_loss) if not isinstance(trepa_loss, int) else 0.0,
+                    "train/lr": lr_scheduler.get_last_lr()[0],
+                    "train/epoch": epoch,
+                }, step=global_step)
+
             optimizer.zero_grad()
 
             if config.run.mixed_precision_training:
@@ -717,6 +739,8 @@ def main(config):
                         logger.info(e)
                         conf = 0
                     sync_conf_list.append(conf)
+                    if is_main_process:
+                        tracker.log({"val/sync_conf": float(conf)}, step=global_step)
                     plot_loss_chart(
                         os.path.join(output_dir, f"sync_conf_results/sync_conf_chart-{global_step}.png"),
                         ("Sync confidence", val_step_list, sync_conf_list),
@@ -742,6 +766,7 @@ def main(config):
                 break
 
     progress_bar.close()
+    tracker.finish()
     dist.destroy_process_group()
 
 
