@@ -22,19 +22,6 @@ class AlignRestore(object):
             self.fill_value = torch.tensor([127, 127, 127], device=device, dtype=dtype)
             self.mask = torch.ones((1, 1, self.face_size[1], self.face_size[0]), device=device, dtype=dtype)
 
-    def reset_p_bias(self) -> None:
-        """Reset the cross-frame affine translation smoothing state.
-
-        Call this at the start of any batch where the previous
-        batch's end-of-stream bias would not be representative of
-        the incoming frames (e.g. a scene cut, a different camera
-        distance, or simply the start of a new video). Without a
-        reset, ``p_bias`` EMA converges to a value that drifts from
-        the per-frame true bias and corrupts ``M[:, 2]`` for the
-        first few frames of the new batch.
-        """
-        self.p_bias = None
-
     def align_warp_face(self, img, landmarks3, smooth=True):
         affine_matrix, self.p_bias = self.transformation_from_points(
             landmarks3, self.face_template, smooth, self.p_bias
@@ -55,6 +42,9 @@ class AlignRestore(object):
         return cropped_face, affine_matrix
 
     def restore_img(self, input_img, face, affine_matrix, paste_mask_512=None):
+        # paste_mask_512 is accepted for API compatibility with the newer
+        # per-frame inpaint-mask path, but the legacy full-face paste/blend
+        # is intentionally preserved here as the baseline behavior.
         h, w, _ = input_img.shape
 
         if isinstance(affine_matrix, np.ndarray):
@@ -69,68 +59,40 @@ class AlignRestore(object):
         inv_face = (inv_face / 2 + 0.5).clamp(0, 1) * 255
 
         input_img = rearrange(torch.from_numpy(input_img).to(device=self.device, dtype=self.dtype), "h w c -> c h w")
+        inv_mask = kornia.geometry.transform.warp_affine(
+            self.mask, inv_affine_matrix, (h, w), padding_mode="zeros"
+        )  # (1, 1, h_up, w_up)
 
-        if paste_mask_512 is not None:
-            # Per-frame inpaint-mask path. The mask lives in 512x512
-            # aligned-face space; warp it back into the original frame
-            # coordinates so the paste region exactly covers the area
-            # the inpainter touched (mouth + small feather band). A
-            # small Gaussian feather softens the seam against the
-            # surrounding unmodified source pixels -- much smaller than
-            # the legacy cv2.erode(60x60) + gaussian_blur(91, sigma=37)
-            # band, which produced a ~440x540 ellipse covering the
-            # entire lower half of the face.
-            inv_soft_mask = kornia.geometry.transform.warp_affine(
-                paste_mask_512.to(device=self.device, dtype=self.dtype).unsqueeze(0),
-                inv_affine_matrix, (h, w), padding_mode="border",
-            )  # (1, 1, h, w)
-            # Scale the feather sigma with the output resolution so the paste
-            # seam stays soft on high-res frames. At 512x512 this keeps the
-            # original sigma=4 / kernel=21; at 1080p sigma grows to ~8.4.
-            sigma = max(4.0, float(min(h, w)) / 128.0)
-            kernel_size = int(sigma * 5) // 2 * 2 + 1
-            inv_soft_mask = kornia.filters.gaussian_blur2d(
-                inv_soft_mask, (kernel_size, kernel_size), (sigma, sigma)
-            ).squeeze(0)  # -> (1, h, w)
-            inv_soft_mask_3d = inv_soft_mask.expand_as(inv_face)
-            img_back = inv_soft_mask_3d * inv_face + (1 - inv_soft_mask_3d) * input_img
-        else:
-            # Legacy full-face paste path. Kept as a fallback for
-            # callers that don't have a per-frame inpaint mask.
-            inv_mask = kornia.geometry.transform.warp_affine(
-                self.mask, inv_affine_matrix, (h, w), padding_mode="zeros"
-            )  # (1, 1, h_up, w_up)
+        inv_mask_erosion = kornia.morphology.erosion(
+            inv_mask,
+            torch.ones(
+                (int(2 * self.upscale_factor), int(2 * self.upscale_factor)), device=self.device, dtype=self.dtype
+            ),
+        )
 
-            inv_mask_erosion = kornia.morphology.erosion(
-                inv_mask,
-                torch.ones(
-                    (int(2 * self.upscale_factor), int(2 * self.upscale_factor)), device=self.device, dtype=self.dtype
-                ),
-            )
+        inv_mask_erosion_t = inv_mask_erosion.squeeze(0).expand_as(inv_face)
+        pasted_face = inv_mask_erosion_t * inv_face
+        total_face_area = torch.sum(inv_mask_erosion.float())
+        w_edge = int(total_face_area**0.5) // 20
+        erosion_radius = w_edge * 2
 
-            inv_mask_erosion_t = inv_mask_erosion.squeeze(0).expand_as(inv_face)
-            pasted_face = inv_mask_erosion_t * inv_face
-            total_face_area = torch.sum(inv_mask_erosion.float())
-            w_edge = max(int(total_face_area**0.5) // 16, 6)
-            erosion_radius = w_edge * 2
+        # This step will consume a large amount of GPU memory.
+        # inv_mask_center = kornia.morphology.erosion(
+        #     inv_mask_erosion, torch.ones((erosion_radius, erosion_radius), device=self.device, dtype=self.dtype)
+        # )
 
-            # This step will consume a large amount of GPU memory.
-            # inv_mask_center = kornia.morphology.erosion(
-            #     inv_mask_erosion, torch.ones((erosion_radius, erosion_radius), device=self.device, dtype=self.dtype)
-            # )
+        # Run on CPU to avoid consuming a large amount of GPU memory.
+        inv_mask_erosion = inv_mask_erosion.squeeze().cpu().numpy().astype(np.float32)
+        inv_mask_center = cv2.erode(inv_mask_erosion, np.ones((erosion_radius, erosion_radius), np.uint8))
+        inv_mask_center = torch.from_numpy(inv_mask_center).to(device=self.device, dtype=self.dtype)[None, None, ...]
 
-            # Run on CPU to avoid consuming a large amount of GPU memory.
-            inv_mask_erosion = inv_mask_erosion.squeeze().cpu().numpy().astype(np.float32)
-            inv_mask_center = cv2.erode(inv_mask_erosion, np.ones((erosion_radius, erosion_radius), np.uint8))
-            inv_mask_center = torch.from_numpy(inv_mask_center).to(device=self.device, dtype=self.dtype)[None, None, ...]
-
-            blur_size = w_edge * 3 // 2 * 2 + 1
-            sigma = 0.4 * ((blur_size - 1) * 0.5 - 1) + 0.9
-            inv_soft_mask = kornia.filters.gaussian_blur2d(
-                inv_mask_center, (blur_size, blur_size), (sigma, sigma)
-            ).squeeze(0)
-            inv_soft_mask_3d = inv_soft_mask.expand_as(inv_face)
-            img_back = inv_soft_mask_3d * pasted_face + (1 - inv_soft_mask_3d) * input_img
+        blur_size = w_edge * 2 + 1
+        sigma = 0.3 * ((blur_size - 1) * 0.5 - 1) + 0.8
+        inv_soft_mask = kornia.filters.gaussian_blur2d(
+            inv_mask_center, (blur_size, blur_size), (sigma, sigma)
+        ).squeeze(0)
+        inv_soft_mask_3d = inv_soft_mask.expand_as(inv_face)
+        img_back = inv_soft_mask_3d * pasted_face + (1 - inv_soft_mask_3d) * input_img
 
         img_back = rearrange(img_back, "c h w -> h w c").contiguous().to(dtype=torch.uint8)
         img_back = img_back.cpu().numpy()
