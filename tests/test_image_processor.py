@@ -18,7 +18,7 @@ class TestPrepareMasksAndMaskedImages(unittest.TestCase):
             from latentsync.utils.image_processor import ImageProcessor
         except ModuleNotFoundError as exc:
             self.skipTest(f"optional dependency missing: {exc.name}")
-        return ImageProcessor(resolution=512, device="cpu")
+        return ImageProcessor(resolution=256, device="cpu")
 
     def _prepare_loop_reference(self, processor, images, per_frame_masks=None):
         """Reference implementation using the old per-frame loop."""
