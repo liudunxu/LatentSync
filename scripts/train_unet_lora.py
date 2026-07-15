@@ -472,6 +472,8 @@ def main(config):
     recon_loss_list = []
     lpips_loss_list = []
     sync_loss_list = []
+    sync_loss_ema = 0.0
+    sync_loss_ema_alpha = 0.95
     lr_list = []
     val_step_list = []
     sync_conf_list = []
@@ -647,29 +649,46 @@ def main(config):
                 ones_tensor = torch.ones((config.data.batch_size, 1)).float().to(device=device)
                 vision_embeds, audio_embeds = syncnet(syncnet_input, mel)
                 sync_loss = cosine_loss(vision_embeds.float(), audio_embeds.float(), ones_tensor).mean()
+                # EMA smooth the sync signal for logging (and optional loss clipping).
+                # SyncNet loss is computed on a single/generated clip and is very noisy;
+                # the raw tensor is still used for gradients, but we cap extreme outliers
+                # so a single bad sample does not dominate the gradient.
+                sync_loss_val = float(sync_loss.item())
+                if global_step == resume_global_step:
+                    sync_loss_ema = sync_loss_val
+                else:
+                    sync_loss_ema = sync_loss_ema_alpha * sync_loss_ema + (1 - sync_loss_ema_alpha) * sync_loss_val
+                # Cap the sync loss used for optimization at 3x the EMA to suppress spikes.
+                sync_loss_for_backward = min(float(sync_loss.item()), 3.0 * sync_loss_ema + 1e-6)
+                sync_loss_for_backward = torch.tensor(sync_loss_for_backward, device=sync_loss.device, dtype=sync_loss.dtype)
             else:
                 sync_loss = 0
+                sync_loss_for_backward = 0
 
             loss = (
                 recon_loss * config.run.recon_loss_weight
-                + sync_loss * config.run.sync_loss_weight
+                + sync_loss_for_backward * config.run.sync_loss_weight
                 + lpips_loss * config.run.perceptual_loss_weight
                 + trepa_loss * config.run.trepa_loss_weight
             )
 
             if is_main_process:
+                # Log the EMA-smoothed sync value for curves; the raw/backward value
+                # may be clipped, but EMA better reflects the underlying trend.
+                sync_log_val = sync_loss_ema if isinstance(sync_loss, torch.Tensor) else 0.0
+
                 train_step_list.append(global_step)
                 train_loss_list.append(float(loss.item()))
                 recon_loss_list.append(float(recon_loss))
                 lpips_loss_list.append(float(lpips_loss))
-                sync_loss_list.append(float(sync_loss))
+                sync_loss_list.append(float(sync_log_val))
                 lr_list.append(float(lr_scheduler.get_last_lr()[0]))
 
                 # ---- Push to experiment tracker (WandB / TensorBoard) ----
                 tracker.log({
                     "train/loss": loss.item(),
                     "train/recon": float(recon_loss) if not isinstance(recon_loss, int) else 0.0,
-                    "train/sync": float(sync_loss) if not isinstance(sync_loss, int) else 0.0,
+                    "train/sync": float(sync_log_val),
                     "train/lpips": float(lpips_loss) if not isinstance(lpips_loss, int) else 0.0,
                     "train/trepa": float(trepa_loss) if not isinstance(trepa_loss, int) else 0.0,
                     "train/lr": lr_scheduler.get_last_lr()[0],

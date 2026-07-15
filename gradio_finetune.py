@@ -202,7 +202,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "use_motion_module": True,
         "pixel_space_supervise": True,
         "use_syncnet": True,
-        "sync_loss_weight": 0.12,
+        "sync_loss_weight": 0.08,
         "perceptual_loss_weight": 0.15,
         "recon_loss_weight": 1.0,
         "trepa_loss_weight": 10.0,
@@ -291,7 +291,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "pixel_space_supervise": True,
         "use_syncnet": True,
         # 侧脸时唇被遮 ~30-50%,必须强推 audio-driven 想象
-        "sync_loss_weight": 0.18,
+        "sync_loss_weight": 0.12,
         # 唇部纹理在侧脸时 shading 不同,提权
         "perceptual_loss_weight": 0.25,
         "recon_loss_weight": 1.0,
@@ -339,7 +339,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "pixel_space_supervise": True,
         "use_syncnet": True,
         # 短剧容错低,口型必须跟得紧
-        "sync_loss_weight": 0.18,
+        "sync_loss_weight": 0.12,
         "perceptual_loss_weight": 0.20,
         "recon_loss_weight": 1.0,
         "trepa_loss_weight": 10.0,
@@ -3053,11 +3053,11 @@ def build_ui() -> gr.Blocks:
                     num_workers = gr.Slider(0, 32, value=12, step=1, label="num_workers")
                     lr_scheduler = gr.Dropdown(
                         choices=["constant", "cosine", "cosine_with_restarts", "linear", "polynomial"],
-                        value="constant",
+                        value="cosine",
                         label="lr_scheduler",
                     )
                     lr_warmup_steps = gr.Slider(
-                        0, 2000, value=0, step=50, label="lr_warmup_steps (推荐 100-300 for cosine)"
+                        0, 2000, value=200, step=50, label="lr_warmup_steps (推荐 100-300 for cosine)"
                     )
                     train_output_dir = gr.Textbox(
                         label=f"train_output_dir (相对于 {FINETUNE_BASE_DIR.name})",
