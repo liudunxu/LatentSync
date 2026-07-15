@@ -2989,8 +2989,9 @@ def build_ui() -> gr.Blocks:
                 with gr.Column():
                     gr.Markdown("### 🏗 模型 & 训练")
                     resume_ckpt = gr.Textbox(
-                        label="resume_ckpt (加载的预训练权重)",
+                        label="resume_ckpt (base UNet .pt 或 LoRA adapter 目录)",
                         value=PRESETS["Stage 2 (256, 推荐)"]["resume_ckpt"],
+                        info="传 .pt 表示从 base/pretrained 开始训；传 LoRA adapter 目录（含 adapter_config.json）表示从该 checkpoint 继续训练。",
                     )
                     batch_size = gr.Slider(1, 64, value=1, step=1, label="batch_size")
                     num_frames = gr.Slider(8, 32, value=16, step=1, label="num_frames")
