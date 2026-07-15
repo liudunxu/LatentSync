@@ -1967,9 +1967,12 @@ def _monitor_refresh_core(
     """
     run_choices = _list_run_dirs_for_monitor(train_output_dir)
     # Auto-select the latest run if none is selected so the page isn't blank
-    # on first load.
+    # on first load. If the incoming selection is stale (e.g. browser cached a
+    # path that no longer exists), reset it to avoid Gradio dropdown errors.
     if not selected_run and run_choices:
         selected_run = run_choices[-1]
+    elif selected_run and selected_run not in run_choices:
+        selected_run = run_choices[-1] if run_choices else None
 
     run_dir = _resolve_run_dir(selected_run)
     run_path = str(run_dir) if run_dir else None
