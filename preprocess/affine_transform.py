@@ -108,7 +108,7 @@ if __name__ == "__main__":
     input_dir = "/mnt/bn/maliva-gen-ai-v2/chunyu.li/VoxCeleb2/segmented"
     output_dir = "/mnt/bn/maliva-gen-ai-v2/chunyu.li/VoxCeleb2/affine_transformed"
     temp_dir = "temp"
-    resolution = 256
+    resolution = 512
     num_workers = 10  # How many processes per device
 
     affine_transform_multi_gpus(input_dir, output_dir, temp_dir, resolution, num_workers)

@@ -35,7 +35,7 @@ def gather_video_paths(input_dir, output_dir, resolution):
 
 
 class FaceDetector:
-    def __init__(self, resolution=256):
+    def __init__(self, resolution=512):
         self.face_detection = mp.solutions.face_detection.FaceDetection(
             model_selection=0, min_detection_confidence=0.5
         )
@@ -106,7 +106,7 @@ def filter_high_resolution_multiprocessing(input_dir, output_dir, resolution, nu
 if __name__ == "__main__":
     input_dir = "/mnt/bn/maliva-gen-ai-v2/chunyu.li/VoxCeleb2/raw"
     output_dir = "/mnt/bn/maliva-gen-ai-v2/chunyu.li//VoxCeleb2/high_resolution"
-    resolution = 256
+    resolution = 512
     num_workers = 50
 
     filter_high_resolution_multiprocessing(input_dir, output_dir, resolution, num_workers)

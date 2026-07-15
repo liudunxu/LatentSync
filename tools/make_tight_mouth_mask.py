@@ -98,7 +98,7 @@ def main():
         default="latentsync/utils/mask5.png",
         help="output PNG path",
     )
-    ap.add_argument("--size", type=int, default=256)
+    ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--feather", type=float, default=6.0)
     args = ap.parse_args()
     mask = make_tight_mouth_mask(args.out, size=args.size, feather_sigma_px=args.feather)

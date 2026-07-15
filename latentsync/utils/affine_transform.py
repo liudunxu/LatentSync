@@ -8,7 +8,7 @@ import kornia
 
 
 class AlignRestore(object):
-    def __init__(self, align_points=3, resolution=256, device="cpu", dtype=torch.float16):
+    def __init__(self, align_points=3, resolution=512, device="cpu", dtype=torch.float16):
         if align_points == 3:
             self.upscale_factor = 1
             ratio = resolution / 256 * 2.8

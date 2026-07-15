@@ -85,12 +85,12 @@ ASSETS_DIR = REPO_ROOT / "assets"
 # ---------------------------------------------------------------------------
 
 PRESETS: Dict[str, Dict[str, Any]] = {
-    "Stage 1 (256, 全量训练)": {
+    "Stage 1 (512, 全量训练)": {
         "config_file": "configs/unet/stage1.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
         "batch_size": 1,
         "num_frames": 16,
-        "resolution": 256,
+        "resolution": 512,
         "learning_rate": 1e-5,
         "use_motion_module": False,
         "pixel_space_supervise": False,
@@ -102,48 +102,10 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "mixed_precision_training": True,
         "enable_gradient_checkpointing": True,
         "mask_image_path": "latentsync/utils/mask.png",
-        "description": "学视觉特征，不加 sync / lpips / trepa。23GB VRAM。",
+        "description": "学视觉特征，不加 sync / lpips / trepa。35GB+ VRAM。",
     },
-    "Stage 2 (256, 推荐)": {
+    "Stage 2 (512, 推荐)": {
         "config_file": "configs/unet/stage2.yaml",
-        "resume_ckpt": "checkpoints/latentsync_unet.pt",
-        "batch_size": 1,
-        "num_frames": 16,
-        "resolution": 256,
-        "learning_rate": 1e-5,
-        "use_motion_module": True,
-        "pixel_space_supervise": True,
-        "use_syncnet": True,
-        "sync_loss_weight": 0.05,
-        "perceptual_loss_weight": 0.1,
-        "recon_loss_weight": 1.0,
-        "trepa_loss_weight": 10.0,
-        "mixed_precision_training": True,
-        "enable_gradient_checkpointing": True,
-        "mask_image_path": "latentsync/utils/mask.png",
-        "description": "冻结 UNet 主体，只训 motion + attn。30GB VRAM。",
-    },
-    "Stage 2 Efficient (256, 20GB)": {
-        "config_file": "configs/unet/stage2_efficient.yaml",
-        "resume_ckpt": "checkpoints/latentsync_unet.pt",
-        "batch_size": 1,
-        "num_frames": 16,
-        "resolution": 256,
-        "learning_rate": 1e-5,
-        "use_motion_module": True,
-        "pixel_space_supervise": True,
-        "use_syncnet": True,
-        "sync_loss_weight": 0.05,
-        "perceptual_loss_weight": 0.1,
-        "recon_loss_weight": 1.0,
-        "trepa_loss_weight": 0.0,
-        "mixed_precision_training": True,
-        "enable_gradient_checkpointing": True,
-        "mask_image_path": "latentsync/utils/mask.png",
-        "description": "关 TREPA，只训 motion + attn2。20GB VRAM。",
-    },
-    "Stage 2 512 (高分辨率)": {
-        "config_file": "configs/unet/stage2_512.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
         "batch_size": 1,
         "num_frames": 16,
@@ -158,15 +120,53 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "trepa_loss_weight": 10.0,
         "mixed_precision_training": True,
         "enable_gradient_checkpointing": True,
-        "mask_image_path": "latentsync/utils/mask2.png",
-        "description": "512 分辨率。55GB VRAM。",
+        "mask_image_path": "latentsync/utils/mask.png",
+        "description": "冻结 UNet 主体，只训 motion + attn。48GB+ VRAM。",
     },
-    "Stage 2 LoRA (256, 12-15GB)": {
+    "Stage 2 Efficient (512, 35GB)": {
+        "config_file": "configs/unet/stage2_efficient.yaml",
+        "resume_ckpt": "checkpoints/latentsync_unet.pt",
+        "batch_size": 1,
+        "num_frames": 16,
+        "resolution": 512,
+        "learning_rate": 1e-5,
+        "use_motion_module": True,
+        "pixel_space_supervise": True,
+        "use_syncnet": True,
+        "sync_loss_weight": 0.05,
+        "perceptual_loss_weight": 0.1,
+        "recon_loss_weight": 1.0,
+        "trepa_loss_weight": 0.0,
+        "mixed_precision_training": True,
+        "enable_gradient_checkpointing": True,
+        "mask_image_path": "latentsync/utils/mask.png",
+        "description": "关 TREPA，只训 motion + attn2。35GB VRAM。",
+    },
+    "Stage 2 (256, 低显存回退)": {
         "config_file": "configs/unet/stage2.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
         "batch_size": 1,
         "num_frames": 16,
         "resolution": 256,
+        "learning_rate": 1e-5,
+        "use_motion_module": True,
+        "pixel_space_supervise": True,
+        "use_syncnet": True,
+        "sync_loss_weight": 0.05,
+        "perceptual_loss_weight": 0.1,
+        "recon_loss_weight": 1.0,
+        "trepa_loss_weight": 10.0,
+        "mixed_precision_training": True,
+        "enable_gradient_checkpointing": True,
+        "mask_image_path": "latentsync/utils/mask.png",
+        "description": "256 分辨率低显存回退。30GB VRAM。",
+    },
+    "Stage 2 LoRA (512, 18-22GB)": {
+        "config_file": "configs/unet/stage2.yaml",
+        "resume_ckpt": "checkpoints/latentsync_unet.pt",
+        "batch_size": 1,
+        "num_frames": 16,
+        "resolution": 512,
         "learning_rate": 5e-5,
         "use_motion_module": True,
         "pixel_space_supervise": True,
@@ -192,12 +192,12 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         },
         "freeze_attn2": False,
     },
-    "🎯 Badcase Fix (侧脸+运动, LoRA, 12-15GB)": {
+    "🎯 Badcase Fix (侧脸+运动, LoRA, 18-22GB)": {
         "config_file": "configs/unet/stage2.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
         "batch_size": 1,
         "num_frames": 16,
-        "resolution": 256,
+        "resolution": 512,
         "learning_rate": 5e-5,
         "use_motion_module": True,
         "pixel_space_supervise": True,
@@ -232,12 +232,12 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         },
         "freeze_attn2": True,
     },
-    "🧩 Structural Fix (LoRA + conv, 18-22GB)": {
+    "🧩 Structural Fix (LoRA + conv, 28-35GB)": {
         "config_file": "configs/unet/stage2.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
         "batch_size": 1,
         "num_frames": 16,
-        "resolution": 256,
+        "resolution": 512,
         "learning_rate": 3e-5,
         "use_motion_module": True,
         "pixel_space_supervise": True,
@@ -257,7 +257,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             "🔴 **推荐 — 结构性 badcase**\n"
             "LoRA target 加 conv1/conv2/conv_shortcut/proj_in/proj_out/conv_in/conv_out\n"
             "(11 项,~25-30M params,3x capacity,够 cover 侧脸几何错位)。\n"
-            "VRAM 占用 18-22GB(Lower lr 防过拟合; perceptual↑保细节)。\n"
+            "VRAM 占用 28-35GB(Lower lr 防过拟合; perceptual↑保细节)。\n"
             "内容型嘴错见 🎯 Badcase Fix; 短剧多说话人见 🎬 Short Drama; 通用 baseline 见 ⚪ Stage 2 LoRA。"
         ),
         "lora": {
@@ -279,13 +279,13 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         },
         "freeze_attn2": True,
     },
-    "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)": {
+    "💋 Side-Face Lip Quality (LoRA+conv, 28-35GB)": {
         "config_file": "configs/unet/stage2.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
         "batch_size": 1,
         # SyncNet 只支持 16 帧,长时序上下文需用 motion module 补偿
         "num_frames": 16,
-        "resolution": 256,
+        "resolution": 512,
         "learning_rate": 3e-5,
         "use_motion_module": True,
         "pixel_space_supervise": True,
@@ -327,13 +327,13 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         },
         "freeze_attn2": True,
     },
-    "🎬 Short Drama (LoRA+conv, 多说话人, 18-22GB)": {
+    "🎬 Short Drama (LoRA+conv, 多说话人, 28-35GB)": {
         "config_file": "configs/unet/stage2.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
         "batch_size": 1,
         # Short drama 单段短(5-15s),长上下文稀释信号 — 回到 16
         "num_frames": 16,
-        "resolution": 256,
+        "resolution": 512,
         "learning_rate": 3e-5,
         "use_motion_module": True,
         "pixel_space_supervise": True,
@@ -378,12 +378,12 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         },
         "freeze_attn2": True,
     },
-    "Stage 2 QLoRA (256, 8-10GB)": {
+    "Stage 2 QLoRA (512, 12-15GB)": {
         "config_file": "configs/unet/stage2.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
         "batch_size": 1,
         "num_frames": 16,
-        "resolution": 256,
+        "resolution": 512,
         "learning_rate": 2e-4,
         "use_motion_module": True,
         "pixel_space_supervise": True,
@@ -2994,7 +2994,7 @@ def build_ui() -> gr.Blocks:
                     )
                     batch_size = gr.Slider(1, 64, value=1, step=1, label="batch_size")
                     num_frames = gr.Slider(8, 32, value=16, step=1, label="num_frames")
-                    resolution = gr.Radio([256, 512], value=256, label="resolution")
+                    resolution = gr.Radio([256, 512], value=512, label="resolution")
                     learning_rate = gr.Number(value=1e-5, label="learning_rate", precision=8)
 
                     use_motion_module = gr.Checkbox(
@@ -3405,7 +3405,7 @@ def build_ui() -> gr.Blocks:
                         label="Fine-tuned checkpoint",
                         allow_custom_value=True,
                     )
-                    cmp_resolution = gr.Radio([256, 512], value=256, label="resolution")
+                    cmp_resolution = gr.Radio([256, 512], value=512, label="resolution")
 
             with gr.Row():
                 cmp_steps = gr.Slider(10, 50, value=20, step=1, label="inference_steps")
@@ -3473,7 +3473,7 @@ def build_ui() -> gr.Blocks:
                         value="configs/unet/stage2.yaml",
                         label="UNet config（必须和 ckpt 匹配）",
                     )
-                    val_resolution = gr.Radio([256, 512], value=256, label="resolution")
+                    val_resolution = gr.Radio([256, 512], value=512, label="resolution")
 
             with gr.Row():
                 val_steps = gr.Slider(10, 50, value=20, step=1, label="inference_steps")

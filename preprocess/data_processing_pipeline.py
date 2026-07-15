@@ -74,7 +74,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--total_num_workers", type=int, default=100)
     parser.add_argument("--per_gpu_num_workers", type=int, default=20)
-    parser.add_argument("--resolution", type=int, default=256)
+    parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--sync_conf_threshold", type=int, default=3)
     parser.add_argument("--temp_dir", type=str, default="temp")
     parser.add_argument("--input_dir", type=str, required=True)
