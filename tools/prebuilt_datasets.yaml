@@ -96,13 +96,13 @@ datasets:
     name: CelebV-HQ Head-Talk (1.5k, 侧脸/转头专项)
     hf_repo: saeed-5959/celebv_hq_head_talking
     hf_repo_type: dataset
-    hf_allow: ["head_talk/*.mp4", "head_talk_2/*.mp4"]
+    hf_allow: ["head_talk/*.mp4", "head_talk_2/*.mp4", "lipsync/*.mp4", "lipsync_2/*.mp4"]
     n_clips: 1500
     target_ratio: {frontal: 0.25, side_face: 0.60, fast_motion: 0.15}
     description: |
-      CelebV-HQ 中专注于头部说话的 512×512 片段。head_talk / head_talk_2
-      子集包含丰富的 yaw 变化与转头动作,侧脸桶提到 60%,专门用来改善
-      侧脸唇形同步 badcase。约 1-2GB,比原 CelebV-HQ 39GB tar 包轻量很多。
+      CelebV-HQ 中专注于头部说话的 512×512 片段。head_talk / head_talk_2 /
+      lipsync / lipsync_2 子集包含丰富的 yaw 变化与转头动作,侧脸桶提到 60%,
+      专门用来改善侧脸唇形同步 badcase。
     typical_use: "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)"
 
   - id: lipsync_full_159
