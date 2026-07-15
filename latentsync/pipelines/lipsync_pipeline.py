@@ -3816,12 +3816,12 @@ class LipsyncPipeline(DiffusionPipeline):
         identity_yaw_adaptive_band_deg = kwargs.get("identity_yaw_adaptive_band_deg", 25.0)
         min_detection_score = kwargs.get("min_detection_score", 0.50)
         temporal_smoothing_enabled = kwargs.get("temporal_smoothing_enabled", True)
-        mouth_motion_preserve_strength = kwargs.get("mouth_motion_preserve_strength", 0.0)
-        mouth_temporal_stabilization_strength = kwargs.get("mouth_temporal_stabilization_strength", 0.0)
-        mouth_temporal_stabilization_max_delta = kwargs.get("mouth_temporal_stabilization_max_delta", 0.0)
+        mouth_motion_preserve_strength = kwargs.get("mouth_motion_preserve_strength", 0.45)
+        mouth_temporal_stabilization_strength = kwargs.get("mouth_temporal_stabilization_strength", 0.15)
+        mouth_temporal_stabilization_max_delta = kwargs.get("mouth_temporal_stabilization_max_delta", 0.12)
         mouth_audio_adaptive_motion_enabled = kwargs.get("mouth_audio_adaptive_motion_enabled", True)
-        mouth_audio_motion_min_scale = kwargs.get("mouth_audio_motion_min_scale", 1.0)
-        mouth_audio_motion_max_scale = kwargs.get("mouth_audio_motion_max_scale", 1.0)
+        mouth_audio_motion_min_scale = kwargs.get("mouth_audio_motion_min_scale", 0.85)
+        mouth_audio_motion_max_scale = kwargs.get("mouth_audio_motion_max_scale", 1.60)
         quality_gate_enabled = kwargs.get("quality_gate_enabled", False)
         quality_min_laplacian = kwargs.get("quality_min_laplacian", 0.04)
         quality_min_sharpness_ratio = kwargs.get("quality_min_sharpness_ratio", 0.05)
@@ -3868,7 +3868,7 @@ class LipsyncPipeline(DiffusionPipeline):
         silent_pad_frames = kwargs.get("silent_pad_frames", 0)
         color_match_strength = kwargs.get("color_match_strength", 0.60)
         mouth_detail_strength = kwargs.get("mouth_detail_strength", 0.65)
-        mouth_sharpen_strength = kwargs.get("mouth_sharpen_strength", 0.0)
+        mouth_sharpen_strength = kwargs.get("mouth_sharpen_strength", 0.30)
         codeformer_enabled = kwargs.get("codeformer_enabled", False)
         codeformer_fidelity_weight = kwargs.get("codeformer_fidelity_weight", 0.5)
         codeformer_adain = kwargs.get("codeformer_adain", True)
@@ -5000,20 +5000,20 @@ class LipsyncPipeline(DiffusionPipeline):
         temporal_smoothing_enabled: bool = True,
         # Preserve current-frame mouth-core motion after temporal smoothing.
         # 0 = fully smoothed mouth, 1 = keep generated current-frame mouth.
-        mouth_motion_preserve_strength: float = 0.0,
+        mouth_motion_preserve_strength: float = 0.45,
         # Lightly stabilize mouth-core color/detail between consecutive valid
         # generated frames to reduce flicker without freezing lip motion.
-        mouth_temporal_stabilization_strength: float = 0.0,
+        mouth_temporal_stabilization_strength: float = 0.15,
         # If the current mouth core differs too much from the previous
         # stabilized mouth, clear carry state instead of blending. This keeps
         # stabilization from borrowing lips across speaker/shot changes that
         # were not caught by geometry or identity continuity breaks.
-        mouth_temporal_stabilization_max_delta: float = 0.0,
+        mouth_temporal_stabilization_max_delta: float = 0.12,
         # Audio-adaptive mouth motion: preserve more current generated mouth
         # motion on high-energy speech frames and less on weak/silent frames.
         mouth_audio_adaptive_motion_enabled: bool = True,
-        mouth_audio_motion_min_scale: float = 1.0,
-        mouth_audio_motion_max_scale: float = 1.0,
+        mouth_audio_motion_min_scale: float = 0.85,
+        mouth_audio_motion_max_scale: float = 1.60,
         # Postfilter: skip frames where the generated mouth ROI is clearly
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
@@ -5142,8 +5142,14 @@ class LipsyncPipeline(DiffusionPipeline):
         # mask). 0 = off, 1 = full mean+std match. Default 0.60.
         color_match_strength: float = 0.60,
         # Unsharp-mask amount applied to the generated mouth region.
-        # 0 = off, 1 = strong sharpen. Default 0.0.
-        mouth_sharpen_strength: float = 0.0,
+        # 0 = off, 1 = strong sharpen. Default 0.30 (was 0.0): the inpainter's
+        # output tends to be slightly soft -- the diffusion process encourages
+        # plausible-but-not-sharp, so a small amount of unsharp in the mouth
+        # region recovers the high-frequency detail (teeth, lip lines, mouth
+        # corners) that the generated content is missing. 0.30 is in the
+        # "mild" range documented in the unsharp-mask helper; values above
+        # ~0.7 start to look crunchy. Frontend can still override per request.
+        mouth_sharpen_strength: float = 0.30,
         # Original-detail restoration outside the central mouth-motion core.
         # 0 = off, 1 = strong reference detail. Default 0.65.
         mouth_detail_strength: float = 0.65,
