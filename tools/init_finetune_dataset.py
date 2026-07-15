@@ -494,9 +494,15 @@ def _preprocess_aligned(
     """Run face alignment on curated videos and write fixed-res outputs."""
     aligned_dir.mkdir(parents=True, exist_ok=True)
 
+    # Only process the curated bucket directories (frontal / side_face /
+    # fast_motion). Ignore any _raw/ or aligned/ sub-dirs that may have
+    # been left behind by manual moves or older runs.
+    bucket_names = ("frontal", "side_face", "fast_motion")
     src_paths = sorted(
-        p for p in curated_dir.rglob("*.mp4")
-        if p.is_file() and aligned_dir not in p.parents
+        p
+        for name in bucket_names
+        for p in (curated_dir / name).rglob("*.mp4")
+        if p.is_file()
     )
     if not src_paths:
         logger.warning("no curated videos found under %s", curated_dir)
