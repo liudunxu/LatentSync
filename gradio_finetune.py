@@ -2079,8 +2079,21 @@ def run_compare(
     config_path = CONFIG_DIR / "stage2.yaml"
 
     def _run(ckpt_path: Path, out_path: Path) -> None:
+        # If a LoRA adapter directory was selected, merge it into the base UNet first.
+        if ckpt_path.is_dir() and (ckpt_path / "adapter_config.json").exists():
+            try:
+                merged_ckpt = _merge_adapter_to_temp_pt(
+                    ckpt_path,
+                    base_ckpt="checkpoints/latentsync_unet.pt",
+                    unet_config=config_path,
+                )
+                ckpt_path = merged_ckpt
+            except Exception as exc:
+                logger.exception("[run_compare] failed to merge adapter %s", ckpt_path)
+                raise gr.Error(f"LoRA adapter 合并失败: {exc}")
+
         cmd = [
-            "python",
+            sys.executable,
             "-m",
             "scripts.inference",
             "--unet_config_path",
