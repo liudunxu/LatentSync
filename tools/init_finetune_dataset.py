@@ -58,6 +58,11 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+# HuggingFace Hub 从 0.26 开始默认走 Xet 存储后端。Xet 对匿名/部分网络
+# 环境会偶发 401 (cas-server.xethub.hf.co)，且并发下载容易触发 CAS 错误。
+# 强制回退到普通 HTTP/LFS 可显著提升预置数据集下载成功率。
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -70,6 +75,8 @@ from einops import rearrange
 from latentsync.utils.affine_transform import AlignRestore
 from latentsync.utils.face_detector import FaceDetector
 from latentsync.utils.util import write_video_via_ffmpeg
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_YAML = REPO_ROOT / "tools" / "prebuilt_datasets.yaml"
 
