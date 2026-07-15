@@ -197,12 +197,12 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
         "batch_size": 1,
         "num_frames": 16,
-        "resolution": 256,
-        "learning_rate": 5e-5,
+        "resolution": 512,
+        "learning_rate": 1e-4,
         "use_motion_module": True,
         "pixel_space_supervise": True,
         "use_syncnet": True,
-        "sync_loss_weight": 0.08,
+        "sync_loss_weight": 0.10,
         "perceptual_loss_weight": 0.15,
         "recon_loss_weight": 1.0,
         "trepa_loss_weight": 10.0,
@@ -210,22 +210,22 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "enable_gradient_checkpointing": True,
         "mask_image_path": "latentsync/utils/mask.png",
         "save_ckpt_steps": 500,
-        "max_train_steps": 20000,
+        "max_train_steps": 5000,
         "lr_scheduler": "cosine",
         "lr_warmup_steps": 200,
         "description": (
             "🟢 **推荐 — 内容型 badcase**\n"
-            "只 wrap 注意力,但 sync_loss↑到 0.12, num_frames=16,"
-            "cosine+200 warmup, 每 500 步存 ckpt。\n"
-            "适用:嘴型/audio 同步、嘴糊、paste-back 外溢。\n"
+            "resolution=512 与 base model 训练分布一致,"
+            "LoRA rank=64, lr=1e-4, sync_loss=0.10, cosine+200 warmup, 每 500 步存 ckpt。\n"
+            "适用:嘴型/audio 同步、嘴糊、paste-back 外溢、侧脸唇形不同步。\n"
             "注意:SyncNet 只支持 16 帧,所以不要改 num_frames。\n"
             "freeze_attn2=True 保护基础唇音同步能力。\n"
-            "结构性脸变形见 🧩 Structural Fix。"
+            "训练前请确认数据集已做人脸对齐(init_finetune_dataset.py --align)。"
         ),
         "lora": {
             "enabled": True,
-            "rank": 32,
-            "alpha": 64,
+            "rank": 64,
+            "alpha": 128,
             "dropout": 0.10,
             "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
             "qlora": False,
