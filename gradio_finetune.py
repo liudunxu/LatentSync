@@ -868,11 +868,12 @@ def list_datasets() -> List[str]:
     return sorted(candidates)
 
 
-def list_checkpoints() -> List[str]:
+def list_checkpoints(include_lora: bool = True) -> List[str]:
     """Available UNet / SyncNet checkpoints and LoRA adapter directories.
 
     Returns .pt files under checkpoints/ plus peft-format LoRA adapter
-    directories found under FINETUNE_BASE_DIR/unet/*/checkpoints/.
+    directories found under FINETUNE_BASE_DIR/unet/*/checkpoints/ when
+    ``include_lora`` is True.
     """
     out: List[str] = []
     if CHECKPOINT_DIR.exists():
@@ -880,15 +881,16 @@ def list_checkpoints() -> List[str]:
             out.append(str(p.relative_to(REPO_ROOT)))
 
     # LoRA adapter directories produced by train_unet_lora.py
-    lora_base = FINETUNE_BASE_DIR / "unet"
-    if lora_base.exists():
-        for ckpt_dir in sorted(lora_base.rglob("checkpoints")):
-            for p in sorted(ckpt_dir.iterdir()):
-                if p.is_dir() and (p / "adapter_config.json").exists():
-                    try:
-                        out.append(str(p.relative_to(REPO_ROOT)))
-                    except ValueError:
-                        out.append(str(p))
+    if include_lora:
+        lora_base = FINETUNE_BASE_DIR / "unet"
+        if lora_base.exists():
+            for ckpt_dir in sorted(lora_base.rglob("checkpoints")):
+                for p in sorted(ckpt_dir.iterdir()):
+                    if p.is_dir() and (p / "adapter_config.json").exists():
+                        try:
+                            out.append(str(p.relative_to(REPO_ROOT)))
+                        except ValueError:
+                            out.append(str(p))
     return out
 
 
@@ -3392,13 +3394,16 @@ def build_ui() -> gr.Blocks:
                     cmp_video = gr.Video(label="Input Video")
                     cmp_audio = gr.Audio(label="Input Audio", type="filepath")
                 with gr.Column():
+                    cmp_include_lora = gr.Checkbox(value=True, label="包含 LoRA adapter 目录")
                     cmp_base = gr.Dropdown(
-                        choices=list_checkpoints(),
+                        choices=list_checkpoints(include_lora=True),
                         label="Base checkpoint",
+                        allow_custom_value=True,
                     )
                     cmp_ft = gr.Dropdown(
-                        choices=list_checkpoints(),
+                        choices=list_checkpoints(include_lora=True),
                         label="Fine-tuned checkpoint",
+                        allow_custom_value=True,
                     )
                     cmp_resolution = gr.Radio([256, 512], value=256, label="resolution")
 
@@ -3426,6 +3431,11 @@ def build_ui() -> gr.Blocks:
                 ],
                 outputs=[cmp_out_base, cmp_out_ft],
             )
+            cmp_include_lora.change(
+                fn=lambda incl: gr.update(choices=list_checkpoints(include_lora=incl)),
+                inputs=cmp_include_lora,
+                outputs=[cmp_base, cmp_ft],
+            )
             cmp_cancel_btn.click(fn=stop_inference, outputs=cmp_status)
 
         # =========================================================
@@ -3446,9 +3456,10 @@ def build_ui() -> gr.Blocks:
                     val_video = gr.Video(label="Input Video", scale=2)
                     val_audio = gr.Audio(label="Input Audio", type="filepath", scale=2)
                 with gr.Column():
+                    val_include_lora = gr.Checkbox(value=True, label="包含 LoRA adapter 目录")
                     val_ckpt = gr.Dropdown(
-                        choices=list_checkpoints(),
-                        label="Checkpoint（base / fine-tuned）",
+                        choices=list_checkpoints(include_lora=True),
+                        label="Checkpoint（base / fine-tuned / LoRA-merged）",
                         value="checkpoints/latentsync_unet.pt" if (REPO_ROOT / "checkpoints/latentsync_unet.pt").exists() else None,
                         allow_custom_value=True,
                     )
@@ -3489,6 +3500,11 @@ def build_ui() -> gr.Blocks:
                     val_deepcache, val_skip_qc, val_baseline,
                 ],
                 outputs=[val_output, val_compat, val_report, val_saved],
+            )
+            val_include_lora.change(
+                fn=lambda incl: gr.update(choices=list_checkpoints(include_lora=incl)),
+                inputs=val_include_lora,
+                outputs=val_ckpt,
             )
             val_cancel_btn.click(fn=stop_inference, outputs=val_report)
 
