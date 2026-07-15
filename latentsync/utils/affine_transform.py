@@ -22,6 +22,15 @@ class AlignRestore(object):
             self.fill_value = torch.tensor([127, 127, 127], device=device, dtype=dtype)
             self.mask = torch.ones((1, 1, self.face_size[1], self.face_size[0]), device=device, dtype=dtype)
 
+    def reset_p_bias(self):
+        """Reset the per-sequence smoothing bias.
+
+        The pipeline calls this across shot/scene boundaries so that the
+        temporal smoothing in ``transformation_from_points`` does not leak
+        state from one speaker/shot to the next.
+        """
+        self.p_bias = None
+
     def align_warp_face(self, img, landmarks3, smooth=True):
         affine_matrix, self.p_bias = self.transformation_from_points(
             landmarks3, self.face_template, smooth, self.p_bias
