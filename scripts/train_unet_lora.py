@@ -285,16 +285,31 @@ def main(config):
         try:
             from peft import PeftModel
             # Some peft versions try to import transformers.integrations.tensor_parallel
-            # even when tensor parallelism is not used. Patch it to a no-op for single-GPU
-            # resume so we don't fail on older/newer transformers combinations.
+            # even when tensor parallelism is not used. Wrap the helper so a missing
+            # tensor_parallel module falls back to the identity path instead of crashing.
             try:
                 import peft.utils.save_and_load as _peft_save_load
                 if hasattr(_peft_save_load, "_maybe_shard_state_dict_for_tp"):
                     _orig_maybe_shard = _peft_save_load._maybe_shard_state_dict_for_tp
-                    _peft_save_load._maybe_shard_state_dict_for_tp = lambda model, state_dict, adapter_name: state_dict
+
+                    def _safe_maybe_shard(model, state_dict, adapter_name):
+                        try:
+                            return _orig_maybe_shard(model, state_dict, adapter_name)
+                        except ModuleNotFoundError:
+                            return state_dict
+
+                    _peft_save_load._maybe_shard_state_dict_for_tp = _safe_maybe_shard
             except Exception:
                 pass
             unet = PeftModel.from_pretrained(unet, adapter_resume_dir)
+            # Defensive: make sure LoRA params are trainable and base params frozen.
+            # In most peft versions from_pretrained already does this, but some
+            # environment combinations leave everything frozen after resume.
+            for name, param in unet.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
             unet.to(device)
         except Exception as e:
             raise RuntimeError(f"Could not load LoRA adapter from {adapter_resume_dir}: {e}") from e
