@@ -3249,7 +3249,7 @@ def build_ui() -> gr.Blocks:
                 )
                 refresh_runs_btn = gr.Button("🔄 刷新 run 列表")
 
-            run_dd = gr.Dropdown(label="run 目录", choices=[], value=None)
+            run_dd = gr.Dropdown(label="run 目录", choices=[], value=None, allow_custom_value=True)
             refresh_runs_btn.click(
                 fn=refresh_runs,
                 inputs=monitor_output_dir,
