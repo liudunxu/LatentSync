@@ -754,8 +754,10 @@ def main(config):
                     )
                     logger.info(f"Saved trainable LoRA params to {adapter_dir}/lora_trainable.pt")
 
-                # Validation
-                logger.info("Running validation... ")
+                # Validation: optionally render at a higher resolution than
+                # training so the user can judge final output quality.
+                val_resolution = int(getattr(config.data, "val_resolution", config.data.resolution))
+                logger.info("Running validation at resolution %dx%d ...", val_resolution, val_resolution)
                 torch.cuda.empty_cache()
                 validation_video_out_path = os.path.join(output_dir, f"val_videos/val_video_{global_step}.mp4")
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -767,8 +769,8 @@ def main(config):
                         num_inference_steps=config.run.inference_steps,
                         guidance_scale=config.run.guidance_scale,
                         weight_dtype=torch.float16,
-                        width=config.data.resolution,
-                        height=config.data.resolution,
+                        width=val_resolution,
+                        height=val_resolution,
                         mask_image_path=config.data.mask_image_path,
                     )
                 logger.info(f"Saved validation video output to {validation_video_out_path}")

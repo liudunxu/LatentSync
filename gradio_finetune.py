@@ -951,6 +951,7 @@ def build_config_from_form(
             "num_workers": int(num_workers),
             "num_frames": int(num_frames),
             "resolution": int(resolution),
+            "val_resolution": 512,
             "mask_image_path": mask_image_path,
             "audio_sample_rate": 16000,
             "video_fps": 25,
