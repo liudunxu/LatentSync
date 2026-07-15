@@ -3577,7 +3577,7 @@ LatentSync 用 **4 层防御** 保证只改嘴部、不改脸：
                     detail_strength = gr.Slider(
                         minimum=0.0,
                         maximum=1.0,
-                        value=0.65,
+                        value=0.0,
                         step=0.05,
                         label="mouth_detail_strength (L4 detail restore)",
                         info="越大越贴原图皮肤纹理（痣、皱纹）。>0.85 会盖掉生成的嘴型",
@@ -3585,7 +3585,7 @@ LatentSync 用 **4 层防御** 保证只改嘴部、不改脸：
                     color_match_strength = gr.Slider(
                         minimum=0.0,
                         maximum=1.0,
-                        value=0.60,
+                        value=0.0,
                         step=0.05,
                         label="color_match_strength",
                         info="越大颜色越平滑（避免 mask 边界色差）。>0.9 可能过度",
@@ -4110,7 +4110,7 @@ def generate_identity_kit(
 
 
 def reset_identity_defaults() -> Tuple[str, int, str, float, float, float]:
-    return "random", 16, "standard", 7.0, 0.65, 0.60
+    return "random", 16, "standard", 7.0, 0.0, 0.0
 
 
 # ---------------------------------------------------------------------------

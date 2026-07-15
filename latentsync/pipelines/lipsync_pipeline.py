@@ -5193,20 +5193,17 @@ class LipsyncPipeline(DiffusionPipeline):
         silent_min_run_frames: int = 8,
         silent_pad_frames: int = 0,
         # Per-frame color transfer from generated to original (inside the
-        # mask). 0 = off, 1 = full mean+std match. Default 0.60.
-        color_match_strength: float = 0.60,
+        # mask). 0 = off, 1 = full mean+std match. Default 0.0 to avoid
+        # washed/pasty mouth artifacts; raise only when mask-boundary tone
+        # drift is visible.
+        color_match_strength: float = 0.0,
         # Unsharp-mask amount applied to the generated mouth region.
-        # 0 = off, 1 = strong sharpen. Default 0.30 (was 0.0): the inpainter's
-        # output tends to be slightly soft -- the diffusion process encourages
-        # plausible-but-not-sharp, so a small amount of unsharp in the mouth
-        # region recovers the high-frequency detail (teeth, lip lines, mouth
-        # corners) that the generated content is missing. 0.30 is in the
-        # "mild" range documented in the unsharp-mask helper; values above
-        # ~0.7 start to look crunchy. Frontend can still override per request.
-        mouth_sharpen_strength: float = 0.30,
+        # 0 = off, 1 = strong sharpen. Default 0.0.
+        mouth_sharpen_strength: float = 0.0,
         # Original-detail restoration outside the central mouth-motion core.
-        # 0 = off, 1 = strong reference detail. Default 0.65.
-        mouth_detail_strength: float = 0.65,
+        # 0 = off, 1 = strong reference detail. Default 0.0 to avoid
+        # texture-overwrite artifacts around the lips.
+        mouth_detail_strength: float = 0.0,
         # --- CodeFormer face-restoration postprocess (added 2026-06) ---
         # When ``codeformer_restorer`` is provided and ``codeformer_enabled``
         # is True, the pipeline runs the released CodeFormer model on every

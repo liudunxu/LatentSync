@@ -141,22 +141,22 @@ logger = logging.getLogger("latentsync.api")
 
 QUALITY_PRESETS = {
     "natural": {
-        "color_match_strength": 0.55,
-        "mouth_detail_strength": 0.55,
-        "mouth_sharpen_strength": 0.20,
-        "mouth_temporal_stabilization_strength": 0.18,
+        "color_match_strength": 0.0,
+        "mouth_detail_strength": 0.0,
+        "mouth_sharpen_strength": 0.0,
+        "mouth_temporal_stabilization_strength": 0.0,
     },
     "balanced": {
-        "color_match_strength": 0.60,
-        "mouth_detail_strength": 0.65,
-        "mouth_sharpen_strength": 0.30,
-        "mouth_temporal_stabilization_strength": 0.15,
+        "color_match_strength": 0.0,
+        "mouth_detail_strength": 0.0,
+        "mouth_sharpen_strength": 0.0,
+        "mouth_temporal_stabilization_strength": 0.0,
     },
     "sharp": {
-        "color_match_strength": 0.65,
-        "mouth_detail_strength": 0.75,
-        "mouth_sharpen_strength": 0.45,
-        "mouth_temporal_stabilization_strength": 0.10,
+        "color_match_strength": 0.0,
+        "mouth_detail_strength": 0.0,
+        "mouth_sharpen_strength": 0.0,
+        "mouth_temporal_stabilization_strength": 0.0,
     },
 }
 
@@ -419,20 +419,14 @@ class LipSyncRequest(BaseModel):
     parsing_mode: str = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
     blend_mask_blur_ratio: float = Field(0.01, ge=0.0, le=0.2)
-    color_match_strength: float = Field(0.60, ge=0.0, le=1.0)
-    mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
+    color_match_strength: float = Field(0.0, ge=0.0, le=1.0)
+    mouth_detail_strength: float = Field(0.0, ge=0.0, le=1.0)
     # Unsharp-mask amount applied to the generated mouth region. 0 = off,
-    # 1 = strong sharpen. Default 0.30 (was 0.0): the inpainter's output
-    # tends to be slightly soft -- the diffusion process encourages
-    # plausible-but-not-sharp, so a small amount of unsharp in the mouth
-    # region recovers the high-frequency detail (teeth, lip lines, mouth
-    # corners) that the generated content is missing. 0.30 is in the
-    # "mild" range documented in the unsharp-mask helper; values above
-    # ~0.7 start to look crunchy. Frontend can still override per request.
-    mouth_sharpen_strength: float = Field(0.30, ge=0.0, le=1.0)
+    # 1 = strong sharpen. Default 0.0 to avoid crunchy artifacts.
+    mouth_sharpen_strength: float = Field(0.0, ge=0.0, le=1.0)
     # Frame-to-frame mouth stabilization. Keep this light: too much carryover
     # damps open-mouth frames and makes speech look under-articulated.
-    mouth_temporal_stabilization_strength: float = Field(0.15, ge=0.0, le=0.6)
+    mouth_temporal_stabilization_strength: float = Field(0.0, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     mouth_audio_adaptive_motion_enabled: bool = True
     # Adaptive motion: preserve more current generated mouth motion,
