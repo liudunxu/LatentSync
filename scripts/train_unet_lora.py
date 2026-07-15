@@ -474,6 +474,8 @@ def main(config):
     sync_loss_list = []
     sync_loss_ema = 0.0
     sync_loss_ema_alpha = 0.95
+    loss_ema = 0.0
+    loss_ema_alpha = 0.95
     lr_list = []
     val_step_list = []
     sync_conf_list = []
@@ -672,13 +674,20 @@ def main(config):
                 + trepa_loss * config.run.trepa_loss_weight
             )
 
+            # EMA-smooth the total loss so the curve is less noisy.
+            loss_val = float(loss.item())
+            if global_step == resume_global_step:
+                loss_ema = loss_val
+            else:
+                loss_ema = loss_ema_alpha * loss_ema + (1 - loss_ema_alpha) * loss_val
+
             if is_main_process:
                 # Log the EMA-smoothed sync value for curves; the raw/backward value
                 # may be clipped, but EMA better reflects the underlying trend.
                 sync_log_val = sync_loss_ema if isinstance(sync_loss, torch.Tensor) else 0.0
 
                 train_step_list.append(global_step)
-                train_loss_list.append(float(loss.item()))
+                train_loss_list.append(loss_val)
                 recon_loss_list.append(float(recon_loss))
                 lpips_loss_list.append(float(lpips_loss))
                 sync_loss_list.append(float(sync_log_val))
@@ -686,7 +695,8 @@ def main(config):
 
                 # ---- Push to experiment tracker (WandB / TensorBoard) ----
                 tracker.log({
-                    "train/loss": loss.item(),
+                    "train/loss": loss_val,
+                    "train/loss_ema": loss_ema,
                     "train/recon": float(recon_loss) if not isinstance(recon_loss, int) else 0.0,
                     "train/sync": float(sync_log_val),
                     "train/lpips": float(lpips_loss) if not isinstance(lpips_loss, int) else 0.0,
@@ -700,13 +710,25 @@ def main(config):
             if config.run.mixed_precision_training:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable_params, config.optimizer.max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, config.optimizer.max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(trainable_params, config.optimizer.max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, config.optimizer.max_grad_norm)
                 optimizer.step()
+
+            # Log gradient norm and weighted loss breakdown after the step.
+            if is_main_process:
+                tracker.log({
+                    "train/grad_norm": float(grad_norm) if torch.is_tensor(grad_norm) else float(grad_norm),
+                    "train/weighted_recon": float(recon_loss) * config.run.recon_loss_weight,
+                    "train/weighted_sync": float(sync_loss_for_backward.item() if torch.is_tensor(sync_loss_for_backward) else sync_loss_for_backward) * config.run.sync_loss_weight,
+                    "train/weighted_lpips": float(lpips_loss) * config.run.perceptual_loss_weight,
+                    "train/weighted_trepa": float(trepa_loss) * config.run.trepa_loss_weight,
+                    "system/gpu_allocated_gb": torch.cuda.memory_allocated() / 1e9,
+                    "system/gpu_reserved_gb": torch.cuda.memory_reserved() / 1e9,
+                }, step=global_step)
 
             lr_scheduler.step()
             progress_bar.update(1)
