@@ -494,7 +494,10 @@ def _preprocess_aligned(
     """Run face alignment on curated videos and write fixed-res outputs."""
     aligned_dir.mkdir(parents=True, exist_ok=True)
 
-    src_paths = sorted(p for p in curated_dir.rglob("*.mp4") if p.is_file())
+    src_paths = sorted(
+        p for p in curated_dir.rglob("*.mp4")
+        if p.is_file() and aligned_dir not in p.parents
+    )
     if not src_paths:
         logger.warning("no curated videos found under %s", curated_dir)
         return 0
