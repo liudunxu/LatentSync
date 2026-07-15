@@ -2314,7 +2314,7 @@ def _merge_adapter_to_temp_pt(
     peft_model = PeftModel.from_pretrained(base, str(adapter_dir), device="cpu")
     merged = peft_model.merge_and_unload()
 
-    out_dir = REPO_ROOT / "debug" / "validation_outputs" / "merged_adapters"
+    out_dir = FINETUNE_BASE_DIR / "debug" / "merged_adapters"
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_pt = out_dir / f"{adapter_dir.name}_{ts}.pt"
