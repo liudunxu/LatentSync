@@ -3822,6 +3822,10 @@ class LipsyncPipeline(DiffusionPipeline):
         mouth_audio_adaptive_motion_enabled = kwargs.get("mouth_audio_adaptive_motion_enabled", True)
         mouth_audio_motion_min_scale = kwargs.get("mouth_audio_motion_min_scale", 0.85)
         mouth_audio_motion_max_scale = kwargs.get("mouth_audio_motion_max_scale", 1.60)
+        # Per-frame dynamic mouth masks are opt-in. The fixed mask.png baseline
+        # (ef3903f) is the default; dynamic masks may help extreme expressions
+        # but can also introduce soft/pasty artifacts in some clips.
+        dynamic_mask_enabled = kwargs.get("dynamic_mask_enabled", False)
         quality_gate_enabled = kwargs.get("quality_gate_enabled", False)
         quality_min_laplacian = kwargs.get("quality_min_laplacian", 0.04)
         quality_min_sharpness_ratio = kwargs.get("quality_min_sharpness_ratio", 0.05)
@@ -4169,11 +4173,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 # keep_mask convention) doesn't matter for the
                 # output.
                 all_dynamic_masks.append(
-                    torch.zeros(
-                        len(inference_skip_mask), 1,
-                        self.image_processor.resolution,
-                        self.image_processor.resolution,
-                    )
+                    fixed_keep_mask.repeat(len(inference_skip_mask), 1, 1, 1)
                 )
                 continue
             if self.unet.add_audio_layer:
@@ -4194,10 +4194,13 @@ class LipsyncPipeline(DiffusionPipeline):
             ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
                 inference_faces, affine_transform=False
             )
-            dynamic_region_mask_batch = torch.stack([
-                self.generate_dynamic_mouth_mask(mi, height, fixed_keep_mask=fixed_keep_mask)
-                for mi in aligned_mouth_info[batch_start:batch_end]
-            ])
+            if dynamic_mask_enabled:
+                dynamic_region_mask_batch = torch.stack([
+                    self.generate_dynamic_mouth_mask(mi, height, fixed_keep_mask=fixed_keep_mask)
+                    for mi in aligned_mouth_info[batch_start:batch_end]
+                ])
+            else:
+                dynamic_region_mask_batch = fixed_keep_mask.repeat(batch_len, 1, 1, 1)
             all_dynamic_masks.append(dynamic_region_mask_batch)
 
             # 7. Prepare mask latent variables
@@ -5014,6 +5017,10 @@ class LipsyncPipeline(DiffusionPipeline):
         mouth_audio_adaptive_motion_enabled: bool = True,
         mouth_audio_motion_min_scale: float = 0.85,
         mouth_audio_motion_max_scale: float = 1.60,
+        # Per-frame dynamic mouth masks are opt-in. The fixed mask.png baseline
+        # is the default; dynamic masks may help extreme expressions but can
+        # also introduce soft/pasty artifacts in some clips.
+        dynamic_mask_enabled: bool = False,
         # Postfilter: skip frames where the generated mouth ROI is clearly
         # blurrier than the original mouth ROI. Checked after paste/detail
         # recovery, and conservative enough to keep closed/low-texture mouths.
