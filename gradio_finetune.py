@@ -2309,9 +2309,24 @@ def _merge_adapter_to_temp_pt(
 
     Used by Tab 3.5 so users can select a LoRA adapter directory directly
     without manually running scripts/merge_lora.py first.
+
+    Reuses an existing merged checkpoint when the (adapter_dir, base_ckpt)
+    pair has already been processed in this session, avoiding redundant
+    4-5 GB writes.
     """
     from latentsync.models.unet import UNet3DConditionModel
+    import hashlib
     import torch
+
+    out_dir = FINETUNE_BASE_DIR / "debug" / "merged_adapters"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stable cache key for this (adapter, base) pair.
+    cache_key = hashlib.md5(f"{adapter_dir.resolve()}:{base_ckpt}".encode()).hexdigest()[:12]
+    cached = sorted(out_dir.glob(f"{adapter_dir.name}_{cache_key}_*.pt"))
+    if cached:
+        logger.info("[validation] reusing merged ckpt for %s: %s", adapter_dir, cached[-1])
+        return cached[-1]
 
     logger.info("[validation] merging adapter %s into base %s", adapter_dir, base_ckpt)
     cfg = OmegaConf.load(unet_config)
@@ -2326,10 +2341,8 @@ def _merge_adapter_to_temp_pt(
     peft_model = PeftModel.from_pretrained(base, str(adapter_dir), device="cpu")
     merged = peft_model.merge_and_unload()
 
-    out_dir = FINETUNE_BASE_DIR / "debug" / "merged_adapters"
-    out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_pt = out_dir / f"{adapter_dir.name}_{ts}.pt"
+    out_pt = out_dir / f"{adapter_dir.name}_{cache_key}_{ts}.pt"
     torch.save({"global_step": 0, "state_dict": merged.state_dict()}, out_pt)
     logger.info("[validation] saved merged ckpt to %s", out_pt)
     return out_pt
