@@ -734,6 +734,7 @@ def main(config):
 
                 # Validation
                 logger.info("Running validation... ")
+                torch.cuda.empty_cache()
                 validation_video_out_path = os.path.join(output_dir, f"val_videos/val_video_{global_step}.mp4")
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     pipeline(
