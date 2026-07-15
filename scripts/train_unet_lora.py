@@ -284,6 +284,16 @@ def main(config):
         )
         try:
             from peft import PeftModel
+            # Some peft versions try to import transformers.integrations.tensor_parallel
+            # even when tensor parallelism is not used. Patch it to a no-op for single-GPU
+            # resume so we don't fail on older/newer transformers combinations.
+            try:
+                import peft.utils.save_and_load as _peft_save_load
+                if hasattr(_peft_save_load, "_maybe_shard_state_dict_for_tp"):
+                    _orig_maybe_shard = _peft_save_load._maybe_shard_state_dict_for_tp
+                    _peft_save_load._maybe_shard_state_dict_for_tp = lambda model, state_dict, adapter_name: state_dict
+            except Exception:
+                pass
             unet = PeftModel.from_pretrained(unet, adapter_resume_dir)
             unet.to(device)
         except Exception as e:
