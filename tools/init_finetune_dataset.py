@@ -58,15 +58,18 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-# HuggingFace Hub 从 0.26 开始默认走 Xet 存储后端。Xet 对匿名/部分网络
-# 环境会偶发 401 (cas-server.xethub.hf.co)，且并发下载容易触发 CAS 错误。
-# 强制回退到普通 HTTP/LFS 可显著提升预置数据集下载成功率。
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-logger = logging.getLogger(__name__)
+import cv2
+import numpy as np
+import torch
+from decord import VideoReader, cpu
+from einops import rearrange
+
+from latentsync.utils.affine_transform import AlignRestore
+from latentsync.utils.face_detector import FaceDetector
+from latentsync.utils.util import write_video_via_ffmpeg
 
 DEFAULT_YAML = REPO_ROOT / "tools" / "prebuilt_datasets.yaml"
 
@@ -342,9 +345,8 @@ def _run_curation(
     return subprocess.call(cmd, cwd=str(REPO_ROOT))
 
 
-def _print_paste_able(recipe_id: str, recipe: dict, output_dir: Path) -> None:
+def _print_paste_able(recipe_id: str, recipe: dict, output_dir: Path, fileslist: Path) -> None:
     """Print copy-paste-able block for gradio Tab 1."""
-    fileslist = output_dir / "fileslist.txt"
     print()
     print("=" * 72)
     print(f"✅ Pre-built dataset ready: {recipe.get('name', recipe_id)}")
@@ -363,6 +365,160 @@ def _print_paste_able(recipe_id: str, recipe: dict, output_dir: Path) -> None:
     print("=" * 72)
 
 
+def _read_video_fps(video_path: Path) -> float:
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    cap.release()
+    return fps
+
+
+def _mux_audio(src_video: str, dst_video: str) -> None:
+    """Copy audio stream from src_video into dst_video (overwrites dst_video)."""
+    tmp_path = dst_video + ".audio_mux.tmp.mp4"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel", "error",
+        "-nostdin",
+        "-i", src_video,
+        "-i", dst_video,
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-map", "1:v:0",
+        "-map", "0:a:0?",
+        "-shortest",
+        tmp_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return
+    os.replace(tmp_path, dst_video)
+
+
+def _align_one_video(
+    src_path: Path,
+    dst_path: Path,
+    detector: FaceDetector,
+    restorer: AlignRestore,
+    resolution: int,
+    det_threshold: float,
+    max_fail_ratio: float,
+) -> bool:
+    """Align faces in one video. Returns True if output was written."""
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        vr = VideoReader(str(src_path), ctx=cpu(0))
+        total = len(vr)
+        if total < 30:
+            logger.warning("skip %s: too short (%d frames)", src_path, total)
+            return False
+        frames = vr[:].asnumpy()
+        vr.seek(0)
+    except Exception as exc:
+        logger.warning("failed to read %s: %s", src_path, exc)
+        return False
+
+    restorer.p_bias = None
+    aligned_frames: List[np.ndarray] = []
+    last_face: Optional[np.ndarray] = None
+    n_fail = 0
+
+    for frame in frames:
+        try:
+            bbox, lmk = detector(frame, threshold=det_threshold)
+            if bbox is None or lmk is None:
+                raise RuntimeError("face not detected")
+
+            pt_left_eye = np.mean(lmk[[43, 48, 49, 51, 50]], axis=0)
+            pt_right_eye = np.mean(lmk[101:106], axis=0)
+            pt_nose = np.mean(lmk[[74, 77, 83, 86]], axis=0)
+            landmarks3 = np.array([pt_left_eye, pt_right_eye, pt_nose])
+
+            face, _ = restorer.align_warp_face(frame.copy(), landmarks3=landmarks3, smooth=True)
+            face = cv2.resize(face, (resolution, resolution), interpolation=cv2.INTER_LANCZOS4)
+            last_face = face
+        except Exception:
+            n_fail += 1
+            if last_face is None:
+                logger.warning("skip %s: face detection failed on first frame", src_path)
+                return False
+            face = last_face.copy()
+
+        aligned_frames.append(face)
+
+    fail_ratio = n_fail / total
+    if fail_ratio > max_fail_ratio:
+        logger.warning(
+            "skip %s: fail ratio %.2f > %.2f", src_path, fail_ratio, max_fail_ratio
+        )
+        return False
+
+    if len(aligned_frames) != total:
+        logger.warning("skip %s: frame count mismatch", src_path)
+        return False
+
+    aligned_stack = np.stack(aligned_frames)
+    fps = _read_video_fps(src_path)
+    try:
+        write_video_via_ffmpeg(str(dst_path), aligned_stack, fps=int(fps), crf=13)
+        _mux_audio(str(src_path), str(dst_path))
+    except Exception as exc:
+        logger.warning("failed to write %s: %s", dst_path, exc)
+        if os.path.exists(dst_path):
+            os.unlink(dst_path)
+        return False
+
+    return True
+
+
+def _preprocess_aligned(
+    curated_dir: Path,
+    aligned_dir: Path,
+    *,
+    resolution: int = 512,
+    device: str = "cuda",
+    det_threshold: float = 0.3,
+    max_fail_ratio: float = 0.2,
+) -> int:
+    """Run face alignment on curated videos and write fixed-res outputs."""
+    aligned_dir.mkdir(parents=True, exist_ok=True)
+
+    src_paths = sorted(p for p in curated_dir.rglob("*.mp4") if p.is_file())
+    if not src_paths:
+        logger.warning("no curated videos found under %s", curated_dir)
+        return 0
+
+    logger.info(
+        "aligning %d curated videos to %dx%d on %s ...",
+        len(src_paths), resolution, resolution, device,
+    )
+
+    detector = FaceDetector(device=device, skip_side_face_threshold=None)
+    restorer = AlignRestore(resolution=resolution, device=device, dtype=torch.float32)
+
+    kept = 0
+    for src in src_paths:
+        rel = src.relative_to(curated_dir)
+        dst = aligned_dir / rel
+        if _align_one_video(src, dst, detector, restorer, resolution, det_threshold, max_fail_ratio):
+            kept += 1
+            logger.info("aligned %s", rel)
+
+    logger.info("alignment done: kept %d / %d", kept, len(src_paths))
+    return kept
+
+
+def _write_fileslist_from_dir(written: List[Path], fileslist_path: Path) -> None:
+    """One path per line, no header. Readable by LatentSync dataset loaders."""
+    with open(fileslist_path, "w") as f:
+        for p in sorted(written):
+            f.write(str(p.resolve()) + "\n")
+
+
 def init_one(
     recipe_id: str,
     recipe: dict,
@@ -370,11 +526,17 @@ def init_one(
     output_root: Path,
     n_clips_override: Optional[int] = None,
     hf_token: Optional[str] = None,
+    align: bool = True,
+    align_resolution: int = 512,
+    align_device: str = "cuda",
+    align_det_threshold: float = 0.3,
+    align_max_fail_ratio: float = 0.2,
 ) -> Path:
     """Initialize one prebuilt dataset. Returns the output dir."""
     output_dir = output_root / recipe_id
     raw_dir = output_dir / "_raw"
     curated_dir = output_dir / "curated"
+    aligned_dir = curated_dir / "aligned"
 
     n_clips = n_clips_override or recipe.get("n_clips", 1000)
     ratio = recipe.get("target_ratio") or DEFAULT_TARGET_RATIO
@@ -404,24 +566,52 @@ def init_one(
     if rc != 0:
         raise SystemExit(f"❌ [{recipe_id}] curation failed (rc={rc})")
 
-    # Write a top-level fileslist.txt that points at the curated buckets,
+    # Optional face-alignment preprocessing. This turns raw curated videos
+    # into fixed-resolution face crops so the UNetDataset can train with
+    # affine_transform=False while still seeing aligned faces.
+    if align:
+        _preprocess_aligned(
+            curated_dir=curated_dir,
+            aligned_dir=aligned_dir,
+            resolution=align_resolution,
+            device=align_device,
+            det_threshold=align_det_threshold,
+            max_fail_ratio=align_max_fail_ratio,
+        )
+
+    # Decide which directory supplies the training files:
+    # aligned videos win when they exist; otherwise fall back to curated.
+    if aligned_dir.exists() and any(aligned_dir.rglob("*.mp4")):
+        fileslist_dir = aligned_dir
+        fileslist_source = aligned_dir
+    else:
+        fileslist_dir = curated_dir
+        fileslist_source = curated_dir
+
+    # Write a top-level fileslist.txt that points at the chosen directory,
     # so the user can drop it straight into gradio Tab 1.
     curated_fileslist = curated_dir / "fileslist.txt"
     top_fileslist = output_dir / "fileslist.txt"
+    target_fileslist = fileslist_dir / "fileslist.txt"
     kept = 0
     if curated_fileslist.exists():
-        kept = len([line for line in curated_fileslist.read_text().splitlines() if line.strip()])
+        # If we have aligned outputs, build the fileslist from aligned dir;
+        # otherwise copy the existing curated fileslist.
+        if fileslist_source == aligned_dir:
+            aligned_paths = sorted(p for p in aligned_dir.rglob("*.mp4") if p.is_file())
+            _write_fileslist_from_dir(aligned_paths, target_fileslist)
+        kept = len([line for line in target_fileslist.read_text().splitlines() if line.strip()])
         if kept == 0:
             raise SystemExit(
-                f"❌ [{recipe_id}] curation produced an empty fileslist.\n"
-                f"   Likely face detection failed (missing InsightFace checkpoints).\n"
+                f"❌ [{recipe_id}] produced an empty fileslist.\n"
+                f"   Likely face detection/alignment failed.\n"
                 f"   Run: python tools/download_checkpoints.py\n"
-                f"   Then retry."
+                f"   Then retry, or pass --no-align to skip alignment."
             )
-        shutil.copy2(curated_fileslist, top_fileslist)
+        shutil.copy2(target_fileslist, top_fileslist)
 
-    _print_paste_able(recipe_id, recipe, curated_dir)
-    return curated_dir
+    _print_paste_able(recipe_id, recipe, fileslist_dir, target_fileslist)
+    return fileslist_dir
 
 
 def main():
@@ -448,6 +638,16 @@ def main():
     parser.add_argument("--hf-token", type=str, default=None,
                         help="HuggingFace token for gated datasets. Falls back to "
                              "HF_TOKEN / HUGGINGFACE_TOKEN env var.")
+    parser.add_argument("--align", action=argparse.BooleanOptionalAction, default=True,
+                        help="run face alignment after curation (default: True)")
+    parser.add_argument("--align-resolution", type=int, default=512,
+                        help="resolution of aligned output videos (default: 512)")
+    parser.add_argument("--align-device", type=str, default="cuda",
+                        help="device for face alignment (default: cuda)")
+    parser.add_argument("--align-det-threshold", type=float, default=0.3,
+                        help="InsightFace detection threshold for alignment (default: 0.3)")
+    parser.add_argument("--align-max-fail-ratio", type=float, default=0.2,
+                        help="max ratio of frames allowed to fail detection (default: 0.2)")
     parser.add_argument("--log", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -480,7 +680,12 @@ def main():
                 init_one(recipe_id, recipes[recipe_id],
                          output_root=output_root,
                          n_clips_override=args.n_clips,
-                         hf_token=hf_token)
+                         hf_token=hf_token,
+                         align=args.align,
+                         align_resolution=args.align_resolution,
+                         align_device=args.align_device,
+                         align_det_threshold=args.align_det_threshold,
+                         align_max_fail_ratio=args.align_max_fail_ratio)
             except SystemExit as exc:
                 print(f"⚠️  {exc}", file=sys.stderr)
                 continue
@@ -490,7 +695,12 @@ def main():
         init_one(args.dataset, recipes[args.dataset],
                  output_root=output_root,
                  n_clips_override=args.n_clips,
-                 hf_token=hf_token)
+                 hf_token=hf_token,
+                 align=args.align,
+                 align_resolution=args.align_resolution,
+                 align_device=args.align_device,
+                 align_det_threshold=args.align_det_threshold,
+                 align_max_fail_ratio=args.align_max_fail_ratio)
 
     return 0
 
