@@ -153,13 +153,22 @@ def _upload_to_hub(repo_dir: Path, repo_id: str, token: str) -> None:
         )
 
     api = HfApi(token=token)
-    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
-    api.upload_folder(
-        folder_path=str(repo_dir),
-        repo_id=repo_id,
-        repo_type="model",
-        commit_message="Upload merged LatentSync UNet (LoRA finetune)",
-    )
+    try:
+        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+        api.upload_folder(
+            folder_path=str(repo_dir),
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message="Upload merged LatentSync UNet (LoRA finetune)",
+        )
+    except Exception as exc:
+        # Re-raise with an actionable hint so callers can decide whether to
+        # treat upload failure as fatal. Local merge output is already saved.
+        raise RuntimeError(
+            f"HF Hub upload to '{repo_id}' failed: {exc}. "
+            f"Make sure '{repo_id}' is a valid repo id in 'username/repo_name' format, "
+            "the repo exists (or your token can create it), and your token has write access."
+        ) from exc
     print(f"[merge_lora] Pushed to https://huggingface.co/{repo_id}")
 
 
@@ -206,16 +215,33 @@ def main():
     # ---- Optional: HuggingFace Hub sync ----
     if args.push_to_hub:
         repo_id = args.push_to_hub
+        if "/" not in repo_id or repo_id.startswith("/") or repo_id.endswith("/"):
+            print(
+                f"[merge_lora] ERROR: --push_to_hub must be a repo id in 'username/repo_name' format, "
+                f"got '{repo_id}'."
+            )
+            print(
+                "[merge_lora] Example: --push_to_hub myuser/latentsync-finetune-v1"
+            )
+            print(
+                "[merge_lora] Note: this is NOT your HF token. Local merged checkpoint is still saved."
+            )
+            sys.exit(1)
+
         if args.hub_token_env:
             token = os.environ.get(args.hub_token_env, "")
         else:
             token = _hub_token()
 
         if not token:
-            sys.exit(
-                "HF Hub token not set. Set HF_TOKEN (or HUGGINGFACE_TOKEN) "
+            print(
+                "[merge_lora] ERROR: HF Hub token not set. Set HF_TOKEN (or HUGGINGFACE_TOKEN) "
                 "in your env, or pass --hub_token_env MY_VAR to read a custom one."
             )
+            print(
+                "[merge_lora] Local merged checkpoint is still saved; upload it manually later."
+            )
+            sys.exit(1)
 
         # Build a Hub-friendly folder next to the merged .pt. Layout is:
         #   <repo>/
@@ -261,7 +287,12 @@ def main():
 
         print(f"[merge_lora] Staging hub-ready dir at {repo_dir}")
         print(f"[merge_lora] Pushing to HF Hub repo {repo_id} ...")
-        _upload_to_hub(repo_dir, repo_id=repo_id, token=token)
+        try:
+            _upload_to_hub(repo_dir, repo_id=repo_id, token=token)
+        except Exception as exc:
+            print(f"[merge_lora] WARNING: HF Hub upload failed: {exc}")
+            print(f"[merge_lora] Local merged checkpoint is still available at {args.out_ckpt}")
+            print(f"[merge_lora] Hub-ready folder (for manual upload): {repo_dir}")
 
     print(f"[merge_lora] Done. Use it with the standard inference command.")
 
