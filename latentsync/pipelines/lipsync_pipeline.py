@@ -3883,6 +3883,49 @@ class LipsyncPipeline(DiffusionPipeline):
         codeformer_post_ema_track_aware = kwargs.get("codeformer_post_ema_track_aware", True)
         codeformer_restorer = kwargs.get("codeformer_restorer")
 
+        # Baseline mode: strip away all quality optimizations and run the bare
+        # diffusion + fixed-mask pipeline. This makes it easy to A/B test
+        # whether recent post-processing, prefilters, or scene-splitting are
+        # responsible for artifacts like cotton-mouth / pasted-looking mouths.
+        if kwargs.get("baseline_mode", False):
+            logger.info("[LipSync] baseline_mode=True: disabling quality optimizations")
+            audio_sync_offset_seconds = 0.0
+            per_speaker_reference = False
+            apply_identity_filter = False
+            identity_yaw_adaptive_enabled = False
+            mouth_motion_preserve_strength = 0.0
+            mouth_temporal_stabilization_strength = 0.0
+            mouth_temporal_stabilization_max_delta = 0.0
+            mouth_audio_adaptive_motion_enabled = False
+            mouth_audio_motion_min_scale = 1.0
+            mouth_audio_motion_max_scale = 1.0
+            dynamic_mask_enabled = False
+            quality_gate_enabled = False
+            adaptive_quality_fallback_enabled = False
+            yaw_skip_threshold = 90.0
+            yaw_rate_skip_threshold = 999.0
+            side_face_passthrough_yaw_threshold = 0.0
+            side_face_episode_pre_pad = 0
+            side_face_episode_post_pad = 0
+            side_face_blend_fade_frames = 0
+            side_face_warn_min_run_frames = 0
+            side_face_warn_min_run_seconds = 0.0
+            mouth_occlusion_skip_threshold = 1.0
+            motion_blur_skip_threshold = 0.0
+            face_jump_center_threshold = 0.0
+            face_jump_scale_threshold = 0.0
+            lipsync_mouth_diff_break_threshold = 1.0
+            segment_consistency_hard_cut_enabled = False
+            scene_cut_break_enabled = False
+            scene_split_threshold = 1.0  # disable scene splitting
+            shot_passthrough_enabled = False
+            silent_skip_enabled = False
+            color_match_strength = 0.0
+            mouth_detail_strength = 0.0
+            mouth_sharpen_strength = 0.0
+            codeformer_enabled = False
+            aligned_mouth_ema_alpha = 0.0
+
         # Guard against empty clips. This can happen when scene splitting produces
         # an out-of-bounds or zero-length scene (e.g. audio features shorter than
         # video frames), and prevents the downstream torch.cat from crashing.
@@ -4975,6 +5018,10 @@ class LipsyncPipeline(DiffusionPipeline):
         # video. We use earlier audio features to drive each frame, and delay
         # the output audio by padding zeros at the start.
         audio_sync_offset_seconds: float = 0.0,
+        # Baseline mode: disable all quality optimizations and run the bare
+        # diffusion + fixed mask pipeline. Useful for A/B debugging when
+        # post-processing, prefilters, or scene-splitting cause artifacts.
+        baseline_mode: bool = False,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 40,

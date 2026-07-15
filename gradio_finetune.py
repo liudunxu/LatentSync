@@ -2058,6 +2058,7 @@ def run_compare(
     guidance_scale: float,
     seed: int,
     resolution: int,
+    baseline_mode: bool = False,
 ) -> Tuple[str, str]:
     """Run inference twice (base vs fine-tuned) and return the two mp4 paths."""
     if not video_path or not audio_path:
@@ -2115,6 +2116,8 @@ def run_compare(
             "--temp_dir",
             "temp",
         ]
+        if baseline_mode:
+            cmd.append("--baseline_mode")
         # resolution override
         cfg = OmegaConf.load(config_path)
         cfg.data.resolution = int(resolution)
@@ -2334,6 +2337,7 @@ def run_validation(
     resolution: int,
     enable_deepcache: bool,
     skip_quality_check: bool,
+    baseline_mode: bool = False,
 ) -> Tuple[Any, Any, Any, Any]:
     """Kick off Tab-3.5 single-ckpt inference in the background.
 
@@ -2409,6 +2413,8 @@ def run_validation(
     ]
     if enable_deepcache:
         cmd.append("--enable_deepcache")
+    if baseline_mode:
+        cmd.append("--baseline_mode")
     log_path = out_dir / f"validation_{ts}.log"
 
     if not _INFERENCE.start(
@@ -3397,6 +3403,7 @@ def build_ui() -> gr.Blocks:
                 cmp_steps = gr.Slider(10, 50, value=20, step=1, label="inference_steps")
                 cmp_guidance = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="guidance_scale")
                 cmp_seed = gr.Number(value=1247, label="seed", precision=0)
+                cmp_baseline = gr.Checkbox(value=False, label="基线模式（禁用所有质量优化）")
 
             with gr.Row():
                 cmp_btn = gr.Button("🎬 生成对比", variant="primary", scale=3)
@@ -3412,6 +3419,7 @@ def build_ui() -> gr.Blocks:
                 inputs=[
                     cmp_video, cmp_audio, cmp_base, cmp_ft,
                     cmp_steps, cmp_guidance, cmp_seed, cmp_resolution,
+                    cmp_baseline,
                 ],
                 outputs=[cmp_out_base, cmp_out_ft],
             )
@@ -3459,6 +3467,7 @@ def build_ui() -> gr.Blocks:
                 val_seed = gr.Number(value=1247, label="seed", precision=0)
                 val_deepcache = gr.Checkbox(value=True, label="enable_deepcache (快 2x)")
                 val_skip_qc = gr.Checkbox(value=True, label="跳过质量自检（更快）")
+                val_baseline = gr.Checkbox(value=False, label="基线模式（禁用所有质量优化）")
 
             with gr.Row():
                 val_btn = gr.Button("🚀 推理 + 质量自检", variant="primary", scale=3)
@@ -3474,7 +3483,7 @@ def build_ui() -> gr.Blocks:
                 inputs=[
                     val_video, val_audio, val_ckpt, val_config,
                     val_steps, val_guidance, val_seed, val_resolution,
-                    val_deepcache, val_skip_qc,
+                    val_deepcache, val_skip_qc, val_baseline,
                 ],
                 outputs=[val_output, val_compat, val_report, val_saved],
             )
