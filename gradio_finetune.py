@@ -1320,6 +1320,9 @@ def launch_training(
         log_path = log_dir / f"{log_kind}_{ts}.log"
 
         env = os.environ.copy()
+        # Help PyTorch avoid CUDA memory fragmentation during long training runs,
+        # especially at high resolution (512) where VAE decode activations are large.
+        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         if extra_env.strip():
             for kv in extra_env.strip().splitlines():
                 if "=" in kv:
