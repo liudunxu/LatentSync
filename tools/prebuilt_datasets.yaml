@@ -99,6 +99,8 @@ datasets:
     hf_allow: ["lip_sync/*.mp4", "lip_sync_v2/*.mp4"]
     n_clips: 1500
     target_ratio: {frontal: 0.25, side_face: 0.60, fast_motion: 0.15}
+    curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 60, det_threshold: 0.2}
+    align_args: {det_threshold: 0.2, max_fail_ratio: 0.5}
     description: |
       CelebV-HQ 中专注于头部说话的 512×512 片段。lip_sync / lip_sync_v2
       子集包含丰富的 yaw 变化与转头动作,侧脸桶提到 60%,专门用来改善

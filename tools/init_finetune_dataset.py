@@ -585,14 +585,16 @@ def init_one(
     # Optional face-alignment preprocessing. This turns raw curated videos
     # into fixed-resolution face crops so the UNetDataset can train with
     # affine_transform=False while still seeing aligned faces.
+    # Per-recipe align_args can relax thresholds for hard datasets (e.g. side-face).
     if align:
+        align_args = recipe.get("align_args", {})
         _preprocess_aligned(
             curated_dir=curated_dir,
             aligned_dir=aligned_dir,
             resolution=align_resolution,
             device=align_device,
-            det_threshold=align_det_threshold,
-            max_fail_ratio=align_max_fail_ratio,
+            det_threshold=align_args.get("det_threshold", align_det_threshold),
+            max_fail_ratio=align_args.get("max_fail_ratio", align_max_fail_ratio),
         )
 
     # Decide which directory supplies the training files:
