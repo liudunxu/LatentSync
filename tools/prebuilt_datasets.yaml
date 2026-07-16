@@ -105,15 +105,14 @@ datasets:
     n_clips: 1500
     target_ratio: {frontal: 0.25, side_face: 0.60, fast_motion: 0.15}
     curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 70, det_threshold: 0.2}
-    align_args: {det_threshold: 0.15, max_fail_ratio: 0.6, side_face_max_fail_ratio: 0.85}
+    align_args: {det_threshold: 0.10, max_fail_ratio: 0.6, side_face_max_fail_ratio: 0.85}
     description: |
       CelebV-HQ 中专注于头部说话的 512×512 片段。覆盖仓库全部四个子集
       (lip_sync / lip_sync_2 / head_talk / head_talk_2,~23k 候选),
       yaw 变化与转头动作丰富,侧脸桶提到 60%,专门用来改善侧脸唇形同步
-      badcase。已放宽对齐阈值(det 0.15 / max_fail 0.6)与 yaw_side_max(70°),
-      尽量召回更多侧脸/转头样本。side_face 桶单独用 0.85 的 max_fail_ratio
-      (侧脸帧 InsightFace 检测本就频繁失败,但人脸仍在、位姿相近,用上一个
-      检出帧补帧几何上合理)。
+      badcase。curation 已做质量门控,alignment 不再因 fail ratio 丢 clip
+      (只在从未检出人脸时丢),侧脸/转头片段靠补帧保留——这是这类数据
+      的正常处理。det_threshold 降到 0.10 提高逐帧检出率、减少补帧。
     typical_use: "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)"
 
   - id: celebv_hq_head_talk_side_big_mouth
@@ -124,7 +123,7 @@ datasets:
     n_clips: 1500
     target_ratio: {frontal: 0.25, side_face: 0.60, fast_motion: 0.15}
     curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 70, det_threshold: 0.2, mouth_open_min: 0.22, mouth_open_min_mode: p95}
-    align_args: {det_threshold: 0.15, max_fail_ratio: 0.6, side_face_max_fail_ratio: 0.85}
+    align_args: {det_threshold: 0.10, max_fail_ratio: 0.6, side_face_max_fail_ratio: 0.85}
     description: |
       同 celebv_hq_head_talk_side 的数据源(四子集全覆盖),但在 curate 阶段
       额外用 mouth_openness 的 p95(峰值开合)≥0.22 筛选出张嘴幅度更大的片段。

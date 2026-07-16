@@ -469,12 +469,20 @@ def _align_one_video(
         aligned_frames[:0] = [last_face.copy()] * n_leading_missing
         # These leading frames were already counted in n_fail above.
 
+    # curation already gated on quality (face_detected_ratio / yaw / mouth),
+    # so alignment should be a format conversion, not a second quality filter.
+    # Side-face / head-turn clips legitimately fail InsightFace's frontal
+    # detector on most frames; padding those misses with the last detected
+    # (same-pose) frame is the normal handling. Only drop a clip that never
+    # produced a single usable face. Log the fail ratio so heavy-padding
+    # clips are still visible in the logs.
     fail_ratio = n_fail / total
     if fail_ratio > max_fail_ratio:
         logger.warning(
-            "skip %s: fail ratio %.2f > %.2f", src_path, fail_ratio, max_fail_ratio
+            "high fail ratio %.2f on %s (threshold %.2f); keeping — "
+            "curated quality gate already passed, padding missed frames",
+            fail_ratio, src_path, max_fail_ratio,
         )
-        return False
 
     if len(aligned_frames) != total:
         logger.warning("skip %s: frame count mismatch", src_path)
