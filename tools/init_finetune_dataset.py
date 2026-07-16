@@ -502,8 +502,17 @@ def _preprocess_aligned(
     device: str = "cuda",
     det_threshold: float = 0.3,
     max_fail_ratio: float = 0.2,
+    side_face_max_fail_ratio: Optional[float] = None,
 ) -> int:
-    """Run face alignment on curated videos and write fixed-res outputs."""
+    """Run face alignment on curated videos and write fixed-res outputs.
+
+    `side_face_max_fail_ratio` (if set) overrides `max_fail_ratio` for clips
+    in the side_face bucket. Side-face clips inherently fail InsightFace's
+    frontal-biased detector on many frames even though the face is still
+    present in roughly the same pose, so copying the last detected (side-face)
+    frame for missed frames is geometrically defensible — unlike frontal
+    clips, where a high fail ratio means the face really isn't there.
+    """
     aligned_dir.mkdir(parents=True, exist_ok=True)
 
     # Only process the curated bucket directories (frontal / side_face /
@@ -521,8 +530,11 @@ def _preprocess_aligned(
         return 0
 
     logger.info(
-        "aligning %d curated videos to %dx%d on %s ...",
+        "aligning %d curated videos to %dx%d on %s "
+        "(side_face max_fail_ratio=%s, others=%s) ...",
         len(src_paths), resolution, resolution, device,
+        side_face_max_fail_ratio if side_face_max_fail_ratio is not None else max_fail_ratio,
+        max_fail_ratio,
     )
 
     detector = FaceDetector(device=device, skip_side_face_threshold=None)
@@ -532,7 +544,13 @@ def _preprocess_aligned(
     for src in src_paths:
         rel = src.relative_to(curated_dir)
         dst = aligned_dir / rel
-        if _align_one_video(src, dst, detector, restorer, resolution, det_threshold, max_fail_ratio):
+        bucket = rel.parts[0] if rel.parts else ""
+        fail_ratio = (
+            side_face_max_fail_ratio
+            if bucket == "side_face" and side_face_max_fail_ratio is not None
+            else max_fail_ratio
+        )
+        if _align_one_video(src, dst, detector, restorer, resolution, det_threshold, fail_ratio):
             kept += 1
             logger.info("aligned %s", rel)
 
@@ -607,6 +625,7 @@ def init_one(
             device=align_device,
             det_threshold=align_args.get("det_threshold", align_det_threshold),
             max_fail_ratio=align_args.get("max_fail_ratio", align_max_fail_ratio),
+            side_face_max_fail_ratio=align_args.get("side_face_max_fail_ratio"),
         )
 
     # Decide which directory supplies the training files:
