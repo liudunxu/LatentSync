@@ -29,9 +29,10 @@
 #                   for small seed datasets, e.g.
 #                   {min_frames: 16, face_detected_ratio: 0.2}.
 #                   Also supports mouth_open_min to keep only clips whose
-#                   average mouth openness (lip height / lip width) exceeds
-#                   the threshold, e.g. {mouth_open_min: 0.12} for bigger
-#                   mouth shapes.
+#                   mouth openness exceeds the threshold, e.g. {mouth_open_min: 0.22}
+#                   for bigger mouth shapes. Pair with mouth_open_min_mode
+#                   (mean/max/p95, default p95) — p95 captures peak big-open
+#                   moments and recalls far more clips than the mean.
 #   description   — multi-line; surfaces in the gradio dropdown
 #                   description and in the post-curation paste-able
 #                   instructions.
@@ -103,12 +104,13 @@ datasets:
     hf_allow: ["lip_sync/*.mp4", "lip_sync_v2/*.mp4"]
     n_clips: 1500
     target_ratio: {frontal: 0.25, side_face: 0.60, fast_motion: 0.15}
-    curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 60, det_threshold: 0.2}
-    align_args: {det_threshold: 0.2, max_fail_ratio: 0.5}
+    curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 70, det_threshold: 0.2}
+    align_args: {det_threshold: 0.15, max_fail_ratio: 0.6}
     description: |
       CelebV-HQ 中专注于头部说话的 512×512 片段。lip_sync / lip_sync_v2
       子集包含丰富的 yaw 变化与转头动作,侧脸桶提到 60%,专门用来改善
-      侧脸唇形同步 badcase。
+      侧脸唇形同步 badcase。已放宽对齐阈值(det 0.15 / max_fail 0.6)与
+      yaw_side_max(70°),尽量召回更多侧脸/转头样本。
     typical_use: "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)"
 
   - id: celebv_hq_head_talk_side_big_mouth
@@ -118,13 +120,13 @@ datasets:
     hf_allow: ["lip_sync/*.mp4", "lip_sync_v2/*.mp4"]
     n_clips: 1500
     target_ratio: {frontal: 0.25, side_face: 0.60, fast_motion: 0.15}
-    curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 60, det_threshold: 0.2, mouth_open_min: 0.12}
-    align_args: {det_threshold: 0.2, max_fail_ratio: 0.5}
+    curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 70, det_threshold: 0.2, mouth_open_min: 0.22, mouth_open_min_mode: p95}
+    align_args: {det_threshold: 0.15, max_fail_ratio: 0.6}
     description: |
       同 celebv_hq_head_talk_side 的数据源,但在 curate 阶段额外用
-      mouth_openness(嘴高/嘴宽)≥0.12 筛选出张嘴幅度更大的片段。
-      适合「侧脸+大嘴形」badcase 的专项强化;总数会比原版少,但嘴形
-      动态更丰富。
+      mouth_openness 的 p95(峰值开合)≥0.22 筛选出张嘴幅度更大的片段。
+      p95 比 mean 召回更多大嘴样本(说话片段大部分时间闭嘴,mean 会被拉低)。
+      适合「侧脸+大嘴形」badcase 的专项强化,改善微调后张嘴幅度偏小。
     typical_use: "💋 Side-Face + Big Mouth (LoRA+conv, 18-22GB)"
 
   - id: lipsync_full_159

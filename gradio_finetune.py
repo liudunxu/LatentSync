@@ -291,7 +291,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "pixel_space_supervise": True,
         "use_syncnet": True,
         # 侧脸时唇被遮 ~30-50%,必须强推 audio-driven 想象
-        "sync_loss_weight": 0.12,
+        "sync_loss_weight": 0.15,
         # 唇部纹理在侧脸时 shading 不同,提权
         "perceptual_loss_weight": 0.25,
         "recon_loss_weight": 1.0,
@@ -308,9 +308,10 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             "💋 **推荐 — 侧脸唇形质量 (yaw 15-30°)**\n"
             "针对侧脸时嘴部遮挡 (~30-50%) + 唇纹理变化的双重挑战。\n"
             "LoRA target 加 conv(11 项,同 Structural),rank=48 留更多 capacity 学唇形。\n"
-            "sync_loss=0.18 强推唇音同步; perceptual=0.25 锐化唇部纹理;\n"
+            "sync_loss=0.15 强推唇音同步(并改善张嘴幅度偏小); perceptual=0.25 锐化唇部纹理;\n"
             "num_frames=16 (SyncNet 只支持 16 帧),motion module 补偿时序连贯。\n"
-            "数据:用 celebv_hq_side recipe(side_face 桶 ≥ 50%)。"
+            "数据:用 celebv_hq_head_talk_side_big_mouth recipe(p95≥0.22 大嘴筛选)\n"
+            "改善微调后张嘴幅度偏小;侧脸召回用 celebv_hq_head_talk_side。"
         ),
         "lora": {
             "enabled": True,
@@ -354,7 +355,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "description": (
             "🟣 **推荐 — 短剧 (多说话人/频繁切场景)**\n"
             "LoRA target 加 conv(同 Structural Fix 11 项),\n"
-            "sync_loss=0.18 容错低,save_ckpt_steps=500 短段多存。\n"
+            "sync_loss=0.12 容错低,save_ckpt_steps=500 短段多存。\n"
             "数据准备:用 tools/preprocess_short_drama.py 把剧按场景切,\n"
             "再走 curate_finetune_samples.py 分桶。\n"
             "通用 baseline 见 ⚪ Stage 2 LoRA,单人 badcase 见 🟢 🎯 Badcase Fix。"
@@ -3791,6 +3792,7 @@ pipe(
 | 闪烁评分 | < 8 | 嘴部帧间平均像素差 |
 | 唇音同步 | > 7 | SyncNet confidence |
 | 身份保持 | > 0.8 | Face embedding 余弦相似度 |
+| 张嘴幅度 p95 | > 0.18 | 95 分位 嘴高/嘴宽；偏小→大嘴数据重训 |
 
 ### Badcase → 推荐操作 速查
 
@@ -3804,6 +3806,7 @@ pipe(
 | **训练后 sync_conf 退化** | 训练前后 sync 下降 > 1 | (训练配置)勾 `freeze_attn2` 重训 | — |
 | **显存 OOM** | torch OOM 日志 | 切 Stage 2 QLoRA | — |
 | **生成的嘴没动但能听到声音** | `唇音同步 ≈ 1` (没生成) | 看训练日志 `[FaceMatch]` 哪个 filter 跳了 — 通常是 `yaw_skip` 或 `face_jump` | Stage 2 LoRA + 多角度训练数据 |
+| **张嘴幅度小 (嘴张不开)** | `张嘴幅度 p95 < 0.18` | 用 📚 `celebv_hq_head_talk_side_big_mouth` (p95≥0.22) 数据重训 | 💋 Side-Face Lip Quality (sync_loss=0.15) |
 
 **数据先行原则**:finetune 只能缓解,不能根治。`Tab 5` 先跑一遍数据集质量评估,HyperIQA 分布去掉 < 40 的样本后再训,事半功倍。
                 """
@@ -3825,10 +3828,14 @@ pipe(
                         label="平均 yaw (°; 0=正面, ≥15°=侧脸, ≥25°=重度侧脸)",
                         precision=1,
                     )
+                    bc_mouth = gr.Number(
+                        label="张嘴幅度 p95 (目标 > 0.18; 偏小→用大嘴数据重训)",
+                        precision=2,
+                    )
                 with gr.Column():
                     bc_report = gr.Textbox(label="诊断报告", lines=20)
                     bc_recommendation = gr.Textbox(
-                        label="🎯 finetune preset 推荐 (基于上面 5 个数字自动判定)",
+                        label="🎯 finetune preset 推荐 (基于上面 6 个数字自动判定)",
                         lines=4,
                         interactive=False,
                         value="跑完上方 🔍 检测后,这里会自动出推荐 preset。",
@@ -3837,17 +3844,17 @@ pipe(
             bc_check_btn.click(
                 fn=run_badcase_checklist,
                 inputs=[bc_video, bc_reference],
-                outputs=[bc_blurry, bc_flicker, bc_sync, bc_identity, bc_yaw, bc_report],
+                outputs=[bc_blurry, bc_flicker, bc_sync, bc_identity, bc_yaw, bc_mouth, bc_report],
             )
 
-            # Whenever any of the 5 metric numbers change, refresh the
+            # Whenever any of the 6 metric numbers change, refresh the
             # preset recommendation. Tab 6 re-run fills them all in one
             # .click event, so the user sees the recommendation update
             # immediately after the numbers settle.
-            for bc_metric in (bc_blurry, bc_flicker, bc_sync, bc_identity, bc_yaw):
+            for bc_metric in (bc_blurry, bc_flicker, bc_sync, bc_identity, bc_yaw, bc_mouth):
                 bc_metric.change(
                     fn=_recommend_finetune_preset,
-                    inputs=[bc_blurry, bc_flicker, bc_sync, bc_identity, bc_yaw],
+                    inputs=[bc_blurry, bc_flicker, bc_sync, bc_identity, bc_yaw, bc_mouth],
                     outputs=bc_recommendation,
                 )
 
@@ -4412,6 +4419,7 @@ _RECO_THRESHOLDS = {
     "sync_critical":     5.0,    # < 5.0 → audio-visual sync weak
     "blurry_critical":   0.40,   # > 0.40 → 40%+ frames mouth-blurred
     "flicker_critical":  12.0,   # > 12 → temporal flicker severe
+    "mouth_open_low":    0.18,   # p95 mouth openness < this → small mouth opening
 }
 
 
@@ -4419,18 +4427,20 @@ def _recommend_finetune_preset(
     blurry: Optional[float], flicker: Optional[float],
     sync: Optional[float], identity: Optional[float],
     avg_yaw: Optional[float] = None,
+    mouth_open: Optional[float] = None,
 ) -> str:
     """Return a multi-line recommendation string given the badcase metrics.
 
     Rules (in order):
       1. identity < 0.70                         → 🧩 Structural Fix
-      2. content issue AND identity 0.70-0.85    → 🧩 Structural Fix (cover both)
-      3. avg_yaw ≥ 18° AND content issue         → 💋 Side-Face Lip Quality
+      2. avg_yaw ≥ 18° AND content issue         → 💋 Side-Face Lip Quality
          (overrides 🎯 Content Fix for heavy side-face content bugs)
+      3. content issue AND identity 0.70-0.85    → 🧩 Structural Fix (cover both)
       4. content issue AND identity >= 0.85     → 🎯 Content Fix
-      5. flicker > 12 alone (identity OK)       → 🎯 Content Fix
+      5. mouth_open < mouth_open_low (no content issue)
+                                                 → 💋 Side-Face + big-mouth data
       6. identity 0.70-0.85 alone (no content)   → 🧩 Structural Fix (mild drift)
-      6. all metrics OK                           → ⚪ no finetune needed
+      7. all metrics OK                           → ⚪ no finetune needed
     """
     s = _RECO_THRESHOLDS
     parts = []
@@ -4442,6 +4452,8 @@ def _recommend_finetune_preset(
         parts.append(f"flicker={flicker:.1f}")
     if sync is not None:
         parts.append(f"sync={sync:.2f}")
+    if mouth_open is not None:
+        parts.append(f"mouth_p95={mouth_open:.2f}")
     metric_summary = ", ".join(parts) if parts else "(no metrics yet)"
 
     if identity is not None and identity < s["identity_critical"]:
@@ -4474,8 +4486,9 @@ def _recommend_finetune_preset(
             "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)\n"
             f"   {metric_summary}\n"
             f"   平均 yaw = {avg_yaw:.1f}° ≥ 18° + 内容指标越界 → "
-            "侧脸唇形专项(rank=48, sync=0.18, perceptual=0.25)。"
-            "\n   数据:📚 预制 celebv_hq_side (side_face 桶 ≥ 50%)。"
+            "侧脸唇形专项(rank=48, sync=0.15, perceptual=0.25)。"
+            "\n   数据:📚 预制 celebv_hq_head_talk_side (侧脸召回) / "
+            "celebv_hq_head_talk_side_big_mouth (大嘴)。"
         )
 
     if has_content_issue:
@@ -4492,7 +4505,22 @@ def _recommend_finetune_preset(
             f"   脸型 OK (id={identity:.3f}),内容指标越界 → att-only LoRA 就够。"
         )
 
-    # has_content_issue is False from here. Now check identity drift + side-face.
+    # has_content_issue is False from here. Now check small mouth, then
+    # identity drift + side-face.
+    small_mouth = mouth_open is not None and mouth_open < s["mouth_open_low"]
+    if small_mouth:
+        yaw_note = f"\n   平均 yaw = {avg_yaw:.1f}° — 侧脸场景," if (
+            avg_yaw is not None and avg_yaw >= 18.0
+        ) else "\n   "
+        return (
+            "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)\n"
+            f"   {metric_summary}\n"
+            f"   张嘴幅度 p95 = {mouth_open:.2f} < {s['mouth_open_low']:.2f} — "
+            f"生成嘴张不开。{yaw_note}"
+            "数据:📚 预制 celebv_hq_head_talk_side_big_mouth (p95≥0.22 大嘴筛选) "
+            "是主要手段;preset sync_loss=0.15 强推 audio-driven 张嘴。"
+        )
+
     if avg_yaw is not None and avg_yaw >= 18.0:
         return (
             "⚪ 当前侧脸场景内容指标正常,不需要 finetune。"
@@ -4628,16 +4656,17 @@ def _diagnose_short_drama(
 
 def run_badcase_checklist(
     video_path: str, reference_video_path: Optional[str]
-) -> Tuple[float, float, float, float, float, str]:
-    """Run all 5 badcase checks on a single generated video.
+) -> Tuple[float, float, float, float, float, float, str]:
+    """Run all badcase checks on a single generated video.
 
     Returns (blurry_ratio, flicker_score, sync_conf, identity_sim,
-    avg_yaw, report). avg_yaw is the mean |yaw| in degrees across
-    detected-face frames; used by _recommend_finetune_preset to spot
-    side-face badcases.
+    avg_yaw, mouth_open_p95, report). avg_yaw is the mean |yaw| in
+    degrees across detected-face frames; mouth_open_p95 is the 95th
+    percentile mouth height/width ratio. Both feed
+    _recommend_finetune_preset (side-face + small-mouth badcases).
     """
     if not video_path:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, "❌ 请先上传视频"
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "❌ 请先上传视频"
 
     try:
         from decord import VideoReader
@@ -4646,7 +4675,7 @@ def run_badcase_checklist(
         vr = VideoReader(video_path)
         frames = [f.asnumpy() for f in vr]
         if len(frames) < 2:
-            return 0.0, 0.0, 0.0, 0.0, 0.0, "❌ 视频帧数 < 2"
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "❌ 视频帧数 < 2"
 
         # ---- 1. Blurry mouth ratio ----
         # crude: convert to grayscale, Laplacian variance per frame
@@ -4699,20 +4728,33 @@ def run_badcase_checklist(
         else:
             identity_sim_note = "未提供参考视频，跳过 identity sim"
 
-        # ---- 5. Average yaw (sampled face detection) ----
-        # Sample up to 16 frames evenly; run face_detector; record |yaw|.
+        # ---- 5. Average yaw + mouth openness (sampled face detection) ----
+        # Sample up to 16 frames evenly; run face_detector; record |yaw| and
+        # mouth openness (lip height / width, same landmarks as curation).
         # Lightweight — face_detector runs in <1s for 16 frames.
+        mouth_open_p95 = 0.0
         try:
             from latentsync.utils.face_detector import FaceDetector
             _fd = FaceDetector()
             sample_n = min(16, len(frames))
             sample_idx = np.linspace(0, len(frames) - 1, sample_n).astype(int)
             yaws = []
+            mouth_opens = []
             for idx in sample_idx:
-                _, _ = _fd(frames[int(idx)])
+                _, lmk = _fd(frames[int(idx)])
                 if _fd.last_pose_yaw is not None:
                     yaws.append(abs(float(_fd.last_pose_yaw)))
+                if lmk is not None and len(lmk) >= 106:
+                    try:
+                        mh = float(np.linalg.norm(lmk[57] - lmk[51]))
+                        mw = float(np.linalg.norm(lmk[54] - lmk[48]))
+                        if mw > 1e-3:
+                            mouth_opens.append(mh / mw)
+                    except (IndexError, TypeError, ValueError):
+                        pass
             avg_yaw = float(np.mean(yaws)) if yaws else 0.0
+            if mouth_opens:
+                mouth_open_p95 = float(np.percentile(mouth_opens, 95))
         except Exception:
             avg_yaw = 0.0
 
@@ -4771,10 +4813,19 @@ def run_badcase_checklist(
                 lines.append("   若同步/清晰度不佳,可考虑 💋 Side-Face Lip Quality")
             else:
                 lines.append(f"\n✅ 平均 yaw {avg_yaw:.1f}° < 15° (基本正面)")
+        # mouth openness summary
+        if mouth_open_p95 > 0:
+            if mouth_open_p95 < _RECO_THRESHOLDS["mouth_open_low"]:
+                lines.append("")
+                lines.append(f"⚠️ 张嘴幅度 p95 {mouth_open_p95:.2f} < {_RECO_THRESHOLDS['mouth_open_low']:.2f} — 嘴张不开")
+                lines.append("   建议: 用 📚 celebv_hq_head_talk_side_big_mouth (p95≥0.22 大嘴) 数据重训, "
+                             "preset 选 💋 Side-Face Lip Quality (sync_loss=0.15)")
+            else:
+                lines.append(f"\n✅ 张嘴幅度 p95 {mouth_open_p95:.2f} ≥ {_RECO_THRESHOLDS['mouth_open_low']:.2f} (正常)")
 
-        return blurry_ratio, flicker_score, float(sync_conf), identity_sim, avg_yaw, "\n".join(lines)
+        return blurry_ratio, flicker_score, float(sync_conf), identity_sim, avg_yaw, mouth_open_p95, "\n".join(lines)
     except Exception as e:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, f"❌ 检测失败: {e}"
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, f"❌ 检测失败: {e}"
 
 
 def main() -> None:
