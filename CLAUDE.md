@@ -132,10 +132,20 @@ LatentSync/
 ├── api.py                          # FastAPI server, /api/lipsync + /api/faces + /health + /api/download
 ├── predict.py                      # Replicate / Cog entry point
 ├── gradio_app.py                   # Gradio UI (alternative to ~/workspace/others/dubbing)
+├── gradio_finetune.py              # Entry point; implementation lives in latentsync/finetune/
 ├── inference.sh                    # CLI inference (calls scripts/inference.py)
 ├── setup_env.sh                    # Python env + ffmpeg setup
 │
 ├── latentsync/
+│   ├── finetune/                   # Gradio Fine-tune Studio implementation (split from gradio_finetune.py)
+│   │   ├── config.py               # presets + build_config_from_form
+│   │   ├── process.py              # TrainingProcess / InferenceManager singletons
+│   │   ├── utils.py                # path resolution, chart parsing, checkpoint introspection
+│   │   ├── ui.py                   # build_ui() assembly
+│   │   ├── ui_launch.py            # Tab 1 callbacks
+│   │   ├── ui_monitor.py           # Tab 2 callbacks
+│   │   ├── ui_inference.py         # Tab 3 / 3.5 callbacks
+│   │   └── ui_tools.py             # Tab 4/5/6/7 callbacks
 │   ├── pipelines/
 │   │   └── lipsync_pipeline.py     # ⭐ core: LipsyncPipeline.__call__ + ~30 _helper methods
 │   ├── models/                     # UNet3DConditionModel + SyncNet + ResNet + motion module

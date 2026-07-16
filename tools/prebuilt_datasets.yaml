@@ -131,6 +131,56 @@ datasets:
       适合「侧脸+大嘴形」badcase 的专项强化,改善微调后张嘴幅度偏小。
     typical_use: "💋 Side-Face + Big Mouth (LoRA+conv, 18-22GB)"
 
+  - id: celebv_hq_head_talk_huge_mouth
+    name: CelebV-HQ Head-Talk Huge Mouth (1.5k, 大嘴强化 p95≥0.30)
+    hf_repo: saeed-5959/celebv_hq_head_talking
+    hf_repo_type: dataset
+    hf_allow: ["lip_sync/*.mp4", "lip_sync_2/*.mp4", "head_talk/*.mp4", "head_talk_2/*.mp4"]
+    n_clips: 1500
+    target_ratio: {frontal: 0.25, side_face: 0.60, fast_motion: 0.15}
+    curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 70, det_threshold: 0.2, mouth_open_min: 0.30, mouth_open_min_mode: p95}
+    align_args: {det_threshold: 0.10, max_fail_ratio: 0.6, side_face_max_fail_ratio: 0.85}
+    description: |
+      同 celebv_hq_head_talk_side_big_mouth 的数据源,但把 mouth_openness p95 阈值
+      从 0.22 提到 0.30,专门筛选大笑、重音、嘴张得很夸张的片段。
+      样本数会比 big_mouth 少,但峰值嘴型更大,适合「微调后嘴张不开 / 嘴型幅度偏小」
+      的 badcase。建议和 big_mouth 或通用数据混合使用,避免过拟合到夸张嘴型。
+    typical_use: "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB) / 大嘴幅度专项"
+
+  - id: voxceleb2_sample
+    name: VoxCeleb2 Sample (500 clips, 通用 baseline / 侧脸混合)
+    hf_repo: Reverb/voxceleb2
+    hf_repo_type: dataset
+    hf_allow: ["**/*.mp4"]
+    n_clips: 500
+    target_ratio: {frontal: 0.45, side_face: 0.35, fast_motion: 0.20}
+    curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 70, det_threshold: 0.2}
+    align_args: {det_threshold: 0.10, max_fail_ratio: 0.6, side_face_max_fail_ratio: 0.85}
+    description: |
+      VoxCeleb2 的 500-clip 采样版(~5-10GB),不用下完整 300GB。
+      身份/场景/姿态多样性高,适合作为通用 finetune seed 或与侧脸专项数据混合。
+      如果 HF Xet 后端 401,init_finetune_dataset.py 会自动禁用 Xet 并回退到普通 HTTP 下载。
+      需要 --hf-token 或 HF_TOKEN 环境变量(gated 数据集)。
+    typical_use: "Stage 2 LoRA baseline / 通用扩展 / 与侧脸数据混合"
+
+  - id: celebv_hq_head_talk_extreme_yaw
+    name: CelebV-HQ Head-Talk Extreme Yaw (>45°, 混合 15% 正脸)
+    hf_repo: saeed-5959/celebv_hq_head_talking
+    hf_repo_type: dataset
+    hf_allow: ["lip_sync/*.mp4", "lip_sync_2/*.mp4", "head_talk/*.mp4", "head_talk_2/*.mp4"]
+    n_clips: 2500
+    target_ratio: {frontal: 0.15, side_face: 0.65, fast_motion: 0.20}
+    curate_args: {min_frames: 16, face_detected_ratio: 0.15, yaw_side_max: 80, det_threshold: 0.15}
+    align_args: {det_threshold: 0.05, max_fail_ratio: 0.6, side_face_max_fail_ratio: 0.90}
+    description: |
+      同 celebv_hq_head_talk_side 的数据源,但把 yaw_side_max 放宽到 80°,
+      并提高 side_face 桶比例到 65%、frontal 降到 15%,专门召回 yaw>45° 的
+      极端侧脸/转头片段。curation/alignment 阈值同步放宽,减少真实极端侧脸
+      因"检出率不足"或"对齐阶段从未检出人脸"而被丢弃。适合「重度侧脸
+      (yaw 45-80°)唇形不同步」或「转头到极限时嘴消失」类 badcase。
+      注意:推理时也要同步提高 yaw_skip_threshold(建议 60-80°),否则训练完仍会被跳过。
+    typical_use: "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB) / 极端侧脸专项"
+
   - id: lipsync_full_159
     name: LipSync Full (159 mp4+txt, 通用扩展)
     hf_repo: yashlanjewar20/lipsync
