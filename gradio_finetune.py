@@ -2471,6 +2471,10 @@ def _poll_inference_state(skip_quality_check: bool):
     video path into the UI (one-shot, then resets result_video).
     """
     state = _INFERENCE
+    logger.debug(
+        "[_poll_inference_state] kind=%s status=%s busy=%s",
+        state.kind, state.status, state.is_busy(),
+    )
 
     if state.kind != "validate" or state.status not in (state.DONE, state.FAILED, state.CANCELLED):
         if state.is_busy():
@@ -2499,10 +2503,21 @@ def _poll_inference_state(skip_quality_check: bool):
         _INFERENCE.status = _INFERENCE.IDLE
         _INFERENCE.result_video = None
 
+        if result_video is None or not result_video.exists():
+            err_text = f"❌ 推理状态为完成，但输出视频不存在: {result_video}"
+            return (
+                gr.update(value=None),
+                gr.update(),
+                gr.update(value=err_text),
+                gr.update(value=None),
+                gr.update(interactive=True),
+            )
+
         report = f"✅ 推理完成\n📂 {result_video.relative_to(REPO_ROOT)}\n📜 log: {log_path.relative_to(REPO_ROOT)}"
         if not skip_quality_check and result_video.exists():
             metrics = _quick_quality_check(str(result_video))
             report = _format_validation_report(metrics, label, duration=0.0)
+        logger.info("[_poll_inference_state] validation done: %s", result_video)
         return (
             gr.update(value=str(result_video)),
             gr.update(),
@@ -3533,7 +3548,7 @@ def build_ui() -> gr.Blocks:
             )
             val_cancel_btn.click(fn=stop_inference, outputs=[val_report, val_btn])
 
-            val_timer = gr.Timer(value=3, active=True)
+            val_timer = gr.Timer(value=1, active=True)
             val_timer.tick(
                 fn=_poll_inference_state,
                 inputs=[val_skip_qc],
