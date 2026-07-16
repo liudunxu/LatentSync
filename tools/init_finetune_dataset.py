@@ -107,6 +107,71 @@ def _list_recipes(yaml_path: Path) -> List[str]:
     return list(recipes.keys())
 
 
+def _list_repo_files_paginated(
+    *,
+    hf_repo: str,
+    repo_type: str,
+    allow_patterns: List[str],
+    hf_token: Optional[str] = None,
+) -> List[str]:
+    """List repo files by walking each allow-pattern top-level dir via the
+    tree API with cursor pagination.
+
+    Fallback for large repos where list_repo_files(recursive=True) makes the
+    gateway return 504 (e.g. hf-mirror.com on a ~23k-file repo). The tree API
+    caps each page at ~1000 entries; we follow the `cursor` Link header to
+    enumerate a single directory fully, one dir at a time, so each HTTP
+    response stays small.
+
+    Only the top-level directory of each allow_pattern is walked (e.g.
+    "lip_sync/*.mp4" -> walk "lip_sync"). This matches how the recipes use
+    allow_patterns (flat per-dir globs); deep recursive globs are not handled.
+    """
+    import re
+    import requests
+
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    headers = {"authorization": f"Bearer {hf_token}"} if hf_token else {}
+    repo_type_plural = "datasets" if repo_type == "dataset" else repo_type
+
+    # Derive the set of top-level dirs to walk from allow_patterns.
+    dirs: List[str] = []
+    for pat in allow_patterns:
+        top = pat.split("/", 1)[0]
+        if top and top not in dirs:
+            dirs.append(top)
+
+    all_files: List[str] = []
+    for d in dirs:
+        cursor: Optional[str] = None
+        while True:
+            url = f"{endpoint}/api/{repo_type_plural}/{hf_repo}/tree/main/{d}"
+            params: Dict[str, str] = {}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                r = requests.get(url, headers=headers, params=params, timeout=60)
+            except Exception as exc:
+                raise RuntimeError(f"tree request failed for {hf_repo}:{d}: {exc}")
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"tree request for {hf_repo}:{d} returned {r.status_code}: {r.text[:200]}"
+                )
+            entries = r.json()
+            for entry in entries:
+                path = entry.get("path") or entry.get("rfilename")
+                if path and entry.get("type") != "directory":
+                    all_files.append(path)
+            # Follow pagination via the Link header, if present.
+            link = r.headers.get("Link", "")
+            m = re.search(r"[?&]cursor=([^&;>]+)", link)
+            if m:
+                cursor = m.group(1)
+            else:
+                break
+    return all_files
+
+
 def _download_hf_subset(
     *,
     hf_repo: str,
@@ -138,10 +203,24 @@ def _download_hf_subset(
         api = HfApi(**api_kwargs)
         all_files = api.list_repo_files(hf_repo, repo_type=repo_type)
     except Exception as exc:
-        raise SystemExit(
-            f"❌ cannot list files for {hf_repo}: {exc}\n"
-            "   If this is a gated repo, pass --hf-token or set HF_TOKEN."
+        # Large repos (e.g. ~23k files on hf-mirror.com) often 504 on the
+        # recursive tree listing. Fall back to paginated per-directory walk.
+        logger.warning(
+            "list_repo_files failed for %s (%s); trying paginated per-dir walk ...",
+            hf_repo, type(exc).__name__,
         )
+        try:
+            all_files = _list_repo_files_paginated(
+                hf_repo=hf_repo, repo_type=repo_type,
+                allow_patterns=allow_patterns, hf_token=hf_token,
+            )
+        except Exception as exc2:
+            raise SystemExit(
+                f"❌ cannot list files for {hf_repo}: {exc}\n"
+                f"   paginated fallback also failed: {exc2}\n"
+                "   If this is a gated repo, pass --hf-token or set HF_TOKEN. "
+                "If using a mirror, check HF_ENDPOINT / network."
+            )
 
     # Filter to allow_patterns matches (simple glob via fnmatch).
     import fnmatch
