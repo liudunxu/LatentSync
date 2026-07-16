@@ -28,6 +28,10 @@
 #                   curate_finetune_samples.py.  Use it to relax thresholds
 #                   for small seed datasets, e.g.
 #                   {min_frames: 16, face_detected_ratio: 0.2}.
+#                   Also supports mouth_open_min to keep only clips whose
+#                   average mouth openness (lip height / lip width) exceeds
+#                   the threshold, e.g. {mouth_open_min: 0.12} for bigger
+#                   mouth shapes.
 #   description   — multi-line; surfaces in the gradio dropdown
 #                   description and in the post-curation paste-able
 #                   instructions.
@@ -106,6 +110,22 @@ datasets:
       子集包含丰富的 yaw 变化与转头动作,侧脸桶提到 60%,专门用来改善
       侧脸唇形同步 badcase。
     typical_use: "💋 Side-Face Lip Quality (LoRA+conv, 18-22GB)"
+
+  - id: celebv_hq_head_talk_side_big_mouth
+    name: CelebV-HQ Head-Talk Big-Mouth (1.5k, 侧脸+大嘴筛选)
+    hf_repo: saeed-5959/celebv_hq_head_talking
+    hf_repo_type: dataset
+    hf_allow: ["lip_sync/*.mp4", "lip_sync_v2/*.mp4"]
+    n_clips: 1500
+    target_ratio: {frontal: 0.25, side_face: 0.60, fast_motion: 0.15}
+    curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 60, det_threshold: 0.2, mouth_open_min: 0.12}
+    align_args: {det_threshold: 0.2, max_fail_ratio: 0.5}
+    description: |
+      同 celebv_hq_head_talk_side 的数据源,但在 curate 阶段额外用
+      mouth_openness(嘴高/嘴宽)≥0.12 筛选出张嘴幅度更大的片段。
+      适合「侧脸+大嘴形」badcase 的专项强化;总数会比原版少,但嘴形
+      动态更丰富。
+    typical_use: "💋 Side-Face + Big Mouth (LoRA+conv, 18-22GB)"
 
   - id: lipsync_full_159
     name: LipSync Full (159 mp4+txt, 通用扩展)

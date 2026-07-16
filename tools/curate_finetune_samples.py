@@ -105,6 +105,7 @@ class VideoScore:
     yaw_mean: float = 0.0
     yaw_max_abs: float = 0.0
     motion_score: float = 0.0
+    mouth_openness: float = 0.0  # avg mouth height/width ratio across detected frames
     frame_count: int = 0
     face_detected_ratio: float = 0.0  # % of sampled frames with a face
     sync_conf: Optional[float] = None
@@ -314,6 +315,7 @@ def _score_one(
     indices = np.linspace(0, total - 1, sample_frames).astype(int)
 
     yaws: List[float] = []
+    mouth_openness: List[float] = []
     face_centers: List[Tuple[float, float]] = []
     face_detected = 0
 
@@ -338,6 +340,14 @@ def _score_one(
             yaw = _estimate_yaw_from_lmk(lmk)
         if yaw is not None:
             yaws.append(float(yaw))
+        if lmk is not None and len(lmk) >= 106:
+            try:
+                mouth_h = float(np.linalg.norm(lmk[57] - lmk[51]))
+                mouth_w = float(np.linalg.norm(lmk[54] - lmk[48]))
+                if mouth_w > 1e-3:
+                    mouth_openness.append(mouth_h / mouth_w)
+            except (IndexError, TypeError, ValueError):
+                pass
 
     cap.release()
 
@@ -371,6 +381,7 @@ def _score_one(
         yaw_mean=float(yaw_arr.mean()),
         yaw_max_abs=float(np.max(np.abs(yaw_arr))),
         motion_score=motion,
+        mouth_openness=float(np.mean(mouth_openness)) if mouth_openness else 0.0,
     )
 
 
@@ -379,7 +390,7 @@ def _score_one(
 # ---------------------------------------------------------------------------
 
 
-def _bucket(score: VideoScore, *, min_frames: int, face_detected_ratio: float, yaw_side_max: float) -> str:
+def _bucket(score: VideoScore, *, min_frames: int, face_detected_ratio: float, yaw_side_max: float, mouth_open_min: float) -> str:
     """Assign a single bucket to a VideoScore. Sets `rejected_reason` if rejected."""
     if score.rejected_reason:
         return "reject"
@@ -392,6 +403,9 @@ def _bucket(score: VideoScore, *, min_frames: int, face_detected_ratio: float, y
     if score.yaw_max_abs > yaw_side_max:
         score.rejected_reason = "extreme_yaw"
         return "reject"
+    if mouth_open_min > 0 and score.mouth_openness < mouth_open_min:
+        score.rejected_reason = "small_mouth"
+        return "reject"
     if score.sync_conf is not None and score.sync_conf < SYNC_CONF_MIN:
         score.rejected_reason = "low_sync_conf"
         return "reject"
@@ -403,11 +417,11 @@ def _bucket(score: VideoScore, *, min_frames: int, face_detected_ratio: float, y
     return "frontal"
 
 
-def _select(scored: List[VideoScore], target_count: int, *, min_frames: int, face_detected_ratio: float, yaw_side_max: float) -> Dict[str, List[VideoScore]]:
+def _select(scored: List[VideoScore], target_count: int, *, min_frames: int, face_detected_ratio: float, yaw_side_max: float, mouth_open_min: float) -> Dict[str, List[VideoScore]]:
     """Pick the top-N per bucket per TARGET_RATIO."""
     buckets: Dict[str, List[VideoScore]] = defaultdict(list)
     for s in scored:
-        s.bucket = _bucket(s, min_frames=min_frames, face_detected_ratio=face_detected_ratio, yaw_side_max=yaw_side_max)
+        s.bucket = _bucket(s, min_frames=min_frames, face_detected_ratio=face_detected_ratio, yaw_side_max=yaw_side_max, mouth_open_min=mouth_open_min)
         if s.bucket != "reject":
             buckets[s.bucket].append(s)
 
@@ -416,11 +430,17 @@ def _select(scored: List[VideoScore], target_count: int, *, min_frames: int, fac
 
     for cat, ratio in TARGET_RATIO.items():
         n_target = max(1, round(target_count * ratio))
-        pool = sorted(
-            buckets.get(cat, []),
-            key=lambda x: (x.yaw_max_abs if cat == "side_face" else x.motion_score),
-            reverse=(cat == "side_face"),
-        )
+        pool = buckets.get(cat, [])
+        # Primary sort: prefer larger mouth openness for frontal/side_face,
+        # keep motion-based ordering for fast_motion.
+        if cat == "fast_motion":
+            pool = sorted(pool, key=lambda x: x.motion_score, reverse=True)
+        else:
+            pool = sorted(
+                pool,
+                key=lambda x: (x.mouth_openness, x.yaw_max_abs if cat == "side_face" else x.motion_score),
+                reverse=True,
+            )
         selected[cat] = pool[:n_target]
         leftovers[cat] = pool[n_target:]
 
@@ -428,7 +448,8 @@ def _select(scored: List[VideoScore], target_count: int, *, min_frames: int, fac
     have = sum(len(v) for v in selected.values())
     if have < target_count:
         flat = [s for cat, vs in leftovers.items() for s in vs]
-        flat.sort(key=lambda x: x.yaw_max_abs, reverse=True)
+        # Prefer big mouths when backfilling too.
+        flat.sort(key=lambda x: (x.mouth_openness, x.yaw_max_abs), reverse=True)
         for s in flat:
             if have >= target_count:
                 break
@@ -519,6 +540,8 @@ def main():
                         help="minimum ratio of sampled frames that must have a detected face (default 0.4)")
     parser.add_argument("--yaw-side-max", type=float, default=YAW_SIDE_MAX,
                         help=f"max |yaw| allowed; beyond this is rejected as extreme yaw (default {YAW_SIDE_MAX})")
+    parser.add_argument("--mouth-open-min", type=float, default=0.0,
+                        help="minimum mouth openness (mouth height / mouth width) to keep a clip; 0 disables (default)")
     parser.add_argument("--det-threshold", type=float, default=0.3,
                         help="InsightFace detection threshold; lower keeps more hard faces (default 0.3)")
     parser.add_argument("--device", type=str, default="cuda",
@@ -539,6 +562,7 @@ def main():
         "motion_fast_threshold": MOTION_FAST_THRESHOLD,
         "min_frames": args.min_frames,
         "face_detected_ratio": args.face_detected_ratio,
+        "mouth_open_min": args.mouth_open_min,
         "det_threshold": args.det_threshold,
     }
 
@@ -589,7 +613,7 @@ def main():
             and cached.get("min_frames") == args.min_frames
         ):
             vs = VideoScore(**{k: cached[k] for k in [
-                "path", "yaw_mean", "yaw_max_abs", "motion_score",
+                "path", "yaw_mean", "yaw_max_abs", "motion_score", "mouth_openness",
                 "frame_count", "face_detected_ratio", "sync_conf",
             ] if k in cached})
             vs.path = key
@@ -613,6 +637,7 @@ def main():
                 "yaw_mean": s.yaw_mean,
                 "yaw_max_abs": s.yaw_max_abs,
                 "motion_score": s.motion_score,
+                "mouth_openness": s.mouth_openness,
                 "frame_count": s.frame_count,
                 "face_detected_ratio": s.face_detected_ratio,
                 "sync_conf": s.sync_conf,
@@ -632,6 +657,7 @@ def main():
         min_frames=args.min_frames,
         face_detected_ratio=args.face_detected_ratio,
         yaw_side_max=args.yaw_side_max,
+        mouth_open_min=args.mouth_open_min,
     )
     kept_total = sum(len(v) for v in selected.values())
     logger.info(

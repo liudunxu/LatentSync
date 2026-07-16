@@ -451,11 +451,23 @@ def _align_one_video(
         except Exception:
             n_fail += 1
             if last_face is None:
-                logger.warning("skip %s: face detection failed on first frame", src_path)
-                return False
+                # Keep looking for a usable first face rather than dropping
+                # the whole clip on a single bad first frame.
+                continue
             face = last_face.copy()
 
         aligned_frames.append(face)
+
+    # If we never got a single usable face, the clip is unusable.
+    if last_face is None:
+        logger.warning("skip %s: no face detected in any frame", src_path)
+        return False
+
+    # Pad leading frames that were skipped while searching for the first face.
+    n_leading_missing = total - len(aligned_frames)
+    if n_leading_missing > 0:
+        aligned_frames[:0] = [last_face.copy()] * n_leading_missing
+        # These leading frames were already counted in n_fail above.
 
     fail_ratio = n_fail / total
     if fail_ratio > max_fail_ratio:
