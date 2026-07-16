@@ -2466,16 +2466,23 @@ def run_validation(
 def _poll_inference_state(skip_quality_check: bool):
     """Timer poller — checks _INFERENCE status and delivers the result.
 
-    Called by Tab 3.5's gr.Timer every 3s while a validation is running.
-    On DONE: runs _quick_quality_check and pushes the final report +
-    video path into the UI (one-shot, then resets result_video).
+    Called by Tab 3.5's gr.Timer every 1s while the app is open. We always
+    update the report text so the user can see the poller is alive. On a
+    finished result (DONE/FAILED/CANCELLED) we push the video path + report
+    into the UI and reset the one-shot state.
     """
     state = _INFERENCE
+    now = datetime.now().strftime("%H:%M:%S")
     logger.debug(
         "[_poll_inference_state] kind=%s status=%s busy=%s",
         state.kind, state.status, state.is_busy(),
     )
 
+    # Helper to build the report line that proves the poller is ticking.
+    def _heartbeat(prefix: str) -> str:
+        return f"[{now}] {prefix} | kind={state.kind} status={state.status} busy={state.is_busy()}"
+
+    # Not a validation result we should consume (e.g. idle, or compare running).
     if state.kind != "validate" or state.status not in (state.DONE, state.FAILED, state.CANCELLED):
         if state.is_busy():
             try:
@@ -2485,13 +2492,22 @@ def _poll_inference_state(skip_quality_check: bool):
             return (
                 gr.update(value=None),
                 gr.update(),
-                gr.update(value=(
-                    f"⏳ {state.label} running (pid={pid})"
+                gr.update(value=_heartbeat(
+                    f"⏳ {state.label} running (pid={pid})\n"
+                    "💡 页面每秒自动刷新，推理完成后会在此显示视频"
                 )),
                 gr.update(),
                 gr.update(interactive=False),
             )
-        return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(interactive=True))
+        # Idle / no validation running: leave UI unchanged so we don't clobber
+        # a previous result or spam the report when the tab is open.
+        return (
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(interactive=True),
+        )
 
     # ---- one-shot consumption of a finished result ----
     result_video = state.result_video
@@ -2500,11 +2516,17 @@ def _poll_inference_state(skip_quality_check: bool):
     label = state.label
 
     if state.status == state.DONE:
-        _INFERENCE.status = _INFERENCE.IDLE
-        _INFERENCE.result_video = None
+        # Resolve to absolute path for Gradio's Video component.
+        video_path_str = str(result_video.resolve()) if result_video else ""
 
         if result_video is None or not result_video.exists():
-            err_text = f"❌ 推理状态为完成，但输出视频不存在: {result_video}"
+            _INFERENCE.status = _INFERENCE.IDLE
+            _INFERENCE.result_video = None
+            err_text = (
+                f"[{now}] ❌ 推理状态为完成，但输出视频不存在: {result_video}\n"
+                f"📜 log: {log_path}\n"
+                "请检查 validation 子进程日志确认视频是否写入成功。"
+            )
             return (
                 gr.update(value=None),
                 gr.update(),
@@ -2513,16 +2535,36 @@ def _poll_inference_state(skip_quality_check: bool):
                 gr.update(interactive=True),
             )
 
-        report = f"✅ 推理完成\n📂 {result_video.relative_to(REPO_ROOT)}\n📜 log: {log_path.relative_to(REPO_ROOT)}"
-        if not skip_quality_check and result_video.exists():
-            metrics = _quick_quality_check(str(result_video))
-            report = _format_validation_report(metrics, label, duration=0.0)
-        logger.info("[_poll_inference_state] validation done: %s", result_video)
+        # Build the report *before* resetting state so any exception below
+        # doesn't lose the video path.
+        try:
+            if skip_quality_check:
+                report = (
+                    f"[{now}] ✅ 推理完成（已跳过质量自检）\n"
+                    f"📂 {video_path_str}\n"
+                    f"📜 log: {log_path}"
+                )
+            else:
+                metrics = _quick_quality_check(video_path_str)
+                report = _format_validation_report(metrics, label, duration=0.0)
+                report = f"[{now}] {report}\n📂 {video_path_str}\n📜 log: {log_path}"
+        except Exception as exc:
+            logger.exception("[_poll_inference_state] quality check failed")
+            report = (
+                f"[{now}] ✅ 推理完成，但质量自检异常: {exc}\n"
+                f"📂 {video_path_str}\n"
+                f"📜 log: {log_path}"
+            )
+
+        logger.info("[_poll_inference_state] validation done: %s", video_path_str)
+        # Consume the one-shot result.
+        _INFERENCE.status = _INFERENCE.IDLE
+        _INFERENCE.result_video = None
         return (
-            gr.update(value=str(result_video)),
+            gr.update(value=video_path_str),
             gr.update(),
             gr.update(value=report),
-            gr.update(value=str(result_video)),
+            gr.update(value=video_path_str),
             gr.update(interactive=True),
         )
 
@@ -2533,7 +2575,8 @@ def _poll_inference_state(skip_quality_check: bool):
             gr.update(value=None),
             gr.update(),
             gr.update(value=(
-                f"⏹ 已取消\n📜 log: {log_path.relative_to(REPO_ROOT)}\n"
+                f"[{now}] ⏹ 已取消\n"
+                f"📜 log: {log_path}\n"
                 f"最后 30 行:\n{tail_file(log_path, 30)}"
             )),
             gr.update(value=None),
@@ -2544,8 +2587,8 @@ def _poll_inference_state(skip_quality_check: bool):
     _INFERENCE.status = _INFERENCE.IDLE
     _INFERENCE.result_video = None
     err_text = (
-        f"❌ 推理失败 (rc={exit_code})\n"
-        f"📜 log: {log_path.relative_to(REPO_ROOT)}\n\n"
+        f"[{now}] ❌ 推理失败 (rc={exit_code})\n"
+        f"📜 log: {log_path}\n\n"
         f"最后 30 行:\n{tail_file(log_path, 30)}"
     )
     return (
