@@ -142,21 +142,39 @@ def _list_repo_files_paginated(
             dirs.append(top)
 
     all_files: List[str] = []
+    import time as _time
     for d in dirs:
         cursor: Optional[str] = None
+        n_pages = 0
         while True:
             url = f"{endpoint}/api/{repo_type_plural}/{hf_repo}/tree/main/{d}"
             params: Dict[str, str] = {}
             if cursor:
                 params["cursor"] = cursor
-            try:
-                r = requests.get(url, headers=headers, params=params, timeout=60)
-            except Exception as exc:
-                raise RuntimeError(f"tree request failed for {hf_repo}:{d}: {exc}")
-            if r.status_code != 200:
-                raise RuntimeError(
-                    f"tree request for {hf_repo}:{d} returned {r.status_code}: {r.text[:200]}"
+            # hf-mirror.com intermittently 504s on tree pages; retry with
+            # backoff so a transient gateway timeout doesn't kill the whole walk.
+            r = None
+            for attempt in range(5):
+                try:
+                    r = requests.get(url, headers=headers, params=params, timeout=60)
+                    if r.status_code != 504:
+                        break
+                except Exception as exc:
+                    last = exc
+                r = None
+                backoff = 3 * (2 ** attempt)
+                logger.warning(
+                    "tree %s:%s page %d attempt %d/5 failed (%s); retry in %ds",
+                    hf_repo, d, n_pages + 1, attempt + 1,
+                    r.status_code if r is not None else "exc", backoff,
                 )
+                _time.sleep(backoff)
+            if r is None or r.status_code != 200:
+                raise RuntimeError(
+                    f"tree request for {hf_repo}:{d} returned "
+                    f"{r.status_code if r is not None else 'exc'} after retries"
+                )
+            n_pages += 1
             entries = r.json()
             for entry in entries:
                 path = entry.get("path") or entry.get("rfilename")
