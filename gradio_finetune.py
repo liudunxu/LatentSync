@@ -2373,11 +2373,12 @@ def run_validation(
             gr.update(),
             gr.update(value=f"❌ 已有推理在运行 (kind={_INFERENCE.kind})，请先 ⏹ 取消"),
             gr.update(value=None),
+            gr.update(interactive=True),
         )
     if not ckpt_path or not Path(ckpt_path).exists():
-        return (gr.update(value=None), gr.update(), gr.update(value=f"❌ ckpt 不存在: {ckpt_path}"), gr.update())
+        return (gr.update(value=None), gr.update(), gr.update(value=f"❌ ckpt 不存在: {ckpt_path}"), gr.update(), gr.update(interactive=True))
     if not unet_config or not Path(unet_config).exists():
-        return (gr.update(value=None), gr.update(), gr.update(value=f"❌ config 不存在: {unet_config}"), gr.update())
+        return (gr.update(value=None), gr.update(), gr.update(value=f"❌ config 不存在: {unet_config}"), gr.update(), gr.update(interactive=True))
 
     # If the user selected a LoRA adapter directory, merge it into the base
     # UNet on-the-fly so the rest of the validation path can treat it as a
@@ -2400,6 +2401,7 @@ def run_validation(
                 gr.update(),
                 gr.update(value=f"❌ LoRA adapter 合并失败: {exc}"),
                 gr.update(),
+                gr.update(interactive=True),
             )
 
     warnings = _check_ckpt_compatibility(Path(ckpt_path), Path(unet_config))
@@ -2445,7 +2447,7 @@ def run_validation(
         label=f"validate ckpt={Path(ckpt_path).name}",
         result_video=out_mp4,
     ):
-        return (gr.update(value=None), gr.update(), gr.update(value="❌ 启动失败"), gr.update())
+        return (gr.update(value=None), gr.update(), gr.update(value="❌ 启动失败"), gr.update(), gr.update(interactive=True))
 
     skip_msg = " (skip quality check)" if skip_quality_check else ""
     return (
@@ -2454,9 +2456,10 @@ def run_validation(
         gr.update(value=(
             f"⏳ validate 推理启动中{skip_msg}\n"
             f"📜 log: {log_path.relative_to(REPO_ROOT)}\n"
-            f"💡 点击 ⏹ 取消 或 等 timer 自动刷新"
+            f"💡 等待自动刷新，或点击 ⏹ 取消"
         )),
         gr.update(value=None),
+        gr.update(interactive=False),
     )
 
 
@@ -2482,8 +2485,9 @@ def _poll_inference_state(skip_quality_check: bool):
                     f"⏳ {state.label} running (pid={pid})"
                 )),
                 gr.update(),
+                gr.update(interactive=False),
             )
-        return (gr.update(), gr.update(), gr.update(), gr.update())
+        return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(interactive=True))
 
     # ---- one-shot consumption of a finished result ----
     result_video = state.result_video
@@ -2504,6 +2508,7 @@ def _poll_inference_state(skip_quality_check: bool):
             gr.update(),
             gr.update(value=report),
             gr.update(value=str(result_video)),
+            gr.update(interactive=True),
         )
 
     if state.status == state.CANCELLED:
@@ -2517,6 +2522,7 @@ def _poll_inference_state(skip_quality_check: bool):
                 f"最后 30 行:\n{tail_file(log_path, 30)}"
             )),
             gr.update(value=None),
+            gr.update(interactive=True),
         )
 
     # FAILED
@@ -2532,12 +2538,13 @@ def _poll_inference_state(skip_quality_check: bool):
         gr.update(),
         gr.update(value=err_text),
         gr.update(value=None),
+        gr.update(interactive=True),
     )
 
 
-def stop_inference() -> str:
+def stop_inference() -> Tuple[str, Any]:
     """⏹ cancel button — sends SIGINT to the running inference subprocess group."""
-    return _INFERENCE.stop()
+    return _INFERENCE.stop(), gr.update(interactive=True)
     """Run inference with the chosen fine-tuned checkpoint, then a quick
     quality self-check. Returns (output_mp4, warnings_text, report_text,
     saved_path).
@@ -3517,14 +3524,21 @@ def build_ui() -> gr.Blocks:
                     val_steps, val_guidance, val_seed, val_resolution,
                     val_deepcache, val_skip_qc, val_baseline,
                 ],
-                outputs=[val_output, val_compat, val_report, val_saved],
+                outputs=[val_output, val_compat, val_report, val_saved, val_btn],
             )
             val_include_lora.change(
                 fn=lambda incl: gr.update(choices=list_checkpoints(include_lora=incl)),
                 inputs=val_include_lora,
                 outputs=val_ckpt,
             )
-            val_cancel_btn.click(fn=stop_inference, outputs=val_report)
+            val_cancel_btn.click(fn=stop_inference, outputs=[val_report, val_btn])
+
+            val_timer = gr.Timer(value=3, active=True)
+            val_timer.tick(
+                fn=_poll_inference_state,
+                inputs=[val_skip_qc],
+                outputs=[val_output, val_compat, val_report, val_saved, val_btn],
+            )
 
         # =========================================================
         # Tab 4: Identity Protection Strategy
