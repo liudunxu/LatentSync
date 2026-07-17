@@ -228,6 +228,53 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         },
         "freeze_attn2": True,
     },
+    "🎨 Lip Forcing 风格 (保真优先 LoRA, 512)": {
+        "config_file": "configs/unet/stage2_512.yaml",
+        "resume_ckpt": "checkpoints/latentsync_unet.pt",
+        "batch_size": 1,
+        "num_frames": 16,
+        "resolution": 512,
+        "learning_rate": 5e-5,
+        "use_motion_module": True,
+        "pixel_space_supervise": True,
+        "use_syncnet": True,
+        # 论文 fidelity–sync tradeoff 的保真一侧:放松同步约束换画质
+        "sync_loss_weight": 0.02,
+        # 提真实感/抗糊
+        "perceptual_loss_weight": 0.25,
+        "recon_loss_weight": 1.0,
+        # TREPA 保帧间时序一致性
+        "trepa_loss_weight": 10.0,
+        "mixed_precision_training": True,
+        "enable_gradient_checkpointing": True,
+        "mask_image_path": "latentsync/utils/mask2.png",
+        "save_ckpt_steps": 500,
+        "max_train_steps": 10000,
+        "lr_scheduler": "cosine",
+        "lr_warmup_steps": 500,
+        "description": (
+            "🎨 **论文配方 — 保真优先(放同步换画质, 512)** (参考 Lip Forcing, arXiv:2606.11180)\n"
+            "论文 fidelity–sync tradeoff:放松同步约束 → FID/FVD/LPIPS 更优(更真实、更连贯、不糊)。\n"
+            "本预设落在 reference-leaning 一侧:sync_loss=0.02 弱同步监督;\n"
+            "perceptual=0.25 提真实感抗糊;TREPA=10 保帧间一致性;\n"
+            "freeze_attn2 锁住基础唇音通路,防止放松监督后同步能力崩塌。\n"
+            "适用:画质/一致性优先、可容忍同步略松的内容"
+            "(观众对脸崩/不自然的容忍度远低于毫秒级口型偏差,预算押保真一侧是务实操作点)。\n"
+            "512 说明:用 stage2_512 配置 + mask2.png,显存估计 ~30-40GB(512 全量参考 ~55GB);\n"
+            "数据对齐分辨率必须匹配:init_finetune_dataset.py --align-resolution 512。\n"
+            "数据:配合「Lip Forcing 论文混合数据」预设(VoxCeleb2 多样性 + HDTF/Hallo3 高清干净音)。\n"
+            "注意:论文的 DMD 蒸馏 / 因果 student / 两步推理是架构级改动,本预设不含。"
+        ),
+        "lora": {
+            "enabled": True,
+            "rank": 64,
+            "alpha": 128,
+            "dropout": 0.10,
+            "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
+            "qlora": False,
+        },
+        "freeze_attn2": True,
+    },
     "Stage 2 QLoRA (256, 8-10GB)": {
         "config_file": "configs/unet/stage2.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
@@ -373,6 +420,19 @@ DATASET_PRESETS: Dict[str, Dict[str, str]] = {
     "data/train (示例路径)": {
         "train_data_dir": "data/train",
         "train_fileslist": "data/train/fileslist.txt",
+        "val_video_path": "assets/demo1_video.mp4",
+        "val_audio_path": "assets/demo1_audio.wav",
+    },
+    "Lip Forcing 论文混合数据 (VoxCeleb2+HDTF+Hallo3, 目录递归示例)": {
+        # 把 voxceleb2/ hdtf/ hallo3/ 软链或放入该目录,unet_dataset 递归收集 *.mp4
+        "train_data_dir": "data/lip_forcing_mix",
+        "train_fileslist": "",
+        "val_video_path": "assets/demo1_video.mp4",
+        "val_audio_path": "assets/demo1_audio.wav",
+    },
+    "Lip Forcing 论文混合数据 (VoxCeleb2+HDTF+Hallo3, fileslist 示例)": {
+        "train_data_dir": "",
+        "train_fileslist": "data/lip_forcing_mix_fileslist.txt",
         "val_video_path": "assets/demo1_video.mp4",
         "val_audio_path": "assets/demo1_audio.wav",
     },

@@ -193,3 +193,23 @@ datasets:
       在 clean 78 条基础上翻倍,身份/场景更多,适合作为通用 finetune seed
       或和侧脸专项数据混合训练。
     typical_use: "Stage 2 LoRA baseline / 🎯 Badcase Fix"
+
+  - id: fidelity_hq_1k
+    name: Fidelity HQ (1k, 正脸为主, 广召回)
+    hf_repo: saeed-5959/celebv_hq_head_talking
+    hf_repo_type: dataset
+    hf_allow: ["lip_sync/*.mp4", "lip_sync_2/*.mp4", "head_talk/*.mp4", "head_talk_2/*.mp4"]
+    n_clips: 1000
+    target_ratio: {frontal: 0.80, side_face: 0.10, fast_motion: 0.10}
+    curate_args: {min_frames: 16, face_detected_ratio: 0.2, det_threshold: 0.2}
+    align_args: {det_threshold: 0.10, max_fail_ratio: 0.6, side_face_max_fail_ratio: 0.85}
+    description: |
+      保真优先 + 广召回:CelebV-HQ 512×512 高清源(四子集全覆盖,~23k 候选选 1k)。
+      质量门放宽到召回档(min_frames 16 / 检出率 0.2 / det 0.2),对齐阶段也不丢 clip
+      (间歇性检测失败靠补帧保留),尽量把候选用满。
+      frontal 桶 80%:正脸嘴部完整可见 = 「能唇形同步」的样本,保证可学的同步信号占主体;
+      留 10% 侧脸 + 10% 快运动兜底鲁棒性。
+      分工:数据侧广召回 + 同步可学样本为主;保真由训练侧兜底
+      (perceptual=0.25 / TREPA=10 / freeze_attn2,见 🎨 预设)。
+      如需身份多样性,可再跑 voxceleb2_sample 并合并 fileslist(cat 两个 fileslist.txt)。
+    typical_use: "🎨 Lip Forcing 风格 (保真优先 LoRA, 512)"
