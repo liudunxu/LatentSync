@@ -440,6 +440,7 @@ def _run_curation(
         "--source-dir", str(source_dir),
         "--output-dir", str(output_dir),
         "--target-count", str(target_count),
+        "--target-ratio", json.dumps(ratio),
     ]
     curate_args = curate_args or {}
     for key, val in curate_args.items():

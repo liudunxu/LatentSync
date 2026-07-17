@@ -438,8 +438,11 @@ def _bucket(score: VideoScore, *, min_frames: int, face_detected_ratio: float, y
     return "frontal"
 
 
-def _select(scored: List[VideoScore], target_count: int, *, min_frames: int, face_detected_ratio: float, yaw_side_max: float, mouth_open_min: float, mouth_open_min_mode: str = "p95") -> Dict[str, List[VideoScore]]:
-    """Pick the top-N per bucket per TARGET_RATIO."""
+def _select(scored: List[VideoScore], target_count: int, *, min_frames: int, face_detected_ratio: float, yaw_side_max: float, mouth_open_min: float, mouth_open_min_mode: str = "p95", target_ratio: Optional[Dict[str, float]] = None) -> Dict[str, List[VideoScore]]:
+    """Pick the top-N per bucket per target ratio (falls back to TARGET_RATIO).
+
+    A bucket with an explicit ratio of 0 selects nothing from that bucket.
+    """
     buckets: Dict[str, List[VideoScore]] = defaultdict(list)
     for s in scored:
         s.bucket = _bucket(s, min_frames=min_frames, face_detected_ratio=face_detected_ratio, yaw_side_max=yaw_side_max, mouth_open_min=mouth_open_min, mouth_open_min_mode=mouth_open_min_mode)
@@ -449,8 +452,9 @@ def _select(scored: List[VideoScore], target_count: int, *, min_frames: int, fac
     selected: Dict[str, List[VideoScore]] = {}
     leftovers: Dict[str, List[VideoScore]] = {}
 
-    for cat, ratio in TARGET_RATIO.items():
-        n_target = max(1, round(target_count * ratio))
+    ratio_map = target_ratio or TARGET_RATIO
+    for cat, ratio in ratio_map.items():
+        n_target = 0 if ratio <= 0 else max(1, round(target_count * ratio))
         pool = buckets.get(cat, [])
         # Primary sort: prefer larger mouth openness (peak) for frontal/side_face,
         # keep motion-based ordering for fast_motion.
@@ -570,10 +574,20 @@ def main():
                              "(default p95; peak big-open moment, robust to landmark noise)")
     parser.add_argument("--det-threshold", type=float, default=0.3,
                         help="InsightFace detection threshold; lower keeps more hard faces (default 0.3)")
+    parser.add_argument("--target-ratio", type=str, default=None,
+                        help='JSON bucket weights, e.g. \'{"frontal": 1.0, "side_face": 0.0, "fast_motion": 0.0}\' '
+                             '(default: TARGET_RATIO 45/35/20). A 0 ratio selects nothing from that bucket.')
     parser.add_argument("--device", type=str, default="cuda",
                         help="face detector device (cuda/cpu)")
     parser.add_argument("--log", type=str, default="INFO")
     args = parser.parse_args()
+
+    target_ratio = None
+    if args.target_ratio:
+        target_ratio = json.loads(args.target_ratio)
+        unknown = set(target_ratio) - {"frontal", "side_face", "fast_motion"}
+        if unknown:
+            raise SystemExit(f"❌ --target-ratio has unknown buckets: {sorted(unknown)}")
 
     logging.basicConfig(level=getattr(logging, args.log.upper()), format="%(asctime)s %(levelname)s %(message)s")
 
@@ -591,6 +605,7 @@ def main():
         "mouth_open_min": args.mouth_open_min,
         "mouth_open_min_mode": args.mouth_open_min_mode,
         "det_threshold": args.det_threshold,
+        "target_ratio": target_ratio or TARGET_RATIO,
     }
 
     # ---- collect candidates ----
@@ -693,6 +708,7 @@ def main():
         yaw_side_max=args.yaw_side_max,
         mouth_open_min=args.mouth_open_min,
         mouth_open_min_mode=args.mouth_open_min_mode,
+        target_ratio=target_ratio,
     )
     kept_total = sum(len(v) for v in selected.values())
     logger.info(

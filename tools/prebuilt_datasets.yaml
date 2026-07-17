@@ -195,21 +195,23 @@ datasets:
     typical_use: "Stage 2 LoRA baseline / 🎯 Badcase Fix"
 
   - id: fidelity_hq_1k
-    name: Fidelity HQ (1k, 正脸为主, 广召回)
+    name: Fidelity HQ (1k, 正脸60+侧脸30+快运动10, 防 badcase)
     hf_repo: saeed-5959/celebv_hq_head_talking
     hf_repo_type: dataset
     hf_allow: ["lip_sync/*.mp4", "lip_sync_2/*.mp4", "head_talk/*.mp4", "head_talk_2/*.mp4"]
     n_clips: 1000
-    target_ratio: {frontal: 0.80, side_face: 0.10, fast_motion: 0.10}
-    curate_args: {min_frames: 16, face_detected_ratio: 0.2, det_threshold: 0.2}
+    target_ratio: {frontal: 0.60, side_face: 0.30, fast_motion: 0.10}
+    curate_args: {min_frames: 16, face_detected_ratio: 0.2, yaw_side_max: 70, det_threshold: 0.2}
     align_args: {det_threshold: 0.10, max_fail_ratio: 0.6, side_face_max_fail_ratio: 0.85}
     description: |
-      保真优先 + 广召回:CelebV-HQ 512×512 高清源(四子集全覆盖,~23k 候选选 1k)。
-      质量门放宽到召回档(min_frames 16 / 检出率 0.2 / det 0.2),对齐阶段也不丢 clip
-      (间歇性检测失败靠补帧保留),尽量把候选用满。
-      frontal 桶 80%:正脸嘴部完整可见 = 「能唇形同步」的样本,保证可学的同步信号占主体;
-      留 10% 侧脸 + 10% 快运动兜底鲁棒性。
-      分工:数据侧广召回 + 同步可学样本为主;保真由训练侧兜底
-      (perceptual=0.25 / TREPA=10 / freeze_attn2,见 🎨 预设)。
+      「尽量多画面唇形同步 + 不出 badcase」的混合策略:
+      只在干净正脸训练,模型永远学不会硬样本 — 推理遇到中等侧脸/快运动照样崩
+      (极端帧由推理侧 prefilter 跳过兜底,中等帧必须靠模型自己会)。
+      所以 frontal 60% 保可同步信号主体,side_face 30%(仓库决策树修复侧脸
+      badcase 的经验阈值是训练数据 30%+ 侧脸),fast_motion 10% 补运动覆盖。
+      桶内仍按嘴部开合峰值排序,各桶都优先挑 sync 信号最强的子集。
+      召回档门控(同侧脸专项配方):yaw 召回放宽到 70°,对齐失败靠补帧保留。
+      注意:frontal 池不足时会从其他桶 backfill;完工后看 curation_report.json
+      的 by_bucket 确认实际构成。
       如需身份多样性,可再跑 voxceleb2_sample 并合并 fileslist(cat 两个 fileslist.txt)。
     typical_use: "🎨 Lip Forcing 风格 (保真优先 LoRA, 512)"
