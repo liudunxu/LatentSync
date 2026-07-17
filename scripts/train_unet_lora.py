@@ -192,6 +192,12 @@ def _save_loss_chart(
     plt.close(fig)
 
 
+def _update_ema(state: dict, key, val: float, alpha: float = 0.95) -> float:
+    """Update and return an EMA stored in `state` (initialized to `val` on first call)."""
+    state[key] = val if key not in state else alpha * state[key] + (1 - alpha) * val
+    return state[key]
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -476,6 +482,9 @@ def main(config):
     sync_loss_ema_alpha = 0.95
     loss_ema = 0.0
     loss_ema_alpha = 0.95
+    loss_ema_list = []
+    component_emas = {}      # per-component EMAs (recon / lpips / trepa)
+    timestep_bin_emas = {}   # recon EMA per timestep quartile (convergence signal)
     lr_list = []
     val_step_list = []
     sync_conf_list = []
@@ -687,10 +696,15 @@ def main(config):
                 # may be clipped, but EMA better reflects the underlying trend.
                 sync_log_val = sync_loss_ema if isinstance(sync_loss, torch.Tensor) else 0.0
 
+                recon_val = float(recon_loss) if not isinstance(recon_loss, int) else 0.0
+                lpips_val = float(lpips_loss) if not isinstance(lpips_loss, int) else 0.0
+                trepa_val = float(trepa_loss) if not isinstance(trepa_loss, int) else 0.0
+
                 train_step_list.append(global_step)
                 train_loss_list.append(loss_val)
-                recon_loss_list.append(float(recon_loss))
-                lpips_loss_list.append(float(lpips_loss))
+                loss_ema_list.append(loss_ema)
+                recon_loss_list.append(recon_val)
+                lpips_loss_list.append(lpips_val)
                 sync_loss_list.append(float(sync_log_val))
                 lr_list.append(float(lr_scheduler.get_last_lr()[0]))
 
@@ -698,12 +712,26 @@ def main(config):
                 tracker.log({
                     "train/loss": loss_val,
                     "train/loss_ema": loss_ema,
-                    "train/recon": float(recon_loss) if not isinstance(recon_loss, int) else 0.0,
+                    "train/recon": recon_val,
                     "train/sync": float(sync_log_val),
-                    "train/lpips": float(lpips_loss) if not isinstance(lpips_loss, int) else 0.0,
-                    "train/trepa": float(trepa_loss) if not isinstance(trepa_loss, int) else 0.0,
+                    "train/lpips": lpips_val,
+                    "train/trepa": trepa_val,
+                    # Per-component EMAs: raw per-step values swing wildly because
+                    # each step draws a random timestep; the EMA exposes the trend.
+                    "train/recon_ema": _update_ema(component_emas, "recon", recon_val),
+                    "train/lpips_ema": _update_ema(component_emas, "lpips", lpips_val),
+                    "train/trepa_ema": _update_ema(component_emas, "trepa", trepa_val),
                     "train/lr": lr_scheduler.get_last_lr()[0],
                     "train/epoch": epoch,
+                }, step=global_step)
+
+                # Clearest convergence signal: recon EMA within one timestep
+                # quartile. Full-range recon mixes all noise levels (random t each
+                # step), which hides the trend; same-bin comparisons don't.
+                num_train_timesteps = noise_scheduler.config.num_train_timesteps
+                t_bin = min(int(float(timesteps.float().mean()) * 4 / num_train_timesteps), 3)
+                tracker.log({
+                    f"train/recon_t{t_bin}": _update_ema(timestep_bin_emas, t_bin, recon_val),
                 }, step=global_step)
 
             optimizer.zero_grad()
@@ -798,6 +826,7 @@ def main(config):
                         train_step_list,
                         {
                             "total": train_loss_list,
+                            "total_ema": loss_ema_list,
                             "recon": recon_loss_list,
                             "lpips": lpips_loss_list,
                             "sync": sync_loss_list,
