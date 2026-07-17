@@ -661,8 +661,9 @@ def main(config):
                 else:
                     sync_loss_ema = sync_loss_ema_alpha * sync_loss_ema + (1 - sync_loss_ema_alpha) * sync_loss_val
                 # Cap the sync loss used for optimization at 3x the EMA to suppress spikes.
-                sync_loss_for_backward = min(float(sync_loss.item()), 3.0 * sync_loss_ema + 1e-6)
-                sync_loss_for_backward = torch.tensor(sync_loss_for_backward, device=sync_loss.device, dtype=sync_loss.dtype)
+                # Use clamp (not torch.tensor(float)) so the graph stays attached:
+                # in-range steps keep their gradient, clamped outliers get zero grad.
+                sync_loss_for_backward = torch.clamp(sync_loss, max=3.0 * sync_loss_ema + 1e-6)
             else:
                 sync_loss = 0
                 sync_loss_for_backward = 0
