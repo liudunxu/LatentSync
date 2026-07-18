@@ -228,6 +228,56 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         },
         "freeze_attn2": True,
     },
+    "🎭 Short Drama 唇形真实感 (LoRA+conv, 18-22GB)": {
+        "config_file": "configs/unet/stage2.yaml",
+        "resume_ckpt": "checkpoints/latentsync_unet.pt",
+        "batch_size": 1,
+        # SyncNet 只支持 16 帧
+        "num_frames": 16,
+        "resolution": 256,
+        "learning_rate": 3e-5,
+        "use_motion_module": True,
+        "pixel_space_supervise": True,
+        "use_syncnet": True,
+        # 嘴特别小/唇薄:强推 audio-driven 嘴型,减少"开不开都行"的模糊地带
+        "sync_loss_weight": 0.15,
+        # 唇部质感(唇薄/糊):提权锐化嘴部纹理
+        "perceptual_loss_weight": 0.25,
+        "recon_loss_weight": 1.0,
+        # 快切场景:帧间一致性
+        "trepa_loss_weight": 10.0,
+        "mixed_precision_training": True,
+        "enable_gradient_checkpointing": True,
+        "mask_image_path": "latentsync/utils/mask.png",
+        "save_ckpt_steps": 500,
+        "max_train_steps": 10000,
+        "lr_scheduler": "cosine",
+        "lr_warmup_steps": 300,
+        "description": (
+            "🎭 **推荐 — 短剧唇形真实感 (嘴小/唇薄/侧脸糊/快切场景)**\n"
+            "嘴特别小+唇薄 → sync_loss=0.15 强推 audio-driven 嘴型 + perceptual=0.25 锐化唇部质感;\n"
+            "侧脸糊 → LoRA target 加 conv(11 项, rank=48, 同 Side-Face) 补结构容量;\n"
+            "快速切场景 → TREPA=10 保帧间一致(训练数据必须按镜头切, 不跨 cut)。\n"
+            "数据:短剧 shots(tools/preprocess_short_drama.py, 自动丢无人脸镜头)\n"
+            "+ celebv_hq_head_talk_side_big_mouth / huge_mouth 大嘴筛选 recipe 混合;\n"
+            "对齐分辨率 256 (init_finetune_dataset.py --align-resolution 256)。\n"
+            "通用短剧版见 🎬 Short Drama; 画质优先见 🎨 Lip Forcing。"
+        ),
+        "lora": {
+            "enabled": True,
+            "rank": 48,
+            "alpha": 96,
+            "dropout": 0.10,
+            "target_modules": [
+                "to_q", "to_k", "to_v", "to_out.0",
+                "conv1", "conv2", "conv_shortcut",
+                "proj_in", "proj_out",
+                "conv_in", "conv_out",
+            ],
+            "qlora": False,
+        },
+        "freeze_attn2": True,
+    },
     "🎨 Lip Forcing 风格 (保真优先 LoRA, 512)": {
         "config_file": "configs/unet/stage2_512.yaml",
         "resume_ckpt": "checkpoints/latentsync_unet.pt",
@@ -433,6 +483,14 @@ DATASET_PRESETS: Dict[str, Dict[str, str]] = {
     "Lip Forcing 论文混合数据 (VoxCeleb2+HDTF+Hallo3, fileslist 示例)": {
         "train_data_dir": "",
         "train_fileslist": "data/lip_forcing_mix_fileslist.txt",
+        "val_video_path": "assets/demo1_video.mp4",
+        "val_audio_path": "assets/demo1_audio.wav",
+    },
+    "短剧唇形混合数据 (short_drama shots+大嘴 recipe, fileslist 示例)": {
+        # 短剧 shots 对齐目录 + celebv_hq_head_talk_*_big_mouth 对齐目录,
+        # 两份 fileslist 直接 cat 合并即可(UNetDataset 按行读绝对路径)
+        "train_data_dir": "",
+        "train_fileslist": "data/short_drama_lip_v1_fileslist.txt",
         "val_video_path": "assets/demo1_video.mp4",
         "val_audio_path": "assets/demo1_audio.wav",
     },
