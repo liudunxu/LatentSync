@@ -244,8 +244,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         # 唇部质感(唇薄/糊):提权锐化嘴部纹理
         "perceptual_loss_weight": 0.25,
         "recon_loss_weight": 1.0,
-        # 快切场景:帧间一致性
-        "trepa_loss_weight": 10.0,
+        # 快切场景:帧间一致性(>12 会明显压制嘴部动势,勿再加)
+        "trepa_loss_weight": 12.0,
         "mixed_precision_training": True,
         "enable_gradient_checkpointing": True,
         "mask_image_path": "latentsync/utils/mask.png",
@@ -257,7 +257,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             "🎭 **推荐 — 短剧唇形真实感 (嘴小/唇薄/侧脸糊/快切场景)**\n"
             "嘴特别小+唇薄 → sync_loss=0.15 强推 audio-driven 嘴型 + perceptual=0.25 锐化唇部质感;\n"
             "侧脸糊 → LoRA target 加 conv(11 项, rank=48, 同 Side-Face) 补结构容量;\n"
-            "快速切场景 → TREPA=10 保帧间一致(训练数据必须按镜头切, 不跨 cut)。\n"
+            "快速切场景 → TREPA=12 保帧间一致(训练数据必须按镜头切, 不跨 cut);\n"
             "数据:短剧 shots(tools/preprocess_short_drama.py, 自动丢无人脸镜头)\n"
             "+ celebv_hq_head_talk_side_big_mouth / huge_mouth 大嘴筛选 recipe 混合;\n"
             "对齐分辨率 256 (init_finetune_dataset.py --align-resolution 256)。\n"
