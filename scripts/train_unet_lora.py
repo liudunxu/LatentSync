@@ -40,6 +40,18 @@ import copy
 import logging
 from typing import List, Optional
 
+# Some container images ship an empty/garbage OMP_NUM_THREADS, which makes
+# libgomp print "Invalid value for environment variable OMP_NUM_THREADS".
+# Normalize it before torch initializes OpenMP.
+_omp = os.environ.get("OMP_NUM_THREADS")
+try:
+    _omp_valid = _omp is not None and all(int(p) > 0 for p in _omp.split(","))
+except ValueError:
+    _omp_valid = False
+if not _omp_valid:
+    os.environ["OMP_NUM_THREADS"] = "4"
+del _omp, _omp_valid
+
 from omegaconf import OmegaConf
 
 from tqdm.auto import tqdm

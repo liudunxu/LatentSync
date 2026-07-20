@@ -6,6 +6,20 @@ Gradio application built by ``latentsync.finetune.ui.build_ui``.
 """
 
 import argparse
+import os
+
+# Some container images ship an empty/garbage OMP_NUM_THREADS, which makes
+# libgomp print "Invalid value for environment variable OMP_NUM_THREADS".
+# Normalize it before gradio/torch initialize OpenMP (training subprocesses
+# inherit this environment, so fixing it here covers them too).
+_omp = os.environ.get("OMP_NUM_THREADS")
+try:
+    _omp_valid = _omp is not None and all(int(p) > 0 for p in _omp.split(","))
+except ValueError:
+    _omp_valid = False
+if not _omp_valid:
+    os.environ["OMP_NUM_THREADS"] = "4"
+del _omp, _omp_valid
 
 from latentsync.finetune.ui import build_ui
 

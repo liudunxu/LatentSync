@@ -56,6 +56,18 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Some container images ship an empty/garbage OMP_NUM_THREADS, which makes
+# libgomp print "Invalid value for environment variable OMP_NUM_THREADS".
+# Normalize it before cv2/numpy/torch initialize OpenMP.
+_omp = os.environ.get("OMP_NUM_THREADS")
+try:
+    _omp_valid = _omp is not None and all(int(p) > 0 for p in _omp.split(","))
+except ValueError:
+    _omp_valid = False
+if not _omp_valid:
+    os.environ["OMP_NUM_THREADS"] = "4"
+del _omp, _omp_valid
+
 import yaml
 
 # HuggingFace Hub 从 0.26 开始默认走 Xet 存储后端。Xet 对匿名/部分网络
