@@ -116,22 +116,18 @@ def generate_identity_kit(
     return "\n".join(lines)
 def reset_identity_defaults() -> Tuple[str, int, str, float, float, float]:
     return "random", 16, "standard", 7.0, 0.0, 0.0
-def _safe_hyperiqa_score(model_hyper, model_target, frames_tensor, device, transforms):
-    """Run HyperIQA on 3 frames (first/middle/last) and return mean score 0-100."""
-    sampled = frames_tensor[::max(1, len(frames_tensor) // 3)][:3]
-    sampled = transforms(sampled).to(device)
-    paras = model_hyper(sampled)
-    preds = [model_target(paras).mean().item() for _ in [0]]
-    return float(preds[0]) if preds else 0.0
 def evaluate_dataset_quality(
     data_dir: str, max_videos: int
 ) -> Tuple[str, str, Any]:
     """Walk the directory, sample up to max_videos mp4s, compute HyperIQA +
     SyncNet confidence distributions, return summary text + issues + plot."""
+    import statistics
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    device = "cpu"
     if not data_dir or not Path(data_dir).exists():
         return (
             f"❌ 目录不存在: {data_dir}",
@@ -224,7 +220,6 @@ def evaluate_dataset_quality(
         f"⚠️ 太短 (<16 帧): {len(too_short)}",
     ]
     if hyperiqa_scores:
-        import statistics
         stats_lines += [
             "",
             "📊 HyperIQA 分数（视觉质量，0-100）:",
@@ -237,7 +232,6 @@ def evaluate_dataset_quality(
     else:
         stats_lines.append("\n📊 HyperIQA 不可用（检查 checkpoints/auxiliary/koniq_pretrained.pkl）")
     if sync_confs:
-        import statistics
         stats_lines += [
             "",
             "🎵 SyncNet confidence（音视同步）:",
@@ -455,7 +449,8 @@ def _diagnose_short_drama(
 
     try:
         from latentsync.utils.face_detector import FaceDetector
-        detector = FaceDetector(device="cpu")
+        # Count side-face speakers too — the default 15° skip would drop them.
+        detector = FaceDetector(device="cpu", skip_side_face_threshold=None)
     except Exception as exc:
         cap.release()
         return f"❌ face_detector 加载失败: {exc}"
@@ -529,6 +524,41 @@ def _diagnose_short_drama(
     elif speaker_count == 1 and shots <= 2:
         print_lines.append("📋 这条看起来是单场景单人,常规 🎯 Badcase Fix 就够。")
     return "\n".join(print_lines)
+_IDENTITY_APP = None
+
+
+def _face_embedding(frame):
+    """Largest-face embedding via insightface recognition (lazy singleton).
+
+    The shared ``FaceDetector`` only loads detection + landmarks and never
+    exposes embeddings, so Tab 6 keeps its own FaceAnalysis instance with
+    the recognition module instead of touching the pipeline-shared class.
+    """
+    global _IDENTITY_APP
+    from insightface.app import FaceAnalysis
+
+    if _IDENTITY_APP is None:
+        app = FaceAnalysis(
+            allowed_modules=["detection", "recognition"],
+            root="checkpoints/auxiliary",
+            providers=["CUDAExecutionProvider"],
+        )
+        app.prepare(ctx_id=0, det_size=(512, 512))
+        _IDENTITY_APP = app
+
+    faces = _IDENTITY_APP.get(frame)
+    if not faces:
+        return None
+    faces.sort(
+        key=lambda f: float((f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])),
+        reverse=True,
+    )
+    emb = getattr(faces[0], "normed_embedding", None)
+    if emb is None:
+        emb = getattr(faces[0], "embedding", None)
+    return emb
+
+
 def run_badcase_checklist(
     video_path: str, reference_video_path: Optional[str]
 ) -> Tuple[float, float, float, float, float, float, str]:
@@ -548,7 +578,15 @@ def run_badcase_checklist(
         import numpy as np
         import cv2
         vr = VideoReader(video_path)
-        frames = [f.asnumpy() for f in vr]
+        total = len(vr)
+        if total < 2:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "❌ 视频帧数 < 2"
+        # Bound memory on long inputs: blur/flicker run on a contiguous
+        # middle window (contiguous so the flicker diff stays meaningful);
+        # identity / yaw / mouth openness sample the full video below.
+        max_frames = 400
+        win_start = max(0, (total - max_frames) // 2)
+        frames = [f.asnumpy() for f in vr[win_start:min(total, win_start + max_frames)]]
         if len(frames) < 2:
             return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "❌ 视频帧数 < 2"
 
@@ -587,36 +625,40 @@ def run_badcase_checklist(
 
         # ---- 4. Identity similarity (only if reference provided) ----
         identity_sim = 0.0
+        identity_sim_note = None
         if reference_video_path:
             try:
-                from latentsync.utils.face_detector import FaceDetector
-                det = FaceDetector()
-                _, _, real_emb = det.detect(VideoReader(reference_video_path)[0].asnumpy())
-                _, _, gen_emb = det.detect(frames[0])
-                if real_emb is not None and gen_emb is not None:
-                    cos = float(np.dot(real_emb, gen_emb) / (
-                        np.linalg.norm(real_emb) * np.linalg.norm(gen_emb)
-                    ))
-                    identity_sim = cos
+                ref_frame = VideoReader(reference_video_path)[0].asnumpy()
+                gen_frame = vr[0].asnumpy()
+                real_emb = _face_embedding(ref_frame)
+                gen_emb = _face_embedding(gen_frame)
+                if real_emb is None or gen_emb is None:
+                    identity_sim_note = "identity 评估: 参考或生成视频首帧未检测到人脸"
+                else:
+                    real_emb = np.asarray(real_emb, dtype=float)
+                    gen_emb = np.asarray(gen_emb, dtype=float)
+                    denom = float(np.linalg.norm(real_emb) * np.linalg.norm(gen_emb))
+                    if denom > 0:
+                        identity_sim = float(np.dot(real_emb, gen_emb) / denom)
             except Exception as e:
                 identity_sim_note = f"identity 评估失败: {e}"
-        else:
-            identity_sim_note = "未提供参考视频，跳过 identity sim"
 
         # ---- 5. Average yaw + mouth openness (sampled face detection) ----
-        # Sample up to 16 frames evenly; run face_detector; record |yaw| and
-        # mouth openness (lip height / width, same landmarks as curation).
-        # Lightweight — face_detector runs in <1s for 16 frames.
+        # Sample up to 16 frames evenly across the FULL video; run
+        # face_detector; record |yaw| and mouth openness (lip height /
+        # width, same landmarks as curation). Lightweight — face_detector
+        # runs in <1s for 16 frames.
         mouth_open_p95 = 0.0
         try:
             from latentsync.utils.face_detector import FaceDetector
-            _fd = FaceDetector()
-            sample_n = min(16, len(frames))
-            sample_idx = np.linspace(0, len(frames) - 1, sample_n).astype(int)
+            # No side-face skip: side frames must count for yaw + mouth stats.
+            _fd = FaceDetector(skip_side_face_threshold=None)
+            sample_n = min(16, total)
+            sample_idx = np.linspace(0, total - 1, sample_n).astype(int)
             yaws = []
             mouth_opens = []
             for idx in sample_idx:
-                _, lmk = _fd(frames[int(idx)])
+                _, lmk = _fd(vr[int(idx)].asnumpy())
                 if _fd.last_pose_yaw is not None:
                     yaws.append(abs(float(_fd.last_pose_yaw)))
                 if lmk is not None and len(lmk) >= 106:
@@ -636,7 +678,7 @@ def run_badcase_checklist(
         # ---- Build report ----
         lines: List[str] = []
         lines.append(f"📊 视频: {video_path}")
-        lines.append(f"📏 总帧数: {len(frames)}")
+        lines.append(f"📏 总帧数: {total}")
         lines.append(f"🔍 Laplacian sharpness 范围: {min(laps):.1f} ~ {max(laps):.1f}")
         lines.append("")
         if blurry_ratio < 0.30:
@@ -673,7 +715,7 @@ def run_badcase_checklist(
             lines.append("ℹ️ 未提供参考视频，跳过 identity sim 检查")
         if sync_conf_note:
             lines.append(f"\n⚠️ {sync_conf_note}")
-        if 'identity_sim_note' in locals() and identity_sim_note:
+        if identity_sim_note:
             lines.append(f"⚠️ {identity_sim_note}")
         # yaw summary
         if avg_yaw > 0:

@@ -53,9 +53,14 @@ def _resolve_run_dir(selected_run: Optional[str]) -> Optional[Path]:
     return finetune_candidate
 
 def list_datasets() -> List[str]:
-    """Candidate fine-tune datasets: any directory under preprocess/ with mp4 files."""
+    """Candidate fine-tune datasets: directories under preprocess/ or data/ with mp4 files.
+
+    Only these two subtrees are scanned — rglob over the whole repo root
+    (outputs/, debug/, checkpoints/, .git/, …) made UI startup slow on
+    data-heavy machines.
+    """
     candidates: List[str] = []
-    for root in (REPO_ROOT, REPO_ROOT / "preprocess", REPO_ROOT / "data"):
+    for root in (REPO_ROOT / "preprocess", REPO_ROOT / "data"):
         if not root.exists():
             continue
         for path in root.rglob("*.mp4"):
@@ -115,18 +120,6 @@ def _list_run_dirs_for_monitor(train_output_dir: str) -> List[str]:
 def refresh_runs(train_output_dir: str) -> gr.update:
     choices = _list_run_dirs_for_monitor(train_output_dir)
     return gr.update(choices=choices, value=choices[-1] if choices else None)
-def tail_log(log_path: Optional[str], n_lines: int = 80) -> str:
-    if not log_path or not Path(log_path).exists():
-        return "(log file not found yet - training may not have started writing)"
-    try:
-        with open(log_path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 50_000))
-            data = f.read().decode("utf-8", errors="replace")
-        return "\n".join(data.splitlines()[-int(n_lines):])
-    except Exception as e:
-        return f"(error reading log: {e})"
 def parse_loss_chart(run_dir_path: Optional[str]) -> Optional[str]:
     """Surface the latest PNG from the run's loss_charts/ directory.
 
@@ -193,6 +186,43 @@ def list_checkpoints_in_run(run_dir_path: Optional[str]) -> List[str]:
     except ValueError:
         return [str(p) for p in candidates]
 
+# Full-UNet checkpoints are multi-GB; the monitor tab refreshes every 15s
+# and used to torch.load the latest checkpoint TWICE per refresh just to
+# read global_step + the last few losses. Cache the extracted metadata
+# keyed by (path, mtime_ns, size) so a freshly written checkpoint
+# invalidates automatically. Only the latest key is kept to bound memory.
+_CKPT_META_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+
+
+def _load_ckpt_meta(ckpt_path: Path) -> Dict[str, Any]:
+    """Extract cheap scalar metadata from a full-UNet .pt checkpoint."""
+    st = ckpt_path.stat()
+    mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+    key = (str(ckpt_path), mtime_ns, st.st_size)
+    cached = _CKPT_META_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    import torch
+    try:
+        # mmap=True keeps the tensor bytes on disk; we only touch scalars.
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False, mmap=True)
+    except TypeError:  # older torch without mmap support
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+
+    meta: Dict[str, Any] = {
+        "global_step": int(ckpt.get("global_step", 0) or 0),
+        "state_dict_keys": len(ckpt.get("state_dict", {})),
+        "train_step_list_len": len(ckpt["train_step_list"]) if "train_step_list" in ckpt else None,
+        "train_loss_list_len": len(ckpt["train_loss_list"]) if "train_loss_list" in ckpt else None,
+        "last_train_losses": [round(float(x), 4) for x in (ckpt.get("train_loss_list") or [])[-5:]],
+        "last_val_losses": [round(float(x), 4) for x in (ckpt.get("val_loss_list") or [])[-5:]],
+    }
+    _CKPT_META_CACHE.clear()
+    _CKPT_META_CACHE[key] = meta
+    return meta
+
+
 def read_loss_from_checkpoint(ckpt_path: str) -> str:
     """Best-effort: dump global_step + a couple of scalar fields from the
     latest checkpoint so the user gets a textual progress signal without
@@ -233,23 +263,20 @@ def read_loss_from_checkpoint(ckpt_path: str) -> str:
         return "(directory is not a LoRA adapter)"
 
     try:
-        import torch
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        meta = _load_ckpt_meta(Path(ckpt_path))
         info = {
             "type": "full UNet checkpoint",
-            "global_step": ckpt.get("global_step", "?"),
-            "state_dict_keys": len(ckpt.get("state_dict", {})),
-            "train_step_list_len": len(ckpt.get("train_step_list", []))
-            if "train_step_list" in ckpt else "n/a",
-            "train_loss_list_len": len(ckpt.get("train_loss_list", []))
-            if "train_loss_list" in ckpt else "n/a",
+            "global_step": meta["global_step"],
+            "state_dict_keys": meta["state_dict_keys"],
+            "train_step_list_len": meta["train_step_list_len"]
+            if meta["train_step_list_len"] is not None else "n/a",
+            "train_loss_list_len": meta["train_loss_list_len"]
+            if meta["train_loss_list_len"] is not None else "n/a",
         }
-        if "train_loss_list" in ckpt and ckpt["train_loss_list"]:
-            tail = ckpt["train_loss_list"][-5:]
-            info["last_5_train_losses"] = [round(float(x), 4) for x in tail]
-        if "val_loss_list" in ckpt and ckpt["val_loss_list"]:
-            tail = ckpt["val_loss_list"][-5:]
-            info["last_5_val_losses"] = [round(float(x), 4) for x in tail]
+        if meta["last_train_losses"]:
+            info["last_5_train_losses"] = meta["last_train_losses"]
+        if meta["last_val_losses"]:
+            info["last_5_val_losses"] = meta["last_val_losses"]
         return json.dumps(info, indent=2)
     except Exception as e:
         return f"(could not read checkpoint: {e})"
@@ -297,11 +324,10 @@ def _compute_progress(run_dir: Optional[Path]) -> Dict[str, Any]:
             step_str = latest_ckpt.name.split("-")[-1]
             step = int(step_str) if step_str.isdigit() else 0
         else:
-            import torch as _torch
-            ckpt = _torch.load(str(latest_ckpt), map_location="cpu", weights_only=False)
-            step = int(ckpt.get("global_step", 0) or 0)
-            if ckpt.get("train_loss_list"):
-                latest_loss = float(ckpt["train_loss_list"][-1])
+            meta = _load_ckpt_meta(latest_ckpt)
+            step = meta["global_step"]
+            if meta["last_train_losses"]:
+                latest_loss = float(meta["last_train_losses"][-1])
     except Exception:
         return {"step": None, "max_step": None, "elapsed_s": 0,
                 "throughput": 0.0, "eta_s": None, "progress_pct": 0.0,
@@ -380,15 +406,24 @@ def _format_progress_text(p: Dict[str, Any]) -> str:
         f"📈 step {step} / {max_step}  ({pct:.1f}%){loss_str}\n"
         f"⏱ 已运行: {elapsed_str} | 速度: {throughput_str} | ETA: {eta_str}"
     )
-def tail_file(path: Path, n_lines: int = 30) -> str:
-    """Read the last N lines of a text file (best-effort)."""
+def tail_file(path, n_lines: int = 30, missing_msg: str = "(log file not found)") -> str:
+    """Read the last N lines of a text file (best-effort).
+
+    Accepts ``Path`` / ``str`` / ``None``; a missing file yields
+    ``missing_msg`` instead of raising.
+    """
+    if not path:
+        return missing_msg
+    p = Path(path)
+    if not p.exists():
+        return missing_msg
     try:
-        with open(path, "rb") as f:
+        with open(p, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            f.seek(max(0, size - 20_000))
+            f.seek(max(0, size - 50_000))
             data = f.read().decode("utf-8", errors="replace")
-        return "\n".join(data.splitlines()[-n_lines:])
+        return "\n".join(data.splitlines()[-int(n_lines):])
     except Exception as e:
         return f"(log read failed: {e})"
 
@@ -439,12 +474,15 @@ def _list_training_videos(data_dir: str, fileslist: str) -> Tuple[List[str], str
         return videos, f"📁 扫描目录: {len(videos)} 个 mp4"
 
     return [], "⚠️ 请提供有效的 train_data_dir 或 train_fileslist"
-def _analyze_training_video_yaw(video_path: str, n_frames: int = 5) -> Dict[str, Any]:
+def _analyze_training_video_yaw(video_path: str, n_frames: int = 5, detector=None) -> Dict[str, Any]:
     """Sample frames from a training video and estimate face yaw.
 
     Returns a dict with yaw_mean, yaw_max, detect_rate, face_type and an
     optional error key. Used by the training-set preview tab to filter
     frontal / side-face samples.
+
+    ``detector`` may be passed in so a batch analysis loads insightface
+    once instead of once per video.
     """
     try:
         from latentsync.utils.av_reader import AVReader
@@ -463,20 +501,24 @@ def _analyze_training_video_yaw(video_path: str, n_frames: int = 5) -> Dict[str,
         else:
             indices = [int(i * (total_frames - 1) / (n_frames - 1)) for i in range(n_frames)]
 
-        import torch
+        if detector is None:
+            import torch
 
-        detector = FaceDetector(
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            allowed_modules=["detection", "landmark_2d_106", "pose"],
-        )
+            detector = FaceDetector(
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                # Measure yaw on side faces too — the caller decides the
+                # frontal/side cutoff; the default 15° skip would hide them.
+                skip_side_face_threshold=None,
+                allowed_modules=["detection", "landmark_2d_106"],
+            )
 
         yaws: List[float] = []
         for idx in indices:
             _, frame = reader[idx]
             if hasattr(frame, "asnumpy"):
                 frame = frame.asnumpy()
-            face, _ = detector.detect(frame)
-            if face is not None and detector.last_pose_yaw is not None:
+            bbox, _ = detector(frame)
+            if bbox is not None and detector.last_pose_yaw is not None:
                 yaws.append(detector.last_pose_yaw)
 
         if not yaws:

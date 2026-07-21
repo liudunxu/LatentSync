@@ -16,7 +16,7 @@ from latentsync.finetune.utils import (
     parse_loss_chart,
     parse_sync_conf_chart,
     read_loss_from_checkpoint,
-    tail_log,
+    tail_file,
 )
 
 def _on_page_load(train_output_dir: str = "unet"):
@@ -121,7 +121,11 @@ def _monitor_refresh_core(
     effective_log_path = log_path
     if not effective_log_path and _TRAINER.is_running() and _TRAINER.log_path:
         effective_log_path = str(_TRAINER.log_path)
-    log_text = tail_log(effective_log_path, n_lines=80)
+    log_text = tail_file(
+        effective_log_path,
+        n_lines=80,
+        missing_msg="(log file not found yet - training may not have started writing)",
+    )
 
     if ckpts:
         ckpt_path = Path(ckpts[-1])

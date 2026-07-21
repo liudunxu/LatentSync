@@ -81,17 +81,16 @@ def _build_inference_cmd(
     return cmd
 
 
-def _run_inference_subprocess(cmd: List[str], log_path: Path) -> int:
-    """Run ``scripts.inference`` and stream stdout/stderr to ``log_path``."""
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "w") as log_f:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(REPO_ROOT),
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-        )
-        return proc.wait()
+def _run_inference_subprocess(cmd: List[str]) -> int:
+    """Run ``scripts.inference`` inheriting the wrapper's stdout/stderr.
+
+    The Gradio side captures the wrapper's stdout into the per-run log
+    file; inheriting it lands the inner inference logs in that same file
+    so the UI's failure tail shows the real error (previously the inner
+    logs went to a separate, UI-invisible file).
+    """
+    proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT))
+    return proc.wait()
 
 
 def _resolve_ckpt(
@@ -111,7 +110,6 @@ def _run_single(
     ckpt_path: Path,
     out_path: Path,
     unet_config_path: Path,
-    log_path: Path,
 ) -> int:
     """Run one inference and return its subprocess exit code."""
     cmd = _build_inference_cmd(
@@ -123,7 +121,7 @@ def _run_single(
         args,
     )
     logger.info("[finetune_inference] running: %s", " ".join(cmd))
-    return _run_inference_subprocess(cmd, log_path)
+    return _run_inference_subprocess(cmd)
 
 
 def _quality_check_optional(video_path: Path, skip: bool) -> Optional[Dict[str, Any]]:
@@ -144,8 +142,13 @@ def cmd_validate(args: argparse.Namespace) -> int:
     out_dir = out_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    log_path = out_dir / f"validation_{ts}.log"
-    result_json = out_dir / f"validation_{ts}.json"
+    # The UI pins --result_json so its poller and this process agree on
+    # the filename; the timestamped name is only a fallback for manual
+    # CLI runs.
+    result_json = (
+        Path(args.result_json) if args.result_json
+        else out_dir / f"validation_{ts}.json"
+    )
 
     _prune_debug_files(out_dir, "validation_cfg_*.yaml", keep=10)
 
@@ -172,7 +175,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         prefix="validation_cfg",
     )
 
-    rc = _run_single(args, ckpt, out_path, tmp_cfg, log_path)
+    rc = _run_single(args, ckpt, out_path, tmp_cfg)
     if rc != 0:
         write_result_json(
             result_json,
@@ -210,10 +213,15 @@ def cmd_compare(args: argparse.Namespace) -> int:
     out_dir = base_video.parent
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    log_path = out_dir / f"compare_{ts}.log"
-    result_json = out_dir / f"compare_{ts}.json"
+    # The UI pins --result_json so its poller and this process agree on
+    # the filename; the timestamped name is only a fallback for manual
+    # CLI runs.
+    result_json = (
+        Path(args.result_json) if args.result_json
+        else out_dir / f"compare_{ts}.json"
+    )
 
-    _prune_debug_files(REPO_ROOT / "debug", "compare_cfg_*.yaml", keep=10)
+    _prune_debug_files(out_dir, "compare_cfg_*.yaml", keep=10)
 
     tmp_cfg = prepare_temp_config(
         unet_config,
@@ -240,7 +248,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         return 2
 
     # Run base first, then fine-tuned.
-    rc_base = _run_single(args, base_ckpt, base_video, tmp_cfg, log_path)
+    rc_base = _run_single(args, base_ckpt, base_video, tmp_cfg)
     if rc_base != 0:
         write_result_json(
             result_json,
@@ -251,7 +259,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         )
         return rc_base
 
-    rc_ft = _run_single(args, ft_ckpt, ft_video, tmp_cfg, log_path)
+    rc_ft = _run_single(args, ft_ckpt, ft_video, tmp_cfg)
     if rc_ft != 0:
         write_result_json(
             result_json,
@@ -302,6 +310,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.add_argument("--enable_deepcache", action="store_true")
         p.add_argument("--baseline_mode", action="store_true")
         p.add_argument("--skip_quality_check", action="store_true")
+        # Pin the result JSON path so the Gradio poller and this process
+        # write/read the same file (avoids a timestamp race).
+        p.add_argument("--result_json", type=str, default="")
 
     p_val = sub.add_parser("validate")
     _add_common(p_val)

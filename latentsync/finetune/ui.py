@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 import gradio as gr
 
-from latentsync.finetune import REPO_ROOT, FINETUNE_BASE_DIR
+from latentsync.finetune import REPO_ROOT, FINETUNE_BASE_DIR, logger
 from latentsync.finetune.config import DATASET_PRESETS, PRESETS, DEFAULT_PRESET_NAME, apply_dataset_preset, on_preset_change
 from latentsync.finetune.utils import (
     _analyze_training_video_yaw,
@@ -40,6 +40,7 @@ from latentsync.finetune.ui_monitor import (
     monitor_refresh,
 )
 from latentsync.finetune.ui_inference import (
+    _cancel_validate,
     _poll_compare_state,
     _poll_validate_state,
     run_compare,
@@ -497,15 +498,19 @@ def build_ui() -> gr.Blocks:
                     value="(训练日志会在这里显示)",
                 )
 
+            # Dedicated process-status box: the 3s timer used to write into
+            # launch_status, wiping the launch info (config path / command
+            # line) seconds after startup.
+            train_proc_status = gr.Textbox(label="训练进程状态", interactive=False)
             refresh_log_btn = gr.Button("🔄 手动刷新训练日志", variant="secondary")
             refresh_log_btn.click(
                 fn=refresh_training_log,
-                outputs=[training_log_box, launch_status],
+                outputs=[training_log_box, train_proc_status],
             )
             log_timer = gr.Timer(value=3)
             log_timer.tick(
                 fn=refresh_training_log,
-                outputs=[training_log_box, launch_status],
+                outputs=[training_log_box, train_proc_status],
             )
 
             # preset → fill defaults
@@ -804,7 +809,7 @@ def build_ui() -> gr.Blocks:
                 inputs=val_include_lora,
                 outputs=val_ckpt,
             )
-            val_cancel_btn.click(fn=stop_inference, outputs=[val_report, val_btn])
+            val_cancel_btn.click(fn=_cancel_validate, outputs=[val_report, val_btn])
 
             val_timer = gr.Timer(value=1, active=True)
             val_timer.tick(
@@ -1188,12 +1193,25 @@ pipe(
                         {},
                         "",
                     )
+                # Load insightface once for the whole batch instead of once
+                # per video (each load takes seconds).
+                shared_detector = None
+                try:
+                    import torch
+                    from latentsync.utils.face_detector import FaceDetector
+                    shared_detector = FaceDetector(
+                        device="cuda" if torch.cuda.is_available() else "cpu",
+                        skip_side_face_threshold=None,
+                        allowed_modules=["detection", "landmark_2d_106"],
+                    )
+                except Exception as exc:
+                    logger.warning("preview yaw detector init failed: %s", exc)
                 analysis: Dict[str, Any] = {}
                 frontal = 0
                 side = 0
                 unknown = 0
                 for v in videos:
-                    info = _analyze_training_video_yaw(v, n_frames=5)
+                    info = _analyze_training_video_yaw(v, n_frames=5, detector=shared_detector)
                     analysis[v] = info
                     ft = info.get("face_type", "unknown")
                     if ft == "frontal":

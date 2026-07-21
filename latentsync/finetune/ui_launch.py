@@ -138,8 +138,9 @@ def launch_training(
                 "[launch_training] rejected: another training is already running (pid=%s)",
                 _TRAINER.pid,
             )
+            run_name = _TRAINER.run_dir.name if _TRAINER.run_dir else "?"
             return (
-                f"❌ 训练已在运行中 (pid={_TRAINER.pid}, run={_TRAINER.run_dir.name})",
+                f"❌ 训练已在运行中 (pid={_TRAINER.pid}, run={run_name})",
                 "",
             )
 
@@ -315,14 +316,21 @@ def _run_curate_finetune(
     source_dir: str,
     output_dir: str,
     scale: str,
-) -> str:
-    """Spawn `python -m tools.download_curated_finetune_set` and stream output."""
+) -> Iterator[str]:
+    """Spawn `python -m tools.download_curated_finetune_set` and stream output.
+
+    Generator (like ``_run_init_prebuilt``): curation downloads can run for
+    hours, and a blocking subprocess.run would freeze the Gradio queue for
+    every other user action until it finished.
+    """
     urls = (urls or "").strip()
     source_dir = (source_dir or "").strip()
     if not urls and not source_dir:
-        return "❌ 必须填 URL 列表 或 本地源目录(选一)"
+        yield "❌ 必须填 URL 列表 或 本地源目录(选一)"
+        return
     if not output_dir:
-        return "❌ curated 输出目录为空"
+        yield "❌ curated 输出目录为空"
+        return
 
     cmd = [
         sys.executable, "-m", "tools.download_curated_finetune_set",
@@ -337,18 +345,34 @@ def _run_curate_finetune(
 
     log_path = REPO_ROOT / "debug" / f"curate_{datetime.now():%Y%m%d_%H%M%S}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    yield (
+        f"🚀 开始 curate\n"
+        f"📜 实时日志: {log_path}\n"
+        f"   可另开终端查看: tail -f {log_path}\n"
+    )
     try:
         with open(log_path, "w") as logf:
-            proc = subprocess.run(cmd, cwd=str(REPO_ROOT), stdout=logf, stderr=subprocess.STDOUT)
-        log_text = log_path.read_text()
-        if proc.returncode != 0:
-            return (
-                f"❌ curate 退出码 {proc.returncode}\n"
-                f"📜 log: {log_path}\n\n最后 60 行:\n{log_text[-6000:]}"
+            proc = subprocess.Popen(
+                cmd, cwd=str(REPO_ROOT), stdout=logf, stderr=subprocess.STDOUT,
             )
-        return f"✅ 已完成\n📜 log: {log_path}\n\n{log_text[-4000:]}"
+            while proc.poll() is None:
+                time.sleep(0.5)
+                yield (
+                    f"📥 curate 处理中...\n"
+                    f"📜 log: {log_path}\n\n{tail_file(log_path, 40)}"
+                )
     except FileNotFoundError as exc:
-        return f"❌ 启动失败: {exc}"
+        yield f"❌ 启动失败: {exc}"
+        return
+
+    log_text = log_path.read_text()
+    if proc.returncode != 0:
+        yield (
+            f"❌ curate 退出码 {proc.returncode}\n"
+            f"📜 log: {log_path}\n\n最后 60 行:\n{log_text[-6000:]}"
+        )
+        return
+    yield f"✅ 已完成\n📜 log: {log_path}\n\n{log_text[-4000:]}"
 def _prebuilt_choices() -> List[str]:
     """Read tools/prebuilt_datasets.yaml and return a list of `id (name)` strings
     for the gradio Dropdown."""
@@ -366,14 +390,6 @@ def _prebuilt_choices() -> List[str]:
             out.append(f"{entry['id']} — {entry.get('name', '')}")
     return out
 
-def _tail_text(path: Path, n_lines: int = 40) -> str:
-    """Return the last n lines of a text file (best-effort)."""
-    try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return ""
-    lines = text.splitlines()
-    return "\n".join(lines[-n_lines:])
 def _run_init_prebuilt(
     dataset_choice: str, output_dir: str, hf_token: str,
 ) -> Iterator[Tuple[str, Any, Any]]:
@@ -417,11 +433,10 @@ def _run_init_prebuilt(
             proc = subprocess.Popen(
                 cmd, cwd=str(REPO_ROOT),
                 stdout=logf, stderr=subprocess.STDOUT,
-                bufsize=1, universal_newlines=True,
             )
             while proc.poll() is None:
                 time.sleep(0.5)
-                tail = _tail_text(log_path, n_lines=40)
+                tail = tail_file(log_path, 40, missing_msg="")
                 yield (
                     f"🚀 `{dataset_id}` 处理中...\n"
                     f"📜 log: {log_path}\n\n{tail}",

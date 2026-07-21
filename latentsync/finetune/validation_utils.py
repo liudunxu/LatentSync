@@ -130,7 +130,14 @@ def quick_quality_check(video_path: str) -> Dict[str, Any]:
         from decord import VideoReader
 
         vr = VideoReader(video_path)
-        frames = [f.asnumpy() for f in vr]
+        total = len(vr)
+        if total < 2:
+            return {"error": "video too short"}
+        # Bound memory on long videos: analyze a contiguous middle window
+        # (contiguous so the frame-diff flicker metric stays meaningful).
+        max_frames = 400
+        start = max(0, (total - max_frames) // 2)
+        frames = [f.asnumpy() for f in vr[start:min(total, start + max_frames)]]
         if len(frames) < 2:
             return {"error": "video too short"}
 
@@ -153,19 +160,20 @@ def quick_quality_check(video_path: str) -> Dict[str, Any]:
         try:
             from latentsync.utils.face_detector import FaceDetector
 
-            det = FaceDetector()
+            # No side-face skip: this measures detectability, not yaw.
+            det = FaceDetector(skip_side_face_threshold=None)
             detected = 0
             sample = frames[:: max(1, len(frames) // 10)][:10]
             for f in sample:
-                face, _, _ = det.detect(f)
-                if face is not None:
+                bbox, _ = det(f)
+                if bbox is not None:
                     detected += 1
             face_rate = detected / len(sample)
         except Exception:
             pass
 
         return {
-            "num_frames": len(frames),
+            "num_frames": total,
             "sharpness_mean": round(sharpness_mean, 2),
             "blurry_ratio": round(blurry_ratio, 3),
             "flicker": round(flicker, 2),

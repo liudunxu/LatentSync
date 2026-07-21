@@ -266,11 +266,22 @@ class TrainingProcess:
         pid = self.pid
         if self.proc is not None and self.proc.poll() is None:
             try:
-                self.proc.send_signal(signal.SIGINT)
+                # The training subprocess runs in its own session
+                # (os.setsid), so signal the whole group — SIGINT to just
+                # the torchrun pid can leave its workers behind.
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
                 self.proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=5)
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            except (ProcessLookupError, OSError) as e:
+                logger.warning("[TrainingProcess] failed to signal pid=%s: %s", pid, e)
         elif pid is not None:
             # Reattached process: we only have the PID, send SIGINT to its group.
             try:

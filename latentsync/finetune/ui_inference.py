@@ -12,7 +12,6 @@ from latentsync.finetune.utils import tail_file
 from latentsync.finetune.validation_utils import (
     check_ckpt_compatibility,
     format_validation_report,
-    prepare_temp_config,
     read_result_json,
     resolve_ckpt_path,
 )
@@ -44,8 +43,15 @@ def _build_finetune_inference_cmd(
     base_ckpt: Optional[str] = None,
     fine_tuned_ckpt: Optional[str] = None,
     second_out_path: Optional[Path] = None,
+    result_json: Optional[Path] = None,
 ) -> List[str]:
-    """Build the command for ``scripts/finetune_inference.py``."""
+    """Build the command for ``scripts/finetune_inference.py``.
+
+    ``result_json`` pins the JSON path the subprocess writes so the UI
+    poller and the subprocess agree on the filename (both used to mint
+    their own timestamps, which raced whenever startup crossed a second
+    boundary and made the poller read a file that was never written).
+    """
     cmd = [
         sys.executable,
         "-m",
@@ -74,6 +80,8 @@ def _build_finetune_inference_cmd(
         cmd.append("--baseline_mode")
     if skip_quality_check:
         cmd.append("--skip_quality_check")
+    if result_json is not None:
+        cmd.extend(["--result_json", str(result_json)])
 
     if mode == "validate":
         assert ckpt_path is not None
@@ -128,13 +136,22 @@ def run_compare(
     log_path = out_dir / f"compare_{ts}.log"
     result_json = out_dir / f"compare_{ts}.json"
 
-    _prune_debug_files(REPO_ROOT / "debug", "compare_cfg_*.yaml", keep=10)
+    _prune_debug_files(out_dir, "compare_cfg_*.yaml", keep=10)
+
+    # 512 must run with stage2_512.yaml (mask2.png); prepare_temp_config
+    # only overrides resolution, so picking stage2.yaml here would pair a
+    # 512 resolution with the 256 mask and produce garbage.
+    unet_config = Path(
+        "configs/unet/stage2_512.yaml"
+        if int(resolution) == 512
+        else "configs/unet/stage2.yaml"
+    )
 
     cmd = _build_finetune_inference_cmd(
         mode="compare",
         video_path=video_path,
         audio_path=audio_path,
-        unet_config=Path("configs/unet/stage2.yaml"),
+        unet_config=unet_config,
         inference_steps=inference_steps,
         guidance_scale=guidance_scale,
         seed=seed,
@@ -146,6 +163,7 @@ def run_compare(
         base_ckpt=base_ckpt,
         fine_tuned_ckpt=fine_tuned_ckpt,
         second_out_path=out_ft,
+        result_json=result_json,
     )
 
     if not _INFERENCE.start(
@@ -250,6 +268,7 @@ def run_validation(
         skip_quality_check=skip_quality_check,
         out_path=out_mp4,
         ckpt_path=ckpt_path,
+        result_json=result_json,
     )
 
     if not _INFERENCE.start(
@@ -511,3 +530,9 @@ def _poll_compare_state() -> Tuple[Any, Any, Any]:
 def stop_inference() -> str:
     """⏹ cancel button — sends SIGINT to the running inference subprocess group."""
     return _INFERENCE.stop()
+
+
+def _cancel_validate() -> Tuple[str, Any]:
+    """⏹ Tab 3.5 cancel — like stop_inference but matches the two outputs
+    wired in the UI (report box + re-enable the launch button)."""
+    return _INFERENCE.stop(), gr.update(interactive=True)
